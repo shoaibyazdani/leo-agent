@@ -298,7 +298,10 @@ class Settings(BaseModel):
                 base_url=base_url,
                 api_key_env=token_env,
                 model=model or "hy4-flash-free",
-                capabilities=["text", "streaming", "tools", "structured", "usage"],
+                # Anthropic-compatible gateways accept image content blocks;
+                # `vision` lets image-bearing turns route here instead of
+                # failing with "no provider satisfies the request".
+                capabilities=["text", "streaming", "tools", "structured", "usage", "vision"],
             )
         # Automatic mock injection is opt-in only. An explicit ``kind: mock``
         # provider needs no flag; without either, a missing or broken live
@@ -309,7 +312,7 @@ class Settings(BaseModel):
                 ModelProviderConfig(
                     kind="mock",
                     model="mock-1",
-                    capabilities=["text", "streaming", "tools", "structured", "usage"],
+                    capabilities=["text", "streaming", "tools", "structured", "usage", "vision"],
                 ),
             )
 

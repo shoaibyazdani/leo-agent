@@ -12,11 +12,8 @@ models:
       kind: anthropic-compatible
       base_url: https://opencode.ai/inference/go/anthropic
       api_key_env: ANTHROPIC_AUTH_TOKEN
-      # Environment-specific: set your provider's model id here (or override
-      # it in a local, uncommitted config). LEO reports an unroutable
-      # provider honestly instead of inventing an answer.
-      model: set-your-model-id
-      capabilities: [text, streaming, tools, structured, usage]
+      model: hy4-flash-free
+      capabilities: [text, streaming, tools, structured, usage, vision]
       context_window: 128000
       # OpenCode Go requires a stable session ID per conversation for routing
       # and prompt caching. Generate one yourself (e.g. `uuidgen`) and export

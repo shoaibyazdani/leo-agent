@@ -393,6 +393,8 @@ class ChatRequest(BaseModel):
     channel: str = "api"
     subject: str | None = None
     conversation_id: str | None = None
+    attachments: list[Any] = Field(default_factory=list)
+    attachment_ids: list[str] = Field(default_factory=list)
 
     @field_validator("message")
     @classmethod
@@ -670,10 +672,13 @@ async def attachment_content(attachment_id: str) -> FileResponse:
 
 @api.post("/chat")
 async def chat(request: Request, req: ChatRequest) -> dict[str, Any]:
-    if not req.message.strip():
+    if not req.message.strip() and not req.attachments and not req.attachment_ids:
         raise HTTPException(400, "empty message")
     try:
-        result = await get_app().ask(req.message, req.channel, req.subject, req.conversation_id)
+        combined = list(req.attachments) + [{"id": item} for item in req.attachment_ids]
+        result = await get_app().ask(
+            req.message, req.channel, req.subject, req.conversation_id, combined
+        )
     except Exception as exc:  # noqa: BLE001 - boundary must never leak a 500/raw traceback
         code = str(getattr(exc, "code", None) or type(exc).__name__)[:80]
         result = ChatResponse(

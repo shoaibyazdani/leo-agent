@@ -7,13 +7,13 @@ CLI/API/dashboard.
 ## Quick start (local-only)
 
 ```bash
-# Run from the repository root
+# From /Users/macbook/LEO
 uv venv --python 3.12 .venv
 uv pip install -e .
-uv run python -m leo.interfaces.cli init
-uv run python -m leo.interfaces.cli doctor
-uv run python -m leo.interfaces.cli ask "What can you do?"
-uv run python -m leo.interfaces.cli serve   # http://127.0.0.1:8765
+.venv/bin/python -m leo.interfaces.cli init
+.venv/bin/python -m leo.interfaces.cli doctor
+.venv/bin/python -m leo.interfaces.cli ask "What can you do?"
+.venv/bin/python -m leo.interfaces.cli serve     # http://127.0.0.1:8765
 ```
 
 Or use the installed entry point: `leo doctor`, `leo ask "..."`, `leo serve`.
@@ -33,20 +33,25 @@ models:
       base_url: https://provider.example/v1
       api_key_env: MY_API_KEY_ENV  # name of env var holding the secret
       model: exact-model-id-from-provider-docs
+      # Declare only what the model really supports. `vision` routes image
+      # attachments to this provider as image content blocks; without it an
+      # image turn fails with "no enabled provider satisfies the request".
+      capabilities: [text, streaming, tools, structured, usage, vision]
 ```
 
 When `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` / `ANTHROPIC_AUTH_TOKEN` are set,
 LEO automatically registers an `opencode-go` provider using those values. The
-provider is the **OpenCode Go gateway** (the base URL); the model ID is exactly
-the one the gateway serves (see its docs). A provider name is a local routing
-key only — never put a model alias in the provider slot or a different vendor's
-model ID in `model`, or traffic goes to the wrong backend.
+provider is the **OpenCode Go gateway** (the base URL); the model ID is whatever
+the gateway expects (for this environment, `hy4-flash-free`). A provider name
+is a local routing key only — never put a model alias in the provider slot or a
+different vendor's model ID in `model`, or traffic goes to the wrong backend.
 `mock` provider is always available for offline use and tests. Never put a
 secret value in config, prompts, logs or tool output.
 
 ## Architecture and status
 
 - [LEO_ARCHITECTURE.md](LEO_ARCHITECTURE.md) — module boundaries and state model
+- [LEO_BUILD_PLAN.md](LEO_BUILD_PLAN.md) — phase ledger
 - [LEO_PROGRESS.md](LEO_PROGRESS.md) — verified milestones
 - [LEO_DECISIONS.md](LEO_DECISIONS.md) — engineering decisions
 - [LEO_INTEGRATIONS.md](LEO_INTEGRATIONS.md) — real vs blocked integrations; [channel matrix](LEO_INTEGRATIONS.md#channel-matrix-2026-11-18) (22 auto-registered adapters appear in Connected Surfaces; live delivery blocked until credentials are supplied)
@@ -56,11 +61,12 @@ secret value in config, prompts, logs or tool output.
 - [docs/CAPABILITY_INVENTORY.md](docs/CAPABILITY_INVENTORY.md) — Hermes/OpenClaw inventory
 - [research/deep-2026-11-18/SYNTHESIS.md](research/deep-2026-11-18/SYNTHESIS.md) — deep source/runtime research, fixes and remaining gaps
 - [NOTICE](NOTICE) — upstream license attribution
+- [docs/GIT_PUSH_PLAN.md](docs/GIT_PUSH_PLAN.md) — pre-push secret audit and procedure
 
 ## Tests
 
 ```bash
-uv run pytest -q
+.venv/bin/python -m pytest -q
 ```
 
 ## Safety
@@ -86,7 +92,8 @@ one signal-teal accent, and locally bundled Space Grotesk / IBM Plex fonts — n
 network requests at runtime. Tokens live in `static/ui/theme.css`, reusable
 components in `static/ui/components.css`, and behaviour in `static/ui/app.js`.
 All eleven views share these files; there are no one-off colors or styles.
-Before/after evidence: [docs/gallery/](docs/gallery/).
+Before/after evidence: [docs/gallery/](docs/gallery/) and
+[artifacts/screenshots/ui/](artifacts/screenshots/ui/).
 
 The conversation view streams replies over `POST /chat/stream` (SSE via
 `fetch`), shows live status and tool-call rows, supports Stop/cancel, and
