@@ -56,16 +56,14 @@ secret value in config, prompts, logs or tool output.
 ## Architecture and status
 
 - [LEO_ARCHITECTURE.md](LEO_ARCHITECTURE.md) — module boundaries and state model
-- [LEO_BUILD_PLAN.md](LEO_BUILD_PLAN.md) — phase ledger
-- [LEO_PROGRESS.md](LEO_PROGRESS.md) — verified milestones
+- [STATUS.md](STATUS.md) — current status and limits
 - [LEO_DECISIONS.md](LEO_DECISIONS.md) — engineering decisions
 - [LEO_INTEGRATIONS.md](LEO_INTEGRATIONS.md) — real vs blocked integrations; [channel matrix](LEO_INTEGRATIONS.md#channel-matrix-2026-11-18) (22 auto-registered adapters appear in Connected Surfaces; live delivery blocked until credentials are supplied)
 - [LEO_SECURITY.md](LEO_SECURITY.md) — permissions, approvals, audit
-- [LEO_TEST_REPORT.md](LEO_TEST_REPORT.md) — test evidence
+- [docs/TESTING.md](docs/TESTING.md) — how to run the suite
 - [LEO_KNOWN_ISSUES.md](LEO_KNOWN_ISSUES.md) — honest limitations
-- [docs/CAPABILITY_INVENTORY.md](docs/CAPABILITY_INVENTORY.md) — Hermes/OpenClaw inventory
+- [docs/CAPABILITY_INVENTORY.md](docs/CAPABILITY_INVENTORY.md) — design rationale: Hermes/OpenClaw inventory
 - [NOTICE](NOTICE) — upstream license attribution
-- [docs/GIT_PUSH_PLAN.md](docs/GIT_PUSH_PLAN.md) — pre-push secret audit and procedure
 
 ## Tests
 
@@ -96,11 +94,9 @@ one signal-teal accent, and locally bundled Space Grotesk / IBM Plex fonts — n
 network requests at runtime. Tokens live in `static/ui/theme.css`, reusable
 components in `static/ui/components.css`, and behaviour in `static/ui/app.js`.
 All eleven views share these files; there are no one-off colors or styles.
-Before/after evidence: [docs/gallery/](docs/gallery/) and
-[artifacts/screenshots/ui/](artifacts/screenshots/ui/).
+Before/after evidence: [docs/gallery/](docs/gallery/).
 
 The conversation view streams replies over `POST /chat/stream` (SSE via
 `fetch`), shows live status and tool-call rows, supports Stop/cancel, and
-accepts images and files through `POST /attachments`. See
-[docs/CHAT_REALTIME_PLAN.md](docs/CHAT_REALTIME_PLAN.md) and the
-upstream research.
+accepts images and files through `POST /attachments`. The long-conversation
+observer harness is documented in [scripts/README.md](scripts/README.md).

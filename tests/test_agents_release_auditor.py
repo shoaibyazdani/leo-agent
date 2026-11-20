@@ -116,7 +116,7 @@ async def test_audit_path_over_seeded_status_records():
             "claim": "Release audit is implemented and documented",
             # Publishable docs only: the release tree removes the planning
             # documents, so evidence must point at files that ship.
-            "source": "LEO_PROGRESS.md",
+            "source": "STATUS.md",
             "doc": "LEO_SECURITY.md",
             "quote": "Atomic decision + audit commit",
             "code": ["leo/agents/specs/release_auditor.py"],

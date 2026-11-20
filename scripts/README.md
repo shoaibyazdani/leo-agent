@@ -2,7 +2,7 @@
 
 Owner artifact: `scripts/leo_conversation_observer.py`
 Tests: `tests/test_conversation_observer.py`
-This document: `docs/LEO_OBSERVATION_SCENARIOS.md`
+This document: `scripts/README.md`
 
 ## Purpose
 

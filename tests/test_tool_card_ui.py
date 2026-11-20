@@ -143,3 +143,18 @@ def test_repeated_approval_cards_are_grouped_into_one_collapsed_card() -> None:
     )
     for needle in css_needles:
         assert needle in CHAT_CSS
+
+
+def test_reasoning_panel_sits_above_the_answer_and_collapses_when_done() -> None:
+    """Providers may stream reasoning after the text; it must not land below.
+
+    A stale-looking THINKING card at the end of a finished answer was the
+    shipped bug: the panel was appended to the message node. It is inserted
+    before the content node, and a terminal run collapses it.
+    """
+    helper = block(CHAT_JS, "function attachReasoningPanel(stream)", "function appendReasoning(")
+    assert ".chat-msg__content" in helper
+    assert "insertBefore(reasoning.panel, contentNode)" in helper
+    finalize = block(CHAT_JS, "function finalizeReasoning(stream, terminal = false)", "function finalizeTurnReasoning(")
+    assert "panel.open = false" in finalize
+    assert "terminal && stream.reasoningSeen" in finalize

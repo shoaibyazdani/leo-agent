@@ -1,4 +1,4 @@
-# LEO Capability Inventory
+# LEO Design Rationale — Capability Inventory (Hermes / OpenClaw)
 
 Classification values: `native`, `compatible-adapter`, `official-integration`, `independent-reimplementation`, `deferred`.
 
@@ -93,8 +93,7 @@ and must not be quoted as current. These counts are verified by
 The status column in the table above now carries local LEO evidence per row;
 this overlay summarizes test-backed areas and takes precedence only where it
 adds newer information. The historical **689 passed / 8 skipped** figure in
-`LEO_PROGRESS.md` and `leo_state.json` is a 2026-11-18 snapshot;
-`LEO_TEST_REPORT.md` records the still earlier 403-passed snapshot. The current
+[STATUS.md](../STATUS.md) records the current roster; the earlier snapshots
 suite roster is larger and must be re-measured with
 `python -m pytest -o addopts='' -q` — no current pass count is
 asserted here. Skips are opt-in live/optional-crypto checks. Anything not
@@ -114,8 +113,8 @@ deferred, or blocked as recorded.
 | Central fail-closed inbound admission (`leo/integrations/admission.py`, `ChannelsConfig`) | Implemented, unit-tested (internal surfaces always allowed; empty external allowlist denies everyone) | `tests/test_channels_registry.py`, `tests/test_integrations.py` |
 | Auto-discovered channel registry + Connected Surfaces sync (`LeoApp.initialize()` → `sync_integration_records()`, `leo integrations [--sync]`) | Implemented, unit-tested (upserts honest `blocked` records) | `tests/test_channels_registry.py` |
 | Dynamic webhook/poll routes (401 bad signature, 403 valid sender not admitted, 404 unknown channel; signed challenge echo; `POST /channels/{channel}/poll`) | Implemented, unit-tested | `tests/test_channels_registry.py` |
-| Model gateway (`opencode-go`) | Env-conditional: live when host supplies `ANTHROPIC_AUTH_TOKEN` + `LEO_OPENCODE_SESSION` (real pass recorded in `LEO_PROGRESS.md`); mock fallback otherwise; no fresh live verification here | `tests/test_models.py`, `tests/test_router_default.py` |
-| Full offline suite | Current count not asserted here; 689 passed / 8 skipped was a historical 2026-11-18 snapshot, not current evidence | `LEO_TEST_REPORT.md`, `LEO_PROGRESS.md`, `leo_state.json` |
+| Model gateway (`opencode-go`) | Env-conditional: live when host supplies `ANTHROPIC_AUTH_TOKEN` + `LEO_OPENCODE_SESSION` (an earlier real pass is recorded in git history); mock fallback otherwise; no fresh live verification here | `tests/test_models.py`, `tests/test_router_default.py` |
+| Full offline suite | Current count not asserted here; see `docs/TESTING.md` and re-run the suite | `docs/TESTING.md`, git history |
 | Browser automation | Implemented; fake-backend unit test plus live local Chromium page | `tests/test_integrations.py`, `tests/test_browser_live.py` |
 | Computer interaction (macOS) | Implemented; dry-run/permission mock-tested; live OS actions not exercised | `tests/test_integrations.py`, `tests/test_operator_tools.py` |
 | Event-driven automation / webhook ingress | Implemented, unit-tested | `tests/test_tasks.py`, `tests/test_integrations.py`, `tests/test_harden_events.py` |

@@ -906,7 +906,15 @@
     reasoning.node = stream.node;  // the exact assistant message this panel belongs to
     reasoning.runId = stream.runId || null;
     reasoning.panel.dataset.reasoningRun = reasoning.runId || '';
-    stream.node.appendChild(reasoning.panel);  // never inside .chat-msg__content
+    // The panel belongs ABOVE the answer: providers may stream reasoning after
+    // the visible text, and appending would leave a stale-looking THINKING
+    // card below the response. Insert before the content node when it exists.
+    const contentNode = stream.node.querySelector('.chat-msg__content');
+    if (contentNode && contentNode.parentNode === stream.node) {
+      stream.node.insertBefore(reasoning.panel, contentNode);
+    } else {
+      stream.node.appendChild(reasoning.panel);  // never inside .chat-msg__content
+    }
     stream.reasoning = reasoning;
     stream.reasoningBuffer = '';
     stream.reasoningSeen = false;
@@ -983,6 +991,11 @@
       detachReasoningPanel(stream);
       stream.reasoningFinalized = true;
       return;
+    }
+    if (terminal && stream.reasoningSeen) {
+      // Finished turns keep the transcript but collapse it: a completed answer
+      // must not end with an open, stale THINKING block.
+      panel.open = false;
     }
     stream.reasoningFinalized = true;
   }

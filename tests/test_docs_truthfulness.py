@@ -18,8 +18,8 @@ INVENTORY = ROOT / "docs" / "CAPABILITY_INVENTORY.md"
 KNOWN_ISSUES = ROOT / "LEO_KNOWN_ISSUES.md"
 INTEGRATIONS = ROOT / "LEO_INTEGRATIONS.md"
 SECURITY = ROOT / "LEO_SECURITY.md"
-TEST_REPORT = ROOT / "LEO_TEST_REPORT.md"
-PROGRESS = ROOT / "LEO_PROGRESS.md"
+TEST_REPORT = ROOT / "docs" / "TESTING.md"
+PROGRESS = ROOT / "STATUS.md"
 GIT_PLAN = ROOT / "docs" / "GIT_PUSH_PLAN.md"
 HANDOFF = ROOT / "handoff_2026-11-18.md"
 
@@ -162,7 +162,6 @@ def test_tool_command_and_agent_counts_match_test_backed_roster() -> None:
         if "18 tools, 12 skills" in line:
             assert any(marker in line.lower() for marker in ("stale", "historical")), line
     assert "All 14 phases delivered" not in progress
-    assert "Phases 0-14 produced working local implementations" in progress
 
     inventory = INVENTORY.read_text(encoding="utf-8")
     normalized_inventory = " ".join(inventory.split())  # markdown line wrapping
@@ -203,8 +202,8 @@ def test_suite_counts_are_marked_historical() -> None:
                     f"{path.name}: unqualified stale test count: {line}"
                 )
     report = TEST_REPORT.read_text(encoding="utf-8")
-    assert "# LEO Test Report — 2026-11-18" in report
-    assert "suite on the current working tree" not in report
+    assert "# Testing LEO" in report
+    assert "pytest" in report
 
 
 def test_git_plan_head_is_not_stale() -> None:
@@ -237,13 +236,11 @@ def test_git_plan_head_is_not_stale() -> None:
     assert "No push has been performed yet." in text
 
 
-def test_stress_narratives_are_labeled_unreproducible() -> None:
+def test_stress_narratives_are_not_published() -> None:
+    """Unreproducible stress numbers are no longer part of the tree at all."""
     text = PROGRESS.read_text(encoding="utf-8").lower()
-    assert "1000/1000" in text and "999/1000" in text
-    assert "not reproducible from this tree" in text
-    assert "no stress harness is committed" in text
-    assert "agent_reports/" in text and "absent" in text
-    assert "historical verification notes" in text
+    assert "1000/1000" not in text and "999/1000" not in text
+    assert "agent_reports/" not in text
 
 
 def test_security_does_not_contradict_browser_startup_or_closed_gaps() -> None:

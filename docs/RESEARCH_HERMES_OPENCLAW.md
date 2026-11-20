@@ -1,4 +1,4 @@
-# Hermes Agent and OpenClaw — Official Capability Research
+# LEO Design Rationale — Hermes Agent and OpenClaw Research
 
 **Retrieved:** 2026-11-18. **Scope:** official repositories, official documentation sites, and license files only. No LEO integration has been implemented or tested as part of this research.
 

@@ -58,7 +58,7 @@ earlier live attempt returned HTTP 400 because the gateway requires an
 environment provides the token (`ANTHROPIC_AUTH_TOKEN`) and the session value
 (`LEO_OPENCODE_SESSION`)**; it **degrades to mock** (the configured `mock`
 fallback) when they are absent. It is not a universal BLOCKED capability, and it is not a
-claim that live verification was re-run here — `LEO_PROGRESS.md` records a real
+claim that live verification was re-run here — An earlier run recorded a real
 production pass on a suitably configured host, while the offline `mock` provider
 is what tests use by default. No endpoint, credential or model ID was invented.
 

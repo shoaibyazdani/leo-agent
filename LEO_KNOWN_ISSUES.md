@@ -177,7 +177,7 @@ Details and evidence: deep research synthesis.
    environment supplies both values, the live provider is available**;
    otherwise it degrades to mock (the configured `mock` fallback). An earlier real
    attempt returned HTTP 400 only because the session value was missing then.
-   `LEO_PROGRESS.md` records a real-model pass (real calculator/current_time
+   An earlier run recorded a real-model pass (real calculator/current_time
    tool calls and non-estimated token usage) on a host that supplied them. This
    is a record of that pass, **not a fresh live verification performed for this
    document update** — no live call was made here. The default offline suite
