@@ -20,7 +20,7 @@ independent review also closed a config-file host bypass, terminal flag-operand
 path escapes, the standalone fallback task engine's evidence gap, and a
 cross-origin token leak in Electron.
 
-Details and evidence: [deep research synthesis](research/deep-2026-11-18/SYNTHESIS.md).
+Details and evidence: deep research synthesis.
 
 ## Fixed after the deep-research round (2026-11-18)
 

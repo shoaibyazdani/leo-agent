@@ -60,7 +60,7 @@ snapshot (superseded by the larger current roster).
 Hermes/OpenClaw source and runtimes and LEO's code/security/skills. Three P0
 security defects, the task evidence/cancellation gaps, and the SKILL.md import
 semantics were fixed with regression tests. See
-[research/deep-2026-11-18/SYNTHESIS.md](research/deep-2026-11-18/SYNTHESIS.md).
+the upstream research notes
 Remaining atomicity/replay/tool-scoping gaps were recorded in
 [LEO_KNOWN_ISSUES.md](LEO_KNOWN_ISSUES.md); later rounds fixed several of them.
 

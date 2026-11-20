@@ -19,7 +19,7 @@ does not imply runtime compatibility: none of 327 real upstream SKILL.md files
 was executable in LEO, availability gates are retained as inert `gates` data,
 and imported scripts are never run. Do not read "compatible-adapter" below as
 functional execution. Evidence:
-[skill compatibility test](../research/deep-2026-11-18/skill-compatibility.md).
+[skill compatibility test](../the upstream research notes).
 Sources and license details: [research report](RESEARCH_HERMES_OPENCLAW.md).
 
 | Capability | Origin | Description | Dependencies | License | Compatibility | Security implications | Integration difficulty | LEO implementation | Classification | Verification status |

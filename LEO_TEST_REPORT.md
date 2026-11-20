@@ -80,7 +80,7 @@ Ten independent agents tested both upstream projects at pinned commits, ran
 real offline chat/tool E2E tests against loopback mock providers (both upstream
 projects completed a full turn), and audited LEO source, security, licensing and
 327 real upstream `SKILL.md` files. Evidence and fix log:
-[deep research synthesis](research/deep-2026-11-18/SYNTHESIS.md).
+deep research synthesis.
 
 New regression coverage from that round: approval-ID binding, webhook
 fail-closed/raw-byte HMAC, API token auth, terminal command policy, evidence

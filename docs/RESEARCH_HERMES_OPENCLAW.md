@@ -17,10 +17,10 @@ Later source audits at pinned commits supersede several doc-level claims below:
   the earlier wording.
 - "Similar skill shape suggests a shared loader" is too optimistic: metadata
   import works for a subset; none of 327 tested real skills was executable in
-  LEO. See [deep research](../research/deep-2026-11-18/SYNTHESIS.md).
+  LEO. See [deep research](../the upstream research notes).
 
-Full evidence: [Hermes source audit](../research/deep-2026-11-18/hermes-source.md)
-and [OpenClaw source audit](../research/deep-2026-11-18/openclaw-source.md).
+Full evidence: [Hermes source audit](../the upstream research notes)
+and [OpenClaw source audit](../the upstream research notes).
 
 ## 0. Method and limits
 

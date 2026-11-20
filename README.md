@@ -64,7 +64,6 @@ secret value in config, prompts, logs or tool output.
 - [LEO_TEST_REPORT.md](LEO_TEST_REPORT.md) — test evidence
 - [LEO_KNOWN_ISSUES.md](LEO_KNOWN_ISSUES.md) — honest limitations
 - [docs/CAPABILITY_INVENTORY.md](docs/CAPABILITY_INVENTORY.md) — Hermes/OpenClaw inventory
-- [research/deep-2026-11-18/SYNTHESIS.md](research/deep-2026-11-18/SYNTHESIS.md) — deep source/runtime research, fixes and remaining gaps
 - [NOTICE](NOTICE) — upstream license attribution
 - [docs/GIT_PUSH_PLAN.md](docs/GIT_PUSH_PLAN.md) — pre-push secret audit and procedure
 
@@ -104,4 +103,4 @@ The conversation view streams replies over `POST /chat/stream` (SSE via
 `fetch`), shows live status and tool-call rows, supports Stop/cancel, and
 accepts images and files through `POST /attachments`. See
 [docs/CHAT_REALTIME_PLAN.md](docs/CHAT_REALTIME_PLAN.md) and the
-[upstream research](research/deep-2026-11-18/realtime-chat-research.md).
+upstream research.

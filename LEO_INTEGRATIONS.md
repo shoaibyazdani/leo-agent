@@ -43,7 +43,7 @@ researched from official sources; no upstream source code was copied. See
 [docs/CAPABILITY_INVENTORY.md](docs/CAPABILITY_INVENTORY.md). Their plugin
 systems are **not** interchangeable; LEO uses declarative adapters only.
 Source-level and runtime evidence for the 2026-11-18 round:
-[deep research synthesis](research/deep-2026-11-18/SYNTHESIS.md).
+deep research synthesis.
 
 ## Model provider note
 

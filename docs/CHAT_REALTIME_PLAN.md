@@ -1,6 +1,6 @@
 # LEO Real-Time Chat & Attachments — Implementation Plan (draft v0.1)
 
-**Status:** research complete (`research/deep-2026-11-18/realtime-chat-research.md`);
+**Status:** research complete (the upstream research notes);
 backend v1 implemented, frontend and hardening in progress.
 
 **Research verdict:** neither upstream uses browser SSE — Hermes embeds its TUI
