@@ -84,7 +84,7 @@ Sources and license details: [research report](RESEARCH_HERMES_OPENCLAW.md).
 ## LEO verification overlay (updated 2026-11-19)
 
 **Current-state roster (measured from the live `LeoApp.initialize()` composition
-root on 2026-11-20):** 95 unique model-callable tools, 35 available slash
+root on 2026-11-20):** 96 unique model-callable tools, 35 available slash
 commands (127 registered slash commands in all; 92 explicitly unavailable) and
 24 specialist agents. Older 93-tool, 34-command and 20-agent figures are stale
 and must not be quoted as current. These counts are verified by

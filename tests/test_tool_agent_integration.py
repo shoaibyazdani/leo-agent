@@ -59,23 +59,23 @@ async def app(monkeypatch: pytest.MonkeyPatch) -> LeoApp:
 async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     names = [spec.name for spec in app.registry.list_specs()]
     assert names and len(names) == len(set(names)), "duplicate tool names"
-    # 23 non-operator registrar modules advertise 78 specs (this roster count
+    # 24 non-operator registrar modules advertise 79 specs (this roster count
     # still includes json_query); the operator registrar adds 9 and builtins add
-    # another 9, for 96 advertised names. json_query is deliberately withdrawn
+    # another 9, for 97 advertised names. json_query is deliberately withdrawn
     # from the model-callable catalogue because its caller-supplied data/default
-    # arguments let a model feed invented numbers back as evidence, leaving 95
+    # arguments let a model feed invented numbers back as evidence, leaving 96
     # unique live names. preview_tools, http_tools and conversation_tools are all
     # part of the shipped roster, not optional extras.
-    assert len(app.tool_roster) == 24, (
-        "expected the live 24-module tool roster including preview_tools, "
+    assert len(app.tool_roster) == 25, (
+        "expected the live 25-module tool roster including preview_tools, "
         f"http_tools and conversation_tools; got {sorted(app.tool_roster)}"
     )
     registrars = {key: value for key, value in app.tool_roster.items() if key != "operator_tools"}
-    assert len(registrars) == 23, sorted(registrars)
+    assert len(registrars) == 24, sorted(registrars)
     assert {"preview_tools", "http_tools", "conversation_tools"} <= set(registrars)
-    assert sum(len(value) for value in registrars.values()) == 78
+    assert sum(len(value) for value in registrars.values()) == 79
     assert len(app.tool_roster["operator_tools"]) == 9
-    assert len(names) == 95
+    assert len(names) == 96
     assert "json_query" not in names  # operator/offline only, never model-callable
     assert all(app.tool_roster.values())
     for roster_names in app.tool_roster.values():
@@ -200,8 +200,17 @@ async def test_every_toolset_executes_through_real_executor(
         ("skill_tools", "skill_list", {}),
         ("task_tools", "task_list", {}),
         ("webhook_tools", "webhook_routes", {}),
+        ("model_config_tools", "model_add", {
+            "name": "probe", "preset": "openrouter", "model": "probe/model",
+            "config_path": str(app.settings.resolve(app.settings.paths.workspaces)
+                              / "toolset-probe" / "probe-leo.yaml"),
+        }),
     ]
     assert {module for module, _, _ in calls} == set(app.tool_roster)
+    # model_add is HIGH risk: exercise its real write path with the gate
+    # relaxed for this coverage run only (writing a throwaway config).
+    high_risk_backup = app.settings.security.high_risk_requires_approval
+    app.settings.security.high_risk_requires_approval = False
     seen_modules: set[str] = set()
     outputs: dict[str, dict] = {}
     for module, name, arguments in calls:
@@ -217,7 +226,8 @@ async def test_every_toolset_executes_through_real_executor(
         assert result.success is True, f"{module}/{name}: {result.error}"
         outputs[module] = result.output
         seen_modules.add(module)
-    assert len(seen_modules) == 24
+    app.settings.security.high_risk_requires_approval = high_risk_backup
+    assert len(seen_modules) == 25
     # The added toolsets really ran: a value decoded from the fetched HTTP
     # response, the process-local preview table's close handler, and a real
     # page read from the seeded durable conversation.

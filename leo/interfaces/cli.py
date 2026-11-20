@@ -16,7 +16,7 @@ from ..config import Settings
 from ..contracts import MemoryCategory, MemoryKind, TaskStatus
 from ..core import LeoApp
 
-cli = typer.Typer(name="leo", help="LEO autonomous agent platform", no_args_is_help=True)
+cli = typer.Typer(name="leo", help="LEO autonomous agent platform", no_args_is_help=False)
 task_app = typer.Typer(help="Durable task management")
 skill_app = typer.Typer(help="Native skills")
 memory_app = typer.Typer(help="Persistent memory")
@@ -283,6 +283,47 @@ def approval_cleanup(
     show(report)
 
 
+@model_app.command("presets")
+def model_presets() -> None:
+    """List built-in provider presets usable with `leo model add`."""
+    from ..models.presets import PRESETS
+
+    show({
+        name: {
+            "kind": preset["kind"],
+            "base_url": preset["base_url"],
+            "api_key_env": preset["api_key_env"],
+            "capabilities": preset["capabilities"],
+        }
+        for name, preset in PRESETS.items()
+    })
+
+
+@model_app.command("add")
+def model_add(
+    name: str,
+    preset: str = typer.Option("openai-compatible", "--preset", help="provider preset, see `leo model presets`"),
+    model: str = typer.Option(..., "--model", help="exact model id the provider serves"),
+    api_key_env: str = typer.Option(None, "--api-key-env", help="env-var NAME holding the key (never the key)"),
+    base_url: str = typer.Option(None, "--base-url", help="override the preset endpoint"),
+    capabilities: str = typer.Option(None, "--capabilities", help="comma-separated; e.g. text,tools,vision"),
+    make_default: bool = typer.Option(False, "--default", help="also set models.default"),
+    config_path: str = typer.Option("leo.yaml", "--config", help="config file to update"),
+) -> None:
+    """Add a model provider to the config (validated, with a backup)."""
+    from ..models.presets import add_provider, build_provider_entry
+
+    caps = [item.strip() for item in capabilities.split(",") if item.strip()] if capabilities else None
+    with _handle_errors("model add"):
+        entry = build_provider_entry(
+            preset, model, api_key_env=api_key_env, base_url=base_url, capabilities=caps
+        )
+        result = add_provider(
+            name, entry, config_path=config_path, make_default=make_default
+        )
+    show(result)
+
+
 @model_app.command("list")
 def model_list() -> None:
     show({name: provider.model_dump(mode="json") for name, provider in _settings().models.providers.items()})
@@ -326,6 +367,27 @@ def integrations(sync: bool = typer.Option(False, "--sync", help="upsert channel
     from ..integrations.channels import integration_records
 
     show([record.model_dump(mode="json") for record in integration_records()])
+
+
+def _should_open_tui() -> bool:
+    """Bare ``leo`` opens the chat only for an interactive terminal."""
+    import sys
+
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+@cli.callback(invoke_without_command=True)
+def _root(ctx: typer.Context) -> None:
+    """Bare invocation: open the terminal chat, or print help when piped."""
+    if ctx.invoked_subcommand is not None:
+        return
+    if _should_open_tui():
+        _start_chat(None)
+    typer.echo(ctx.get_help())
+    raise typer.Exit(0)
 
 
 def main() -> None:

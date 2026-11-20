@@ -7,21 +7,41 @@ CLI/API/dashboard.
 ## Quick start (local-only)
 
 ```bash
-# Run from the repository root
-uv venv --python 3.12 .venv
-uv pip install -e .
-uv run python -m leo.interfaces.cli init
-uv run python -m leo.interfaces.cli doctor
-uv run python -m leo.interfaces.cli ask "What can you do?"
-uv run python -m leo.interfaces.cli serve     # http://127.0.0.1:8765
+git clone https://github.com/shoaibyazdani/leo-agent.git
+cd leo-agent
+sh install.sh
+leo
 ```
 
-Or use the installed entry point: `leo doctor`, `leo ask "..."`, `leo chat`, `leo serve`.
+`sh install.sh` creates the Python 3.12 virtualenv with `uv`, installs LEO,
+initializes local state and puts a `leo` launcher on your PATH. After that,
+bare `leo` opens the terminal chat.
+
+Manual install (already have a checkout):
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install -e .
+uv run python -m leo.interfaces.cli chat
+```
 
 `leo chat` (alias `leo tui`) streams replies and reasoning, shows tool rows and
 approval gates live, and accepts `/help`, `/new`, `/model`, `/tools`,
 `/agents`, `/approvals`, `/approve <id>`, `/deny <id>`. Resume a session with
-`leo chat --conversation <id>`.
+`leo chat --conversation <id>`. `leo serve` starts the dashboard and API on
+<http://127.0.0.1:8765>; `leo --help` lists every command.
+
+Add providers without editing YAML by hand:
+
+```bash
+leo model presets
+leo model add openrouter --preset openrouter --model openrouter/auto \
+    --api-key-env OPENROUTER_API_KEY --default
+```
+
+Only the environment-variable NAME is stored; the key itself stays in your
+environment (for the launcher, put `export OPENROUTER_API_KEY=...` lines in
+`~/.config/leo/env`).
 
 ## Model configuration
 
