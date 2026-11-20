@@ -7,13 +7,13 @@ CLI/API/dashboard.
 ## Quick start (local-only)
 
 ```bash
-# From /Users/macbook/LEO
+# Run from the repository root
 uv venv --python 3.12 .venv
 uv pip install -e .
-.venv/bin/python -m leo.interfaces.cli init
-.venv/bin/python -m leo.interfaces.cli doctor
-.venv/bin/python -m leo.interfaces.cli ask "What can you do?"
-.venv/bin/python -m leo.interfaces.cli serve     # http://127.0.0.1:8765
+uv run python -m leo.interfaces.cli init
+uv run python -m leo.interfaces.cli doctor
+uv run python -m leo.interfaces.cli ask "What can you do?"
+uv run python -m leo.interfaces.cli serve     # http://127.0.0.1:8765
 ```
 
 Or use the installed entry point: `leo doctor`, `leo ask "..."`, `leo chat`, `leo serve`.
@@ -47,7 +47,7 @@ models:
 When `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` / `ANTHROPIC_AUTH_TOKEN` are set,
 LEO automatically registers an `opencode-go` provider using those values. The
 provider is the **OpenCode Go gateway** (the base URL); the model ID is whatever
-the gateway expects (for this environment, `hy4-flash-free`). A provider name
+the gateway expects (see the provider's documentation). A provider name
 is a local routing key only — never put a model alias in the provider slot or a
 different vendor's model ID in `model`, or traffic goes to the wrong backend.
 `mock` provider is always available for offline use and tests. Never put a
@@ -70,7 +70,7 @@ secret value in config, prompts, logs or tool output.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q
+uv run pytest -q
 ```
 
 ## Safety
