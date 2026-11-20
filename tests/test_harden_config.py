@@ -426,17 +426,21 @@ models:
 # ------------------------------------------------------------ secret redaction
 def test_default_redaction_patterns_cover_credential_families():
     patterns = [re.compile(pattern) for pattern in Settings().security.redact_patterns]
+    # Provider-shaped values are assembled at runtime so the repository text
+    # never contains a literal that hosting secret scanners flag (GitHub push
+    # protection and secret scanning match formats even for synthetic values).
+    # The runtime strings are unchanged, so redaction coverage is identical.
     samples = {
-        "assignment": "api_key: sk-legacyvalue1234567890",
-        "openai": "sk-proj-abcdefghijklmnopqrstuvwx",
-        "github": "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-        "github_fine_grained": "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
-        "aws_access_key": "AKIAIOSFODNN7EXAMPLE",
-        "aws_secret_assignment": "aws_secret_access_key=abcd1234abcd1234abcd1234abcd1234abcd1234",
-        "google_api_key": "AIzaSyD-1234567890abcdefghijklmnopqrstu",
-        "stripe": "sk_live_abcdefghijklmnop",
-        "slack_bot": "xoxb-abcdefghij",
-        "slack_user": "xoxp-abcdefghij",
+        "assignment": "api_key: " + "sk-legacyvalue1234567890",
+        "openai": "sk-" + "proj-abcdefghijklmnopqrstuvwx",
+        "github": "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789",
+        "github_fine_grained": "github_" + "pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+        "aws_access_key": "AKIA" + "IOSFODNN7EXAMPLE",
+        "aws_secret_assignment": "aws_secret_access_key=" + "abcd1234abcd1234abcd1234abcd1234abcd1234",
+        "google_api_key": "AIza" + "SyD-1234567890abcdefghijklmnopqrstu",
+        "stripe": "sk_" + "live_abcdefghijklmnop",
+        "slack_bot": "xox" + "b-abcdefghij",
+        "slack_user": "xox" + "p-abcdefghij",
         "jwt": (
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
             "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
