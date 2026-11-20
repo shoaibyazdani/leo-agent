@@ -120,6 +120,28 @@ def ask(message: str, channel: str = "cli", conversation: str | None = None) -> 
     show(run(_app().ask, message, channel=channel, conversation_id=conversation))
 
 
+def _start_chat(conversation: str | None) -> None:
+    from .tui import run_tui
+
+    raise typer.Exit(run_tui(ready(), conversation))
+
+
+@cli.command("chat")
+def chat(conversation: str | None = typer.Option(
+    None, "--conversation", "-c", help="resume this conversation id (default: new)")
+) -> None:
+    """Interactive terminal chat — streaming replies, tools and approvals."""
+    _start_chat(conversation)
+
+
+@cli.command("tui")
+def tui(conversation: str | None = typer.Option(
+    None, "--conversation", "-c", help="resume this conversation id (default: new)")
+) -> None:
+    """Alias for `leo chat`."""
+    _start_chat(conversation)
+
+
 @cli.command()
 def serve(host: str | None = None, port: int | None = None) -> None:
     """Start the local HTTP API and web dashboard."""

@@ -16,7 +16,12 @@ uv pip install -e .
 .venv/bin/python -m leo.interfaces.cli serve     # http://127.0.0.1:8765
 ```
 
-Or use the installed entry point: `leo doctor`, `leo ask "..."`, `leo serve`.
+Or use the installed entry point: `leo doctor`, `leo ask "..."`, `leo chat`, `leo serve`.
+
+`leo chat` (alias `leo tui`) streams replies and reasoning, shows tool rows and
+approval gates live, and accepts `/help`, `/new`, `/model`, `/tools`,
+`/agents`, `/approvals`, `/approve <id>`, `/deny <id>`. Resume a session with
+`leo chat --conversation <id>`.
 
 ## Model configuration
 
