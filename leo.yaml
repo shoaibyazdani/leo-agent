@@ -1,0 +1,37 @@
+# LEO live model configuration.
+# No secret values are stored here: only the NAME of the env var holding the key.
+models:
+  default: opencode-go
+  # No fallback by default: a broken live provider blocks model calls instead
+  # of silently answering with mock output. Mock is available only when
+  # explicitly configured (kind: mock) or via models.allow_mock_fallback=true
+  # / LEO_ALLOW_MOCK_FALLBACK=true for offline use.
+  allow_mock_fallback: false
+  providers:
+    opencode-go:
+      kind: anthropic-compatible
+      base_url: https://opencode.ai/inference/go/anthropic
+      api_key_env: ANTHROPIC_AUTH_TOKEN
+      # Environment-specific: set your provider's model id here (or override
+      # it in a local, uncommitted config). LEO reports an unroutable
+      # provider honestly instead of inventing an answer.
+      model: set-your-model-id
+      capabilities: [text, streaming, tools, structured, usage]
+      context_window: 128000
+      # OpenCode Go requires a stable session ID per conversation for routing
+      # and prompt caching. Generate one yourself (e.g. `uuidgen`) and export
+      # it as LEO_OPENCODE_SESSION before starting LEO. It is not a credential.
+      extra_header_env:
+        x-opencode-session: LEO_OPENCODE_SESSION
+      # Gateway rejects generic library user agents (Cloudflare 1010).
+      extra_headers:
+        User-Agent: leo-agent-os/0.1.0
+
+# Filesystem sandbox: extra roots the agent's path tools (list/read/write/search)
+# may touch, in addition to the project root and .leo/workspaces. Paths outside
+# these roots are denied with "path outside allowed roots".
+security:
+  allowed_roots:
+    # `~` is expanded per operator (see Settings.resolve), so this file stays
+    # portable; add absolute roots only in a local, uncommitted override.
+    - ~/Downloads
