@@ -56,6 +56,10 @@ class NormalizedMessage(BaseRecord):
     sender_id: str | None = None
     conversation_ref: str | None = None
     thread: str | None = None
+    # Provider-side descriptors only (a file id, never bytes). The gateway hands
+    # them to its attachment sink, which downloads and stores them — a channel
+    # adapter must not own the operator's media store.
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def identity(self) -> str:
@@ -488,9 +492,70 @@ class TelegramAdapter(MessagingAdapter):
                     sender_id=sender_id,
                     conversation_ref=_ref(chat.get("id")),
                     thread=_ref(message.get("message_thread_id")),
+                    attachments=self._attachments_from_message(message),
                 )
             )
         return messages
+
+    @staticmethod
+    def _attachments_from_message(message: dict[str, Any]) -> list[dict[str, Any]]:
+        """Provider descriptors for a photo/document — else a photo is an empty message."""
+        out: list[dict[str, Any]] = []
+        photos = message.get("photo")
+        if isinstance(photos, list) and photos:
+            best = max(
+                (p for p in photos if isinstance(p, dict)),
+                key=lambda p: int(p.get("file_size") or p.get("width") or 0),
+                default=None,
+            )
+            if best and best.get("file_id"):
+                out.append({
+                    "kind": "photo",
+                    "file_id": str(best["file_id"]),
+                    "mime": "image/jpeg",
+                    "name": "photo.jpg",
+                    "size": int(best.get("file_size") or 0),
+                })
+        document = message.get("document")
+        if isinstance(document, dict) and document.get("file_id"):
+            out.append({
+                "kind": "document",
+                "file_id": str(document["file_id"]),
+                "mime": str(document.get("mime_type") or "application/octet-stream"),
+                "name": str(document.get("file_name") or "document"),
+                "size": int(document.get("file_size") or 0),
+            })
+        return out
+
+    async def download(self, descriptor: dict[str, Any]) -> tuple[bytes, str, str]:
+        """Fetch one descriptor's bytes through getFile. Returns (raw, mime, name)."""
+        token = credential("TELEGRAM_BOT_TOKEN")
+        if not token:
+            raise MessagingError("telegram download blocked: TELEGRAM_BOT_TOKEN is not set")
+        file_id = str(descriptor.get("file_id") or "")
+        if not file_id:
+            raise MessagingError("telegram download blocked: descriptor has no file_id")
+        meta_url = f"{self.API_BASE}/bot{token}/getFile"
+        response = await self._http().post(meta_url, json={"file_id": file_id}, timeout=self.timeout)
+        if response.status_code >= 400:
+            raise MessagingError(f"telegram getFile failed: HTTP {response.status_code}")
+        try:
+            meta = response.json()
+        except ValueError as exc:
+            raise MessagingError("telegram getFile failed: invalid response") from exc
+        path = str(((meta or {}).get("result") or {}).get("file_path") or "")
+        if not path:
+            raise MessagingError("telegram getFile failed: no file_path")
+        blob = await self._http().get(
+            f"{self.API_BASE}/file/bot{token}/{path}", timeout=max(self.timeout, 30.0)
+        )
+        if blob.status_code >= 400:
+            raise MessagingError(f"telegram download failed: HTTP {blob.status_code}")
+        return (
+            blob.content,
+            str(descriptor.get("mime") or "application/octet-stream"),
+            str(descriptor.get("name") or "attachment"),
+        )
 
     # ------------------------------------------------------------------- poll
 
