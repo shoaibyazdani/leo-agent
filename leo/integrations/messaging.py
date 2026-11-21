@@ -18,6 +18,7 @@ import hmac
 import json
 import time
 from datetime import datetime, timezone
+import logging
 from typing import Any, Callable, Mapping, Type
 
 import httpx
@@ -25,6 +26,9 @@ from pydantic import Field
 
 from ..contracts import BaseRecord, IntegrationRecord, utcnow
 from .secrets import credential
+from .transport_state import TransportState
+
+_LOG = logging.getLogger(__name__)
 
 
 class MessagingError(RuntimeError):
@@ -350,12 +354,13 @@ class MessagingAdapter:
     ) -> list[NormalizedMessage]:
         raise NotImplementedError
 
-    async def poll(self) -> list[NormalizedMessage]:
+    async def poll(self, state: TransportState | None = None) -> list[NormalizedMessage]:
         """Pull inbound messages from channels without webhook delivery.
 
         Adapters with a poll transport override this and set
-        ``supports_polling = True``. Poll state (e.g. a ``since`` cursor) is
-        the adapter's own responsibility and starts empty each process.
+        ``supports_polling = True``. When a :class:`TransportState` is passed,
+        the poll position is persisted, so a restart resumes instead of
+        replaying or dropping what arrived while the process was down.
         """
         raise MessagingError(f"{self.channel} does not support polling")
 
@@ -565,13 +570,16 @@ class TelegramAdapter(MessagingAdapter):
     # truth for who may talk to LEO.
     _cursor: int | None = None
 
-    async def poll(self) -> list[NormalizedMessage]:
+    async def poll(self, state: TransportState | None = None) -> list[NormalizedMessage]:
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
             raise MessagingError("telegram poll blocked: TELEGRAM_BOT_TOKEN is not set")
+        stored = await state.cursor() if state is not None else None
+        offset = stored if stored is not None else self._cursor
         params: dict[str, str] = {"timeout": "0"}
-        if self._cursor is not None:
-            params["offset"] = str(self._cursor)
+        if offset is not None:
+            params["offset"] = str(offset)
+        latest: int | None = None
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/getUpdates"
         try:
@@ -592,10 +600,21 @@ class TelegramAdapter(MessagingAdapter):
         for update in updates:
             update_id = update.get("update_id") if isinstance(update, dict) else None
             if isinstance(update_id, int):
-                # ponytail: cursor is in-process; a restart re-fetches recent
-                # updates, which the gateway drops on its durable message-id
-                # dedupe. Persist it in kv only if replay ever shows up twice.
+                if offset is not None and update_id > offset and latest is None:
+                    # A confirmed offset followed by a higher id means the
+                    # platform dropped the updates between them. Say so rather
+                    # than presenting a silent hole as a clean poll.
+                    _LOG.warning(
+                        "poll gap: %s update(s) missing between %s and %s",
+                        update_id - offset,
+                        offset,
+                        update_id,
+                        extra={"channel": self.channel, "kind": "transport_gap"},
+                    )
+                latest = update_id + 1 if latest is None else max(latest, update_id + 1)
                 self._cursor = update_id + 1
+        if state is not None and latest is not None:
+            await state.set_cursor(latest)
         return self._messages_from_updates(updates)
 
 

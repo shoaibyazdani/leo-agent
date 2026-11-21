@@ -31,6 +31,7 @@ from .messaging import (
     implements_polling,
     implements_webhook,
 )
+from .transport_state import TransportState
 
 GATEWAY_MESSAGE_TOPIC = "gateway.message"
 GATEWAY_SENT_TOPIC = "gateway.sent"
@@ -491,7 +492,11 @@ class Gateway:
         adapter = self._adapter(channel)
         if not implements_polling(adapter):
             raise GatewayError(f"channel does not support polling: {channel}")
-        messages = await adapter.poll()
+        # Durable position + liveness, owned by the gateway rather than the
+        # adapter: a transport must not have to know where state is kept.
+        state = TransportState(channel)
+        messages = await adapter.poll(state)
+        await state.beat(note=f"{len(messages)} inbound")
         # Same route pinning and durable message-id dedupe as the webhook path.
         return await self.receive_batch(messages, route_channel=channel)
 

@@ -143,9 +143,19 @@ def tui(conversation: str | None = typer.Option(
 
 
 @cli.command()
-def serve(host: str | None = None, port: int | None = None) -> None:
-    """Start the local HTTP API and web dashboard."""
+def serve(
+    host: str | None = None,
+    port: int | None = None,
+    worker: bool = typer.Option(False, "--worker", help="Answer turns claimed from a gateway"),
+    gateway_url: str | None = typer.Option(None, "--gateway-url", help="Gateway base URL"),
+    once: bool = typer.Option(False, "--once", help="Answer one turn and exit"),
+) -> None:
+    """Start the local HTTP API and web dashboard, or run as a gateway worker."""
     import uvicorn
+
+    if worker:
+        _serve_worker(gateway_url or os.getenv("LEO_GATEWAY_URL"), once=once)
+        return
 
     settings = _settings()
     effective_host = (host or settings.server.host).strip()
@@ -164,6 +174,75 @@ def serve(host: str | None = None, port: int | None = None) -> None:
         port=effective_port,
         log_level="info",
     )
+
+
+def _serve_worker(url: str | None, *, once: bool = False) -> None:
+    """Run the brain against a gateway instead of owning the channels."""
+    import asyncio
+
+    if not url:
+        raise typer.BadParameter(
+            "worker mode needs a gateway: pass --gateway-url or set LEO_GATEWAY_URL"
+        )
+    from ..gateway.worker import GatewayClientError, run_worker
+
+    try:
+        answered = asyncio.run(run_worker(url, once=once))
+    except GatewayClientError as exc:
+        fail(str(exc), code=2)
+        return
+    typer.echo(f"worker stopped after answering {answered} turn(s)")
+
+
+gateway_app = typer.Typer(help="Run LEO as a transport gateway")
+cli.add_typer(gateway_app, name="gateway")
+
+
+@gateway_app.command("run")
+def gateway_run(
+    host: str = typer.Option("127.0.0.1", help="bind address (loopback by default)"),
+    port: int = typer.Option(8766, help="bind port"),
+) -> None:
+    """Run the gateway: channel adapters, durable queue, local API."""
+    _require_loopback(host)
+    from ..gateway.server import run_gateway
+
+    run_gateway(host=host, port=port)
+
+
+@gateway_app.command("status")
+def gateway_status(as_json: bool = typer.Option(False, "--json")) -> None:
+    """Show queue depth, channel cursors and heartbeats without a server."""
+    import asyncio
+    import json as _json
+
+    from .. import db as _db
+    from ..gateway.store import GatewayStore
+
+    settings = _settings()
+
+    async def _stats() -> dict:
+        if _db.database_path_configured():
+            await _db.initialize()
+        else:
+            await _db.initialize(settings.db_path)
+        return await GatewayStore().stats()
+
+    stats = asyncio.run(_stats())
+    if as_json:
+        typer.echo(_json.dumps(stats, indent=2, sort_keys=True))
+        return
+    queue = stats.get("queue") or {}
+    typer.echo("queue: " + (", ".join(f"{k}={v}" for k, v in sorted(queue.items())) or "empty"))
+    for channel, value in sorted((stats.get("cursors") or {}).items()):
+        typer.echo(f"cursor {channel}: {value}")
+    for channel, beat in sorted((stats.get("heartbeats") or {}).items()):
+        typer.echo(f"heartbeat {channel}: pid={beat.get('pid')} at {beat.get('beat_at')}")
+
+
+def _require_loopback(host: str) -> None:
+    if not _is_loopback_host(host):
+        fail(f"refusing to bind the gateway to {host}; it must stay on loopback", code=2)
 
 
 @cli.command("init")
