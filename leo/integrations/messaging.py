@@ -384,6 +384,10 @@ class TelegramAdapter(MessagingAdapter):
     credential_env = ("TELEGRAM_BOT_TOKEN",)
     verification_env = ("TELEGRAM_WEBHOOK_SECRET",)
     API_BASE = "https://api.telegram.org"
+    # Both transports are real: signed webhook ingress, or getUpdates polling
+    # for a box with no public HTTPS endpoint (allow-listed, fails closed).
+    supports_webhook = True
+    supports_polling = True
 
     def verify_webhook(self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None) -> bool:
         secret = credential("TELEGRAM_WEBHOOK_SECRET")
@@ -437,6 +441,10 @@ class TelegramAdapter(MessagingAdapter):
         )
         if updates is None:
             updates = data if isinstance(data, list) else [data]
+        return self._messages_from_updates(updates)
+
+    def _messages_from_updates(self, updates: list[Any]) -> list[NormalizedMessage]:
+        """Normalize raw Telegram updates. Shared by webhook and poll ingress."""
         messages: list[NormalizedMessage] = []
         for update in updates:
             if not isinstance(update, dict):
@@ -466,6 +474,55 @@ class TelegramAdapter(MessagingAdapter):
                 )
             )
         return messages
+
+    # ------------------------------------------------------------------- poll
+
+    # LEO has no per-user authorisation (see LEO_SECURITY.md): the owner/from
+    # fields are data, not an auth boundary. A poll transport therefore has to
+    # carry its own allow-list, and it fails CLOSED — an unset list means the
+    # bot refuses every message rather than answering a stranger.
+    allowlist_env = "TELEGRAM_ALLOWED_USER_IDS"
+    _cursor: int | None = None
+
+    def _allowed_senders(self) -> set[str]:
+        raw = credential(self.allowlist_env) or ""
+        return {part.strip() for part in raw.replace(";", ",").split(",") if part.strip()}
+
+    async def poll(self) -> list[NormalizedMessage]:
+        token = credential("TELEGRAM_BOT_TOKEN")
+        if not token:
+            raise MessagingError("telegram poll blocked: TELEGRAM_BOT_TOKEN is not set")
+        allowed = self._allowed_senders()
+        if not allowed:
+            return []
+        params: dict[str, str] = {"timeout": "0"}
+        if self._cursor is not None:
+            params["offset"] = str(self._cursor)
+        # The token appears in the URL: never echo the URL or httpx's exception text.
+        url = f"{self.API_BASE}/bot{token}/getUpdates"
+        try:
+            response = await self._http().get(url, params=params, timeout=self.timeout)
+        except httpx.HTTPError as exc:
+            raise MessagingError(f"telegram poll failed: {type(exc).__name__}") from None
+        if response.status_code >= 400:
+            raise MessagingError(f"telegram poll failed: HTTP {response.status_code}")
+        try:
+            data = response.json()
+        except ValueError:
+            return []
+        if not isinstance(data, dict) or not data.get("ok"):
+            return []
+        updates = data.get("result")
+        if not isinstance(updates, list):
+            return []
+        for update in updates:
+            update_id = update.get("update_id") if isinstance(update, dict) else None
+            if isinstance(update_id, int):
+                # ponytail: cursor is in-process; a restart re-fetches recent
+                # updates, which the gateway drops on its durable message-id
+                # dedupe. Persist it in kv only if replay ever shows up twice.
+                self._cursor = update_id + 1
+        return [m for m in self._messages_from_updates(updates) if m.sender_id in allowed]
 
 
 # Discord signs ``timestamp + raw_body`` but does not bind the request to a

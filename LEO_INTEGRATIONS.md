@@ -31,6 +31,8 @@ adapter with an injected client; it does **not** mean a live service worked.
 | Discord webhook/interactions | Webhook + interaction signature | Ed25519 verifier hook (injectable), normalized messages, send | `tests/test_integrations.py` | BLOCKED: `DISCORD_WEBHOOK_URL` / `DISCORD_BOT_TOKEN` / public key not supplied; Ed25519 needs crypto backend |
 | WhatsApp Cloud webhook/send | Cloud API | `X-Hub-Signature-256` verification, normalized messages, send | `tests/test_integrations.py` | BLOCKED: `WHATSAPP_CLOUD_TOKEN`, phone ID, app secret not supplied |
 
+Telegram now has **two** transports: signed webhook ingress, and a `getUpdates` poll loop for a box with no public HTTPS endpoint. The poll path fails closed — `TELEGRAM_ALLOWED_USER_IDS` is required, and an unset list returns no messages rather than answering a stranger, because LEO has no per-user authorisation. Polling is driven by `App._inbound_loop` and covered by `tests/test_telegram_poll.py`.
+
 The three messaging rows above are the original core set, not the full matrix.
 They are now part of 22 auto-registered channels (3 core + 19 new); see
 [Channel matrix](#channel-matrix-2026-11-18) below. Every channel record
@@ -79,7 +81,7 @@ variable *names* are listed below — never values.
 
 | Channel | Mode | Credential env vars (names only) | Verification env / inbound auth | Test evidence |
 |---|---|---|---|---|
-| telegram | webhook | TELEGRAM_BOT_TOKEN | TELEGRAM_WEBHOOK_SECRET — secret header or HMAC-SHA256 | `tests/test_integrations.py` |
+| telegram | webhook, poll | TELEGRAM_BOT_TOKEN (+ TELEGRAM_ALLOWED_USER_IDS for poll) | TELEGRAM_WEBHOOK_SECRET — secret header or HMAC-SHA256 (webhook); sender allow-list (poll, fails closed) | `tests/test_integrations.py`, `tests/test_telegram_poll.py` |
 | discord | webhook | DISCORD_BOT_TOKEN, DISCORD_WEBHOOK_URL | DISCORD_PUBLIC_KEY — Ed25519 (injectable verifier) | `tests/test_integrations.py` |
 | whatsapp (Cloud API) | webhook | WHATSAPP_CLOUD_TOKEN, WHATSAPP_PHONE_NUMBER_ID | WHATSAPP_APP_SECRET — X-Hub-Signature-256 | `tests/test_integrations.py` |
 | slack | webhook | SLACK_BOT_TOKEN | SLACK_SIGNING_SECRET — v0 HMAC-SHA256 + 5-min replay window | `tests/channels/test_slack.py` |
