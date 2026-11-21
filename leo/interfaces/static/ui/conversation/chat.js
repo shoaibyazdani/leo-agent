@@ -1555,8 +1555,6 @@
     input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
   }
 
-  /* ---- model dialog (ModelInfoCard port) ------------------------------------------ */
-
   /* ---- slash-command palette ---------------------------------------------- */
 
   // The palette opens only while the command token itself is being typed.
@@ -1694,6 +1692,8 @@
     input.setSelectionRange(input.value.length, input.value.length);
     return true;
   }
+
+  /* ---- model dialog (ModelInfoCard port) ------------------------------------------ */
 
   function openModelDialog(health) {
     document.querySelectorAll('.chat-model-backdrop').forEach((n) => n.remove());

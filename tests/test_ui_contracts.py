@@ -653,3 +653,21 @@ def test_shipped_javascript_parses(script: str) -> None:
     path = STATIC / "ui" / script
     result = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_slash_palette_is_fed_by_the_chat_surface_catalog() -> None:
+    """Typing "/" must open a real command list, not a hard-coded copy."""
+    assert 'id="command-palette"' in INDEX
+    assert 'role="listbox"' in INDEX
+    assert 'aria-controls="command-palette"' in INDEX
+    palette = block(CHAT_JS, "/* ---- slash-command palette", "/* ---- model dialog")
+    for needle in ("api('/commands')", "allowed_for_caller !== false",
+                   "aria-activedescendant", "hideCommandPalette", "acceptCommandPalette",
+                   "cmd.args_hint", "cmd.help"):
+        assert needle in palette
+    assert "$('message').addEventListener('input', () => { autosize(); renderCommandPalette(); });" in CHAT_JS
+    keys = block(CHAT_JS, "$('message').addEventListener('keydown'", "$('attach-btn')")
+    for needle in ("ArrowDown", "movePalette", "acceptCommandPalette()", "hideCommandPalette()"):
+        assert needle in keys
+    for needle in (".chat-palette {", ".chat-palette[hidden]", ".chat-palette__item.is-active"):
+        assert needle in CHAT_CSS
