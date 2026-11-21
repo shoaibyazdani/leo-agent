@@ -128,6 +128,7 @@ class LeoApp:
         self.initialized = False
         self._scheduler_task: asyncio.Task[Any] | None = None
         self._gateway_task: asyncio.Task[Any] | None = None
+        self._inbound_task: asyncio.Task[Any] | None = None
         self._heartbeat_tasks: set[asyncio.Task[Any]] = set()
         # Engines are attached by initialize(); declared here for discoverability.
         self.router: Any = None
@@ -389,6 +390,42 @@ class LeoApp:
             self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="leo-scheduler")
         if self._gateway_task is None or self._gateway_task.done():
             self._gateway_task = asyncio.create_task(self._gateway_loop(), name="leo-gateway-outbox")
+        if self._inbound_task is None or self._inbound_task.done():
+            self._inbound_task = asyncio.create_task(self._inbound_loop(), name="leo-gateway-inbound")
+
+    async def _inbound_loop(self) -> None:
+        """Pull inbound from poll-capable channels (Telegram, IMAP, IRC, ...).
+
+        Webhook channels are pushed by their HTTP endpoint; a box with no public
+        ingress needs this path or the bot never hears anything. Each adapter
+        fails closed on its own allow-list, so an unconfigured channel is inert.
+        """
+        from ..integrations.channels import polling_channels
+        from ..integrations.secrets import credential
+
+        while True:
+            try:
+                for channel in polling_channels():
+                    adapter = self.gateway.adapters.get(channel)
+                    if adapter is None:
+                        continue
+                    if not all(credential(name) for name in adapter.credential_env):
+                        continue
+                    try:
+                        await self.gateway.poll(channel)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # one broken channel must not stop the rest
+                        _LOG.warning(
+                            "channel poll failed", extra={"channel": channel, "error": str(exc)}
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _LOG.warning("inbound loop failed", extra={"error": str(exc)})
+            # ponytail: fixed 2s cadence, no new config knob. Raise to a setting
+            # only if a channel starts rate-limiting us.
+            await asyncio.sleep(2.0)
 
     async def _scheduler_loop(self) -> None:
         """Scheduled work, durable dispatch and terminal delivery."""
@@ -421,11 +458,11 @@ class LeoApp:
             await asyncio.sleep(0.5)
 
     async def shutdown(self) -> None:
-        for task in (self._gateway_task, self._scheduler_task, *tuple(self._heartbeat_tasks)):
+        for task in (self._gateway_task, self._inbound_task, self._scheduler_task, *tuple(self._heartbeat_tasks)):
             if task is None:
                 continue
             task.cancel()
-        for task in (self._gateway_task, self._scheduler_task, *tuple(self._heartbeat_tasks)):
+        for task in (self._gateway_task, self._inbound_task, self._scheduler_task, *tuple(self._heartbeat_tasks)):
             if task is None:
                 continue
             try:
@@ -435,6 +472,7 @@ class LeoApp:
             except Exception as exc:  # shutdown must not fail because a loop errored
                 _LOG.warning("background task failed during shutdown", extra={"error": str(exc)})
         self._gateway_task = None
+        self._inbound_task = None
         self._scheduler_task = None
         self._heartbeat_tasks.clear()
         self._detach_self_evolution()
