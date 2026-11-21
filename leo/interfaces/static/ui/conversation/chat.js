@@ -20,6 +20,7 @@
   const RENDER_THROTTLE_MS = 90;
   const HISTORY_RESULT_LIMIT = 4000;
   const REASONING_RESULT_LIMIT = 8000;
+  const SLASH_PALETTE_LIMIT = 40;
   // Reasoning is provider-supplied data, never a substitute for an answer.
   // A disclosure panel is created only by a real thinking.delta. When no delta
   // arrives, the truthful verdict is one short line, never invented reasoning.
@@ -63,6 +64,12 @@
     eventRetryTimer: null,
     scrollPinned: true,
     panelHidden: sessionStorage.getItem('leo_chat_panel_hidden') === '1',
+    // Slash-command palette: the backend's chat-surface catalog, fetched once
+    // and filtered locally as the user types.
+    commands: null,
+    commandsLoading: false,
+    paletteMatches: [],
+    paletteIndex: 0,
   };
 
   /* ---- shared helpers from the dashboard core --------------------------- */
@@ -1550,6 +1557,144 @@
 
   /* ---- model dialog (ModelInfoCard port) ------------------------------------------ */
 
+  /* ---- slash-command palette ---------------------------------------------- */
+
+  // The palette opens only while the command token itself is being typed.
+  // Once a space (or another line) appears the user is writing arguments, so
+  // the list gets out of the way instead of hijacking Enter.
+  function slashQuery(value) {
+    const match = /^\s*\/([A-Za-z0-9_-]*)$/.exec(String(value ?? ''));
+    return match ? match[1].toLowerCase() : null;
+  }
+
+  async function loadCommandCatalog() {
+    if (Array.isArray(state.commands) || state.commandsLoading) return;
+    state.commandsLoading = true;
+    try {
+      const payload = await api('/commands');
+      state.commands = Array.isArray(payload?.commands) ? payload.commands : [];
+    } catch {
+      // An unavailable catalog must not break the composer; keep it empty so a
+      // failed fetch is not repeated on every keystroke.
+      state.commands = [];
+    } finally {
+      state.commandsLoading = false;
+    }
+    if (slashQuery($('message').value) !== null) renderCommandPalette();
+  }
+
+  function commandMatches(query) {
+    const catalog = Array.isArray(state.commands) ? state.commands : [];
+    return catalog
+      // The backend labels entries the chat surface cannot run. Offering them
+      // would promise a command that dispatch refuses.
+      .filter((cmd) => cmd && cmd.allowed_for_caller !== false)
+      .filter((cmd) => {
+        if (!query) return true;
+        const names = [cmd.name, ...(Array.isArray(cmd.aliases) ? cmd.aliases : [])];
+        return names.some((name) => String(name).toLowerCase().startsWith(query));
+      })
+      .slice(0, SLASH_PALETTE_LIMIT);
+  }
+
+  function hideCommandPalette() {
+    const palette = $('command-palette');
+    if (!palette) return;
+    palette.hidden = true;
+    palette.replaceChildren();
+    state.paletteMatches = [];
+    const input = $('message');
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+  }
+
+  function setPaletteActive(index) {
+    const palette = $('command-palette');
+    if (!palette) return;
+    const items = Array.from(palette.querySelectorAll('.chat-palette__item'));
+    if (!items.length) return;
+    state.paletteIndex = Math.max(0, Math.min(index, items.length - 1));
+    items.forEach((item, i) => {
+      const active = i === state.paletteIndex;
+      item.classList.toggle('is-active', active);
+      item.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    const active = items[state.paletteIndex];
+    $('message').setAttribute('aria-activedescendant', active.id);
+    active.scrollIntoView({ block: 'nearest' });
+  }
+
+  function commandPaletteItem(cmd, index) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'chat-palette__item';
+    item.id = `command-palette-${index}`;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', 'false');
+    const head = document.createElement('span');
+    head.className = 'chat-palette__head';
+    const name = document.createElement('span');
+    name.className = 'chat-palette__name';
+    name.textContent = `/${cmd.name}`;
+    head.appendChild(name);
+    if (cmd.args_hint) {
+      const args = document.createElement('span');
+      args.className = 'chat-palette__args';
+      args.textContent = cmd.args_hint;
+      head.appendChild(args);
+    }
+    const help = document.createElement('span');
+    help.className = 'chat-palette__help';
+    help.textContent = cmd.help || '';
+    item.append(head, help);
+    // mousedown would blur the textarea and close the list before click lands.
+    item.addEventListener('mousedown', (event) => event.preventDefault());
+    item.addEventListener('click', () => acceptCommandPalette(index));
+    return item;
+  }
+
+  function renderCommandPalette() {
+    const input = $('message');
+    const palette = $('command-palette');
+    if (!palette || !input) return;
+    const query = slashQuery(input.value);
+    if (query === null) { hideCommandPalette(); return; }
+    if (!Array.isArray(state.commands)) {
+      hideCommandPalette();
+      loadCommandCatalog();
+      return;
+    }
+    const matches = commandMatches(query);
+    if (!matches.length) { hideCommandPalette(); return; }
+    state.paletteMatches = matches;
+    if (state.paletteIndex >= matches.length) state.paletteIndex = 0;
+    palette.replaceChildren(...matches.map((cmd, index) => commandPaletteItem(cmd, index)));
+    palette.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    setPaletteActive(state.paletteIndex);
+  }
+
+  function movePalette(delta) {
+    const palette = $('command-palette');
+    if (!palette || palette.hidden || !state.paletteMatches.length) return;
+    const count = state.paletteMatches.length;
+    setPaletteActive((state.paletteIndex + delta + count) % count);
+  }
+
+  function acceptCommandPalette(index = state.paletteIndex) {
+    const palette = $('command-palette');
+    if (!palette || palette.hidden) return false;
+    const cmd = state.paletteMatches[index];
+    if (!cmd) return false;
+    const input = $('message');
+    input.value = `/${cmd.name} `;
+    hideCommandPalette();
+    autosize();
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    return true;
+  }
+
   function openModelDialog(health) {
     document.querySelectorAll('.chat-model-backdrop').forEach((n) => n.remove());
     const backdrop = document.createElement('div');
@@ -1673,12 +1818,34 @@
       const text = input.value.trim();
       if (!text && !state.attachments.length) return;
       input.value = '';
+      hideCommandPalette();
       autosize();
       await streamChat(text || 'Please review the attached file.');
       input.focus();
     });
-    $('message').addEventListener('input', autosize);
+    $('message').addEventListener('input', () => { autosize(); renderCommandPalette(); });
     $('message').addEventListener('keydown', (e) => {
+      const palette = $('command-palette');
+      if (palette && !palette.hidden) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          movePalette(e.key === 'ArrowDown' ? 1 : -1);
+          return;
+        }
+        if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && !e.isComposing)) {
+          if (acceptCommandPalette()) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+          }
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();  // the global Escape handler stops a running turn
+          hideCommandPalette();
+          return;
+        }
+      }
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         $('chat-form').requestSubmit();

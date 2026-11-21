@@ -1248,6 +1248,21 @@ async def execute_tool(name: str, req: ToolRunRequest, request: Request) -> dict
         )
     return payload
 
+@api.get("/commands")
+async def list_commands() -> dict[str, Any]:
+    """Slash-command catalog for the chat composer palette.
+
+    The dashboard speaks as the untrusted ``chat`` principal on the ``chat``
+    surface — the same pair ``/chat`` uses to dispatch — so a command the
+    palette offers is one the conversation can actually run. Operator-only and
+    admin-only entries keep ``allowed_for_caller`` false instead of disappearing,
+    which lets a client explain why they are not offered.
+    """
+    app = get_app()
+    await app.initialize()
+    return {"commands": app.commands.catalog(principal="chat", surface="chat")}
+
+
 @api.get("/skills")
 async def list_skills() -> dict[str, Any]:
     return {"skills": [s.model_dump(mode="json") for s in await get_app().skills.list()]}

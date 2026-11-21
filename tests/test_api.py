@@ -1601,3 +1601,19 @@ async def test_model_default_switch_is_live_and_persisted(
     assert "  default: mock-2" in text
     assert "# keep this comment" in text
     assert config.with_name("leo.yaml.bak").exists()
+
+
+async def test_command_catalog_uses_the_chat_dispatch_surface(offline_app: LeoApp) -> None:
+    """The composer palette must offer exactly what /chat can dispatch."""
+    transport = httpx.ASGITransport(app=api_module.api)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/commands")
+    assert response.status_code == 200
+    rows = response.json()["commands"]
+    by_name = {row["name"]: row for row in rows}
+    assert {"help", "commands", "model", "tools"} <= set(by_name)
+    # /chat dispatches as principal "chat" on surface "chat"; the catalog must
+    # answer the same question rather than trust the HTTP caller's principal.
+    assert by_name["help"]["allowed_for_caller"] is True
+    assert by_name["approve"]["allowed_for_caller"] is False
+    assert by_name["approve"]["operator_only"] is True

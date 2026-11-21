@@ -252,7 +252,7 @@
 .chat-hero__text { max-width: 52ch; color: var(--text-muted); font-size: var(--text-sm); }
 
 /* ---- composer ------------------------------------------------------------ */
-.chat-composer-zone { border-top: 1px solid var(--border-subtle); padding: var(--space-3) var(--space-5) var(--space-4); background: var(--surface-1); }
+.chat-composer-zone { position: relative; border-top: 1px solid var(--border-subtle); padding: var(--space-3) var(--space-5) var(--space-4); background: var(--surface-1); }
 .chat-attachments { display: flex; flex-wrap: wrap; gap: var(--space-2); padding-bottom: var(--space-2); }
 .chat-attachments:empty { padding-bottom: 0; }
 .attach-chip { display: inline-flex; align-items: center; gap: var(--space-2); padding: 4px 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-pill); background: var(--surface-2); font-size: var(--text-xs); color: var(--text-secondary); }
@@ -274,6 +274,27 @@
 .chat-composer__input::placeholder { color: var(--text-muted); }
 .chat-composer__send { flex: none; min-width: 40px; min-height: 40px; padding: 0; }
 .chat-composer__hint { margin-top: var(--space-2); font-size: var(--text-2xs); color: var(--text-muted); text-align: center; }
+
+/* Slash-command palette: anchored above the composer, keyboard-driven from the
+   textarea (aria-activedescendant), so focus never leaves the input. */
+.chat-palette {
+  position: absolute; left: var(--space-5); right: var(--space-5); bottom: calc(100% + var(--space-2));
+  z-index: var(--z-dropdown); max-height: min(320px, 45vh); overflow-y: auto;
+  padding: var(--space-1); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+  background: var(--surface-2); box-shadow: var(--shadow-2);
+}
+.chat-palette[hidden] { display: none; }
+.chat-palette__item {
+  display: flex; flex-direction: column; gap: 2px; width: 100%;
+  padding: var(--space-2) var(--space-3); border: 0; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text-secondary); text-align: left;
+}
+.chat-palette__item:hover, .chat-palette__item.is-active { background: var(--accent-soft); }
+.chat-palette__head { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; }
+.chat-palette__name { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--accent); }
+.chat-palette__args { font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-palette__help { font-size: var(--text-xs); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-palette__item.is-active .chat-palette__help { color: var(--text-secondary); }
 
 /* ---- side panel (ChatSidebar port) --------------------------------------- */
 .chat-side { display: flex; flex-direction: column; gap: var(--space-4); min-height: 0; overflow-y: auto; }
