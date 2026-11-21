@@ -1404,8 +1404,41 @@ class LeoApp:
                 history.append(ChatMessage(role=role, content=str(row["content"] or "")))
         return self._pair_tool_history(history)
 
+    # Hermes reads exactly these files for its own personas: SOUL.md is
+    # character, USER.md is what the agent knows about the operator, MEMORY.md
+    # is durable facts. Same names, same order, same char caps, so a
+    # Hermes-shaped profile transfers to LEO instead of inventing a second
+    # personality format.
+    IDENTITY_FILES = (
+        ("SOUL.md", "CHARACTER"),
+        ("USER.md", "ABOUT THE OPERATOR"),
+        ("MEMORY.md", "DURABLE FACTS"),
+    )
+    IDENTITY_CHAR_CAPS = {"SOUL.md": 8000, "USER.md": 1375, "MEMORY.md": 2200}
+
     @staticmethod
-    def _conversation_system_prompt() -> str:
+    def _identity_dir() -> "Path":
+        return Path(os.getenv("LEO_HOME") or (Path.home() / ".config" / "leo"))
+
+    def _identity_blocks(self) -> str:
+        """Load SOUL/USER/MEMORY like Hermes does; missing files are simply absent."""
+        blocks: list[str] = []
+        for name, label in self.IDENTITY_FILES:
+            try:
+                text = (self._identity_dir() / name).read_text(
+                    encoding="utf-8-sig", errors="replace"
+                ).strip()
+            except OSError:
+                continue
+            if not text:
+                continue
+            cap = self.IDENTITY_CHAR_CAPS.get(name, 8000)
+            if len(text) > cap:
+                text = text[:cap].rstrip() + "\n[truncated]"
+            blocks.append(f"{label} ({name}):\n{text}")
+        return "\n\n".join(blocks)
+
+    def _conversation_system_prompt(self) -> str:
         """Production system prompt for the conversation tool loop.
 
         The model receives every registered tool spec; the prompt makes tool
@@ -1413,7 +1446,7 @@ class LeoApp:
         content (attachments, tool results, retrieved memory) in the data
         plane rather than the instruction plane.
         """
-        return (
+        base = (
             "You are LEO, a local autonomous agent operating inside the user's own workspace.\n"
             "TOOLS: When a question needs a calculation, file listing/reading/searching, a "
             "web lookup, JSON parsing or the current time, call the matching tool instead of "
@@ -1429,6 +1462,8 @@ class LeoApp:
             "STYLE: Answer directly, in short paragraphs or small lists. Prefer concrete values "
             "over preamble. Say what you did and what the result was."
         )
+        identity = self._identity_blocks()
+        return f"{base}\n\n{identity}" if identity else base
 
     @staticmethod
     def _final_answer(content: str, pending_names: list[str]) -> tuple[str, str]:
