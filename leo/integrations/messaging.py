@@ -477,24 +477,16 @@ class TelegramAdapter(MessagingAdapter):
 
     # ------------------------------------------------------------------- poll
 
-    # LEO has no per-user authorisation (see LEO_SECURITY.md): the owner/from
-    # fields are data, not an auth boundary. A poll transport therefore has to
-    # carry its own allow-list, and it fails CLOSED — an unset list means the
-    # bot refuses every message rather than answering a stranger.
-    allowlist_env = "TELEGRAM_ALLOWED_USER_IDS"
+    # No allow-list here on purpose: ChannelAdmission is the single policy
+    # resolver for inbound senders (see admission.py), so the transport only
+    # fetches and normalizes. Duplicating the check would give two sources of
+    # truth for who may talk to LEO.
     _cursor: int | None = None
-
-    def _allowed_senders(self) -> set[str]:
-        raw = credential(self.allowlist_env) or ""
-        return {part.strip() for part in raw.replace(";", ",").split(",") if part.strip()}
 
     async def poll(self) -> list[NormalizedMessage]:
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
             raise MessagingError("telegram poll blocked: TELEGRAM_BOT_TOKEN is not set")
-        allowed = self._allowed_senders()
-        if not allowed:
-            return []
         params: dict[str, str] = {"timeout": "0"}
         if self._cursor is not None:
             params["offset"] = str(self._cursor)
@@ -522,7 +514,7 @@ class TelegramAdapter(MessagingAdapter):
                 # updates, which the gateway drops on its durable message-id
                 # dedupe. Persist it in kv only if replay ever shows up twice.
                 self._cursor = update_id + 1
-        return [m for m in self._messages_from_updates(updates) if m.sender_id in allowed]
+        return self._messages_from_updates(updates)
 
 
 # Discord signs ``timestamp + raw_body`` but does not bind the request to a

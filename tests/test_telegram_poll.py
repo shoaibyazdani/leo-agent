@@ -1,18 +1,19 @@
 """Offline checks for the Telegram poll transport.
 
-No live network: getUpdates goes through httpx.MockTransport. The claims under
-test are the two that matter for an exposed bot:
+No live network: getUpdates goes through httpx.MockTransport.
 
-1. fail closed — no allow-list means no messages leave the adapter;
-2. the allow-list is enforced on the sender id, and the cursor advances so the
-   same update is never fetched twice.
+Policy is deliberately NOT tested here — ChannelAdmission is the single resolver
+for who may reach LEO (tests/test_channels_registry.py covers fail-closed and
+allowlist admission). This file only asserts the transport's own job: fetch,
+normalize, and never re-fetch an update it already saw.
 """
 
 from __future__ import annotations
 
 import httpx
+import pytest
 
-from leo.integrations.messaging import TelegramAdapter
+from leo.integrations.messaging import MessagingError, TelegramAdapter
 
 
 def _client(calls: list[dict], updates: list[dict]) -> httpx.AsyncClient:
@@ -36,37 +37,33 @@ def _update(update_id: int, user_id: int, text: str) -> dict:
     }
 
 
-async def test_poll_fails_closed_without_allowlist(monkeypatch):
+async def test_poll_normalizes_updates_into_messages(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
-    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
-    calls: list[dict] = []
-    adapter = TelegramAdapter(client=_client(calls, [_update(1, 525083981, "hi")]))
-
-    assert await adapter.poll() == []
-    # Nothing is even fetched: the adapter refuses before calling Telegram.
-    assert calls == []
-
-
-async def test_poll_keeps_allowlisted_sender_and_drops_strangers(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
-    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "525083981")
-    calls: list[dict] = []
     adapter = TelegramAdapter(
-        client=_client(calls, [_update(11, 525083981, "owner"), _update(12, 999, "stranger")])
+        client=_client([], [_update(11, 525083981, "owner"), _update(12, 999, "stranger")])
     )
 
     messages = await adapter.poll()
 
-    assert [m.text for m in messages] == ["owner"]
-    assert messages[0].sender_id == "525083981"
-    # Cursor advanced past BOTH updates, including the dropped one, so the
-    # stranger's message is not retried forever.
+    # Every update is normalized; sender filtering is admission's job.
+    assert [m.text for m in messages] == ["owner", "stranger"]
+    assert [m.sender_id for m in messages] == ["525083981", "999"]
+    assert messages[0].channel == "telegram"
+
+
+async def test_poll_advances_cursor_past_every_update(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    adapter = TelegramAdapter(
+        client=_client([], [_update(11, 525083981, "a"), _update(12, 999, "b")])
+    )
+
+    await adapter.poll()
+
     assert adapter._cursor == 13
 
 
 async def test_poll_sends_offset_on_the_next_call(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
-    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "525083981")
     calls: list[dict] = []
     adapter = TelegramAdapter(client=_client(calls, [_update(5, 525083981, "one")]))
 
@@ -75,3 +72,11 @@ async def test_poll_sends_offset_on_the_next_call(monkeypatch):
 
     assert "offset" not in calls[0]
     assert calls[1]["offset"] == "6"
+
+
+async def test_poll_without_token_is_blocked_not_silent(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    adapter = TelegramAdapter(client=_client([], []))
+
+    with pytest.raises(MessagingError, match="TELEGRAM_BOT_TOKEN"):
+        await adapter.poll()
