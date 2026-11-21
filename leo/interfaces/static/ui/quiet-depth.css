@@ -595,6 +595,14 @@ body::after {
 }
 .chat-composer__attach { width: 34px; height: 34px; border-radius: 50%; border: 0; color: var(--qd-muted); }
 .chat-composer__attach:hover { background: rgba(255, 255, 255, .08); color: #fff; }
+/* The attach button is at the composer's left edge. A centered tooltip spills
+   outside the clipped chat panel and gets cut off, so anchor it left. */
+.chat-composer__attach[data-tip]:hover::after,
+.chat-composer__attach[data-tip]:focus-visible::after {
+  left: 0;
+  transform: none;
+  text-align: left;
+}
 .chat-composer__input {
   flex: 1;
   min-height: 38px;
