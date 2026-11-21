@@ -411,6 +411,12 @@ class ChatRequest(BaseModel):
         return value
 
 
+class ModelSelectRequest(BaseModel):
+    """Pick an already-configured provider as the live default model."""
+
+    provider: str = Field(min_length=1, max_length=128)
+
+
 class ChatResponse(BaseModel):
     """Stable shape of POST /chat, including its error responses.
 
@@ -1296,6 +1302,71 @@ async def model_usage() -> dict[str, Any]:
     return {"usage": await get_app().router.usage_report()}
 
 
+def _persist_default_provider(provider: str) -> tuple[bool, str | None]:
+    """Rewrite only the ``models.default`` line, preserving comments/anchors.
+
+    A full YAML round-trip would expand the catalog's anchors and drop the
+    operator's comments, so this edits the single scalar in place.
+    """
+    cfg_path = Path(os.getenv("LEO_CONFIG", "leo.yaml"))
+    try:
+        original = cfg_path.read_text(encoding="utf-8")
+    except OSError:
+        return False, "leo.yaml is not readable"
+    lines = original.splitlines()
+    in_models = False
+    replaced = False
+    for index, line in enumerate(lines):
+        if not in_models:
+            if line.rstrip() == "models:":
+                in_models = True
+            continue
+        if line and not line[0].isspace():
+            break  # next top-level section
+        match = re.match(r"^(\s+)default:\s*\S.*$", line)
+        if match:
+            lines[index] = f"{match.group(1)}default: {provider}"
+            replaced = True
+            break
+    if not replaced:
+        return False, "no models.default entry found in leo.yaml"
+    updated = "\n".join(lines) + ("\n" if original.endswith("\n") else "")
+    try:
+        cfg_path.with_name(cfg_path.name + ".bak").write_text(original, encoding="utf-8")
+        temporary = cfg_path.with_name(cfg_path.name + ".tmp")
+        temporary.write_text(updated, encoding="utf-8")
+        os.replace(temporary, cfg_path)
+    except OSError:
+        return False, "could not write leo.yaml"
+    return True, None
+
+
+@api.post("/models/default")
+async def select_default_model(request: Request, req: ModelSelectRequest) -> dict[str, Any]:
+    """Switch the live default model to an existing enabled provider.
+
+    The routers read ``settings.models.default`` per turn, so the change applies
+    to the next message without a restart. The choice is also written back to
+    leo.yaml so it survives one.
+    """
+    _require_decision_origin(request)
+    app = get_app()
+    name = req.provider.strip()
+    provider = app.settings.models.providers.get(name)
+    if provider is None or not provider.enabled:
+        raise HTTPException(404, f"unknown or disabled provider: {name}")
+    if not provider.model:
+        raise HTTPException(400, f"provider {name} has no model")
+    app.settings.models.default = name
+    persisted, warning = _persist_default_provider(name)
+    return {
+        "default_provider": name,
+        "model": provider.model,
+        "persisted": persisted,
+        "warning": warning,
+    }
+
+
 @api.get("/events/durability")
 async def event_durability() -> dict[str, Any]:
     """Durable event outbox/delivery statistics."""
@@ -2078,7 +2149,9 @@ if _static.exists():
 
     @api.get("/")
     async def dashboard() -> FileResponse:
-        return FileResponse(_static / "index.html")
+        # Local operator surface: revalidate so a restarted UI never runs a
+        # stale HTML document against newer versioned assets.
+        return FileResponse(_static / "index.html", headers={"Cache-Control": "no-cache"})
 
     @api.get("/agent-activity/live")
     async def agent_activity_live() -> FileResponse:

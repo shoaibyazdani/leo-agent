@@ -25,6 +25,7 @@ secrets/
 *.db
 *.sqlite
 *.sqlite3
+leo.yaml.bak
 desktop/dist/
 desktop/.vite/
 

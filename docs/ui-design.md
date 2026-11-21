@@ -1,6 +1,12 @@
 # LEO UI Design Brief — "Night Instrument"
 
-**Status:** design source of truth for the dashboard and Electron shell.
+> **Superseded in November 2026 by "Quiet Depth".** The shipping dashboard now
+> uses ambient midnight gradients, a floating glass capsule nav, soft-depth
+> panels, and a lavender/ice accent, implemented as an override layer in
+> `leo/interfaces/static/ui/quiet-depth.css`. This brief remains the reference
+> for the underlying token contract, density rules and accessibility intent.
+
+**Status:** historical design reference for the dashboard and Electron shell.
 **Product:** LEO — a local, provider-independent autonomous AI agent OS.
 **Audience:** technical operators and power users running agents on their own
 machine; they need dense state, precise affordances and zero theatre.
