@@ -174,10 +174,16 @@ class Gateway:
 
     @staticmethod
     async def _conversation_in(conn: Any, channel: str, subject: str) -> str:
-        """Get-or-create inside an already-open write transaction."""
+        """Get-or-create inside an already-open write transaction.
+
+        Newest-first: ``/new`` appends a conversation for the same (channel,
+        subject), and the channel has to follow it. Oldest-first pinned the
+        first conversation forever, so ``/new`` created a conversation nothing
+        ever used.
+        """
         cursor = await conn.execute(
             "SELECT id FROM conversations WHERE channel=? AND subject=? "
-            "ORDER BY created_at ASC, id ASC LIMIT 1",
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
             (channel, subject),
         )
         row = await cursor.fetchone()
