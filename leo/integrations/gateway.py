@@ -65,6 +65,7 @@ class _Prepared(NamedTuple):
     subject: str
     identity: str
     dedupe_key: str
+    attachment_ids: tuple[str, ...] = ()
 
 # Webhook signatures cover only the request body (or body+timestamp for
 # Discord), so a captured delivery could otherwise be replayed forever. A
@@ -123,6 +124,7 @@ class Gateway:
         webhook_replay_window: float | None = WEBHOOK_REPLAY_WINDOW_SECONDS,
     ) -> None:
         self.adapters: dict[str, MessagingAdapter] = dict(adapters or {})
+        self.attachment_sink: Callable[[str, dict[str, Any]], Awaitable[str | None]] | None = None
         self.events = events or EventBus()
         self.permissions = permissions or PermissionManagerImpl(Settings.load())
         self.actor = actor
@@ -136,6 +138,17 @@ class Gateway:
         self._reply_handler: OutboxHandler | None = None
         if getattr(self.admission, "events", None) is None:
             self.admission.events = self.events
+
+    def set_attachment_sink(
+        self, sink: Callable[[str, dict[str, Any]], Awaitable[str | None]] | None
+    ) -> None:
+        """Register the store that turns a channel file descriptor into an id.
+
+        The adapter supplies a provider file reference; only the app owns the
+        attachment store, so the gateway routes bytes through this hook and
+        never keeps media itself.
+        """
+        self.attachment_sink = sink
 
     def set_reply_handler(self, handler: OutboxHandler | None) -> None:
         """Register (or clear with ``None``) the durable outbox consumer hook."""
@@ -252,6 +265,17 @@ class Gateway:
             await self._authorize(
                 "gateway.receive", RiskLevel.LOW, channel=message.channel, subject=target_subject
             )
+            attachment_ids: list[str] = []
+            if message.attachments and self.attachment_sink is not None:
+                # Download + store BEFORE the write transaction: a network
+                # round-trip must never hold the database lock.
+                for descriptor in message.attachments:
+                    try:
+                        stored = await self.attachment_sink(message.channel, descriptor)
+                    except Exception:
+                        stored = None
+                    if stored:
+                        attachment_ids.append(str(stored))
             prepared.append(
                 _Prepared(
                     message=message,
@@ -259,6 +283,7 @@ class Gateway:
                     subject=target_subject,
                     identity=identity,
                     dedupe_key=self._message_dedupe_key(message),
+                    attachment_ids=tuple(attachment_ids),
                 )
             )
         return prepared
@@ -300,6 +325,8 @@ class Gateway:
                 }
                 if item.original_channel:
                     metadata["adapter_channel"] = item.original_channel
+                if item.attachment_ids:
+                    metadata["attachments"] = list(item.attachment_ids)
                 now = utcnow()
                 cursor = await conn.execute(
                     "INSERT INTO messages(conversation_id,role,content,metadata,created_at) VALUES(?,?,?,?,?)",
@@ -326,6 +353,7 @@ class Gateway:
                     "text": message.text,
                     "timestamp": message.timestamp,
                     "metadata": metadata,
+                    "attachments": list(item.attachment_ids),
                     "duplicate": False,
                 }
                 encoded = _dump(payload)

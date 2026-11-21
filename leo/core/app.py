@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -363,6 +364,7 @@ class LeoApp:
         self.tasks.register_default_delivery(self._channel_delivery)
         # Durable outbox turns are driven by app.ask and answered via Gateway.send.
         self.gateway.set_reply_handler(self._gateway_reply)
+        self.gateway.set_attachment_sink(self._store_channel_attachment)
         await self.gateway.recover_stale_outbox()
 
         # Channel matrix → dashboard: statuses are honest (blocked until the
@@ -535,6 +537,36 @@ class LeoApp:
             str(channel), str(target), text[:8000], subject=f"task:{getattr(task, 'id', '')}"
         )
 
+    async def _store_channel_attachment(self, channel: str, descriptor: dict[str, Any]) -> str | None:
+        """Download a channel's file and store it, returning the attachment id.
+
+        The gateway hands over a provider descriptor; this is the only place
+        that touches both the channel adapter and the operator's media store.
+        A failed download drops the attachment, never the message.
+        """
+        adapter = self.gateway.adapters.get(channel)
+        download = getattr(adapter, "download", None)
+        if download is None:
+            return None
+        try:
+            raw, mime, name = await download(descriptor)
+        except Exception as exc:
+            _LOG.warning(
+                "channel attachment download failed",
+                extra={"channel": channel, "error": str(exc)},
+            )
+            return None
+        try:
+            record = await self.attachments.save(name, mime, base64.b64encode(raw).decode("ascii"))
+        except Exception as exc:
+            _LOG.warning(
+                "channel attachment store failed",
+                extra={"channel": channel, "error": str(exc)},
+            )
+            return None
+        attachment_id = record.get("id") if isinstance(record, dict) else None
+        return str(attachment_id) if attachment_id else None
+
     async def _gateway_reply(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Answer one admitted inbound message durably, then send its reply."""
         channel = str(payload.get("channel") or "")
@@ -551,6 +583,7 @@ class LeoApp:
             channel=channel,
             subject=str(subject),
             conversation_id=payload.get("conversation_id"),
+            attachments=payload.get("attachments") or None,
         )
         # The outbox id is the stable idempotency key: a retried drain can
         # replay the same external send without delivering it twice.
