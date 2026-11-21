@@ -10,9 +10,11 @@ queried across channels, subject to permission checks.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, NamedTuple
 
@@ -597,6 +599,24 @@ class Gateway:
             stats[str(row["status"])] = int(row["count"])
         return stats
 
+    # Telegram clears the typing indicator after ~5 s, so one call is not
+    # enough for a turn that takes 20 s. Ping on a short interval until the
+    # handler returns; a failure is cosmetic and must never break delivery.
+    TYPING_INTERVAL_SECONDS = 4.0
+
+    async def _typing_heartbeat(self, payload: dict[str, Any]) -> None:
+        channel = str(payload.get("channel") or "")
+        target = str(payload.get("reply_target") or payload.get("subject") or "")
+        adapter = self.adapters.get(channel)
+        if not target or adapter is None:
+            return
+        while True:
+            try:
+                await adapter.typing(target)
+            except Exception:
+                return
+            await asyncio.sleep(self.TYPING_INTERVAL_SECONDS)
+
     async def drain_outbox(
         self,
         handler: OutboxHandler | None = None,
@@ -645,7 +665,13 @@ class Gateway:
                     summary["suppressed"] += 1
                     summary["processed"] += 1
                     continue
-                result = await consumer(payload)
+                typing_task = asyncio.create_task(self._typing_heartbeat(payload))
+                try:
+                    result = await consumer(payload)
+                finally:
+                    typing_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await typing_task
                 if not _delivery_confirmed(result):
                     raise GatewayError("reply handler did not confirm delivery")
                 # Persist the delivery marker BEFORE the processed status: if
