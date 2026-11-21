@@ -374,7 +374,15 @@ async def context_command(ctx: CommandContext) -> CommandResult:
 
 
 async def new_command(ctx: CommandContext) -> CommandResult:
-    subject = ctx.rest().strip()[:200] or None
+    explicit = ctx.rest().strip()[:200] or None
+    # A channel turn is keyed by (channel, subject) — usually the sender id. A
+    # bare /new used to insert subject=NULL, which the gateway can never match,
+    # so the command created a conversation nothing would ever use. Reuse the
+    # subject of the conversation this command arrived on.
+    subject = explicit
+    if subject is None and ctx.conversation_id:
+        row = await db.fetchone("SELECT subject FROM conversations WHERE id=?", (ctx.conversation_id,))
+        subject = str(row["subject"]) if row and row["subject"] else None
     conversation_id = new_id("conv")
     await db.execute(
         "INSERT INTO conversations(id,channel,subject,created_at,updated_at) VALUES(?,?,?,?,?)",
@@ -382,9 +390,15 @@ async def new_command(ctx: CommandContext) -> CommandResult:
     )
     await _audit(ctx, "slash.new", conversation_id, "new conversation created")
     await _emit(ctx.app, "slash.session.new", conversation_id=conversation_id, actor=ctx.actor)
+    if subject is None:
+        return _summary(
+            ctx, "new",
+            f"New conversation {conversation_id} created. The client adapter must switch to this id to use it.",
+            {"conversation_id": conversation_id, "subject": subject},
+        )
     return _summary(
         ctx, "new",
-        f"New conversation {conversation_id} created. The client adapter must switch to this id to use it.",
+        f"New conversation {conversation_id} created; this channel switches to it on your next message.",
         {"conversation_id": conversation_id, "subject": subject},
     )
 
