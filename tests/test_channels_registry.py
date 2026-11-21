@@ -65,11 +65,14 @@ def test_capability_classification_matches_adapter_flags():
         else:
             assert name not in polling_channels()
     assert "telegram" in webhook_channels()
-    assert "telegram" not in polling_channels()
+    # Telegram gained a poll transport (getUpdates); a channel with no pull
+    # transport at all is the right exemplar for the negative case now.
+    assert "telegram" in polling_channels()
+    assert "discord" not in polling_channels()
 
 
 async def test_base_poll_raises_for_non_polling_adapter():
-    adapter = ALL_ADAPTERS["telegram"]()
+    adapter = ALL_ADAPTERS["discord"]()
     with pytest.raises(MessagingError, match="does not support polling"):
         await adapter.poll()
 
@@ -188,14 +191,15 @@ async def test_gateway_poll_rejects_non_polling_channel():
 
             return Decision(allowed=approved, reason="test", risk=RiskLevel.HIGH)
 
+    # discord has no pull transport; telegram does, so it is the wrong exemplar.
     gateway = Gateway(
-        {"telegram": ALL_ADAPTERS["telegram"]()},
+        {"discord": ALL_ADAPTERS["discord"]()},
         events=EventBus(persist=False),
         permissions=AllowAll(),
         admission=ChannelAdmission(ChannelsConfig(default_mode="open")),
     )
     with pytest.raises(GatewayError, match="does not support polling"):
-        await gateway.poll("telegram")
+        await gateway.poll("discord")
 
 
 # --------------------------------------------------------------------- sync
@@ -304,8 +308,8 @@ async def test_api_poll_route_rejects_non_polling_channel(offline_app: LeoApp) -
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         missing = await client.post("/channels/nosuchchannel/poll")
         assert missing.status_code == 404
-        telegram = await client.post("/channels/telegram/poll")
-        assert telegram.status_code == 404
+        webhook_only = await client.post("/channels/discord/poll")
+        assert webhook_only.status_code == 404
 
 
 async def test_app_start_syncs_channels_into_connected_surfaces(
