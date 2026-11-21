@@ -520,6 +520,12 @@
     $('view-title').textContent = VIEWS[name][0];
     $('view-eyebrow').textContent = VIEWS[name][1];
     document.title = `${VIEWS[name][0]} — LEO`;
+    // The capsule folds secondary sections into "More". Keep it lit while one
+    // of those sections is active, and close the popover after a selection.
+    const moreBtn = $('nav-more-btn');
+    const moreMenu = $('nav-more-menu');
+    if (moreBtn) moreBtn.classList.toggle('is-active', !!document.querySelector('.nav__more-menu .nav__item.is-active'));
+    if (moreMenu && !moreMenu.hidden) { moreMenu.hidden = true; if (moreBtn) moreBtn.setAttribute('aria-expanded', 'false'); }
   }
 
   function openModal({ title, text, value = '{}', run, confirm = false, fields = null, runLabel = null, silent = false, showResult = false }) {
@@ -554,6 +560,35 @@
 
   // ---- events -----------------------------------------------------------
   $('nav').addEventListener('click', (e) => { const b = e.target.closest('[data-view]'); if (b) setView(b.dataset.view); });
+
+  // Capsule "More" popover. Items live inside #nav, so the delegate above
+  // performs the view switch; this only owns open/close and focus affordances.
+  (function initNavMore() {
+    const btn = $('nav-more-btn');
+    const menu = $('nav-more-menu');
+    if (!btn || !menu) return;
+    const setOpen = (open) => {
+      menu.hidden = !open;
+      btn.setAttribute('aria-expanded', String(open));
+      if (open) menu.querySelector('button, a')?.focus();
+    };
+    const close = () => setOpen(false);
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setOpen(menu.hidden);
+    });
+    menu.addEventListener('click', (e) => { if (e.target.closest('[data-view], a')) close(); });
+    // Tabbing past the last item returns focus to the page; dismiss the popover.
+    menu.addEventListener('focusout', (e) => {
+      if (!menu.contains(e.relatedTarget) && e.relatedTarget !== btn) close();
+    });
+    document.addEventListener('click', (e) => {
+      if (!menu.hidden && !e.target.closest('.nav__more')) close();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !menu.hidden) { close(); btn.focus(); }
+    });
+  })();
   $('menu-btn').addEventListener('click', (e) => {
     e.stopPropagation();
     const open = $('menu').hidden;

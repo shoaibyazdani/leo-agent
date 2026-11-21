@@ -1553,3 +1553,51 @@ async def test_unauthenticated_audit_sanitizes_every_string_field(
             "/audit", headers={"authorization": "Bearer audit-read-token"}
         )
         assert privileged.status_code == 200 and token in privileged.text
+
+
+@pytest.mark.asyncio
+async def test_model_default_switch_is_live_and_persisted(
+    offline_app: LeoApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clicking a model in the dashboard must switch the live default and stick.
+
+    The config rewrite is scalar-only: comments and YAML anchors elsewhere in
+    the catalog must survive a selection.
+    """
+    config = tmp_path / "leo.yaml"
+    config.write_text(
+        "# keep this comment\n"
+        "models:\n"
+        "  default: mock\n"
+        "  providers:\n"
+        "    mock:\n"
+        "      kind: mock\n"
+        "      model: mock-1\n"
+        "    mock-2:\n"
+        "      kind: mock\n"
+        "      model: mock-2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LEO_CONFIG", str(config))
+    offline_app.settings.models.providers["mock-2"] = ModelProviderConfig(
+        kind="mock", model="mock-2"
+    )
+
+    transport = httpx.ASGITransport(app=api_module.api)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        switched = await client.post("/models/default", json={"provider": "mock-2"})
+        assert switched.status_code == 200, switched.text
+        body = switched.json()
+        assert body["default_provider"] == "mock-2"
+        assert body["model"] == "mock-2"
+        assert body["persisted"] is True
+        assert offline_app.settings.models.default == "mock-2"
+        assert (await client.get("/health")).json()["default_provider"] == "mock-2"
+
+        unknown = await client.post("/models/default", json={"provider": "no-such-model"})
+        assert unknown.status_code == 404
+
+    text = config.read_text(encoding="utf-8")
+    assert "  default: mock-2" in text
+    assert "# keep this comment" in text
+    assert config.with_name("leo.yaml.bak").exists()

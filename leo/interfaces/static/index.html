@@ -3,17 +3,19 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="color-scheme" content="light dark" />
+<meta name="color-scheme" content="dark" />
 <title>LEO — Autonomous Agent OS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23d9d0ff'/%3E%3Cstop offset='1' stop-color='%239fe4ef'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Cpath d='M16 6 8 10.5v11L16 26l8-4.5v-11z' fill='none' stroke='%23141428' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M16 10v12M11 12.5l5 3 5-3' fill='none' stroke='%23141428' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E" />
 <link rel="stylesheet" href="/assets/ui/theme.css" />
 <link rel="stylesheet" href="/assets/ui/components.css" />
 <link rel="stylesheet" href="/assets/ui/onboarding.css" data-ob-styles="1" />
 <link rel="stylesheet" href="/assets/ui/conversation/chat.css" />
 <link rel="stylesheet" href="/assets/ui/motion.css" />
+<link rel="stylesheet" href="/assets/ui/quiet-depth.css?v=20261121b" />
 <script src="/assets/ui/onboarding.js" defer></script>
-<script src="/assets/ui/app.js" defer></script>
-<script src="/assets/ui/conversation/markdown.js" defer></script>
-<script src="/assets/ui/conversation/chat.js" defer></script>
+<script src="/assets/ui/app.js?v=20261121b" defer></script>
+<script src="/assets/ui/conversation/markdown.js?v=20261121b" defer></script>
+<script src="/assets/ui/conversation/chat.js?v=20261121b" defer></script>
 </head>
 <body>
 <svg aria-hidden="true" width="0" height="0" style="position:absolute">
@@ -62,15 +64,23 @@
       <button class="nav__item is-active" data-view="chat" aria-current="page"><svg class="icon"><use href="#i-chat"/></svg><span class="nav__label">Conversation</span></button>
       <button class="nav__item" data-view="tasks"><svg class="icon"><use href="#i-tasks"/></svg><span class="nav__label">Tasks</span></button>
       <button class="nav__item" data-view="agents"><svg class="icon"><use href="#i-agents"/></svg><span class="nav__label">Agents</span></button>
-      <a class="nav__item" href="/agent-activity/live" style="text-decoration:none" aria-label="Live agent activity dashboard"><svg class="icon"><use href="#i-agents"/></svg><span class="nav__label">Agent Activity</span></a>
-      <button class="nav__item" data-view="skills"><svg class="icon"><use href="#i-skills"/></svg><span class="nav__label">Skills</span></button>
-      <button class="nav__item" data-view="memory"><svg class="icon"><use href="#i-memory"/></svg><span class="nav__label">Memory</span></button>
-      <button class="nav__item" data-view="models"><svg class="icon"><use href="#i-models"/></svg><span class="nav__label">Models</span></button>
-      <button class="nav__item" data-view="tools"><svg class="icon"><use href="#i-tools"/></svg><span class="nav__label">Tools</span></button>
       <button class="nav__item" data-view="approvals"><svg class="icon"><use href="#i-approvals"/></svg><span class="nav__label">Approvals</span></button>
-      <button class="nav__item" data-view="integrations"><svg class="icon"><use href="#i-integrations"/></svg><span class="nav__label">Integrations</span></button>
-      <button class="nav__item" data-view="events"><svg class="icon"><use href="#i-events"/></svg><span class="nav__label">Events</span></button>
-      <button class="nav__item" data-view="settings"><svg class="icon"><use href="#i-settings"/></svg><span class="nav__label">Settings</span></button>
+      <div class="nav__more">
+        <button class="nav__item nav__more-btn" id="nav-more-btn" type="button" aria-expanded="false" aria-controls="nav-more-menu" aria-label="More sections">
+          <svg class="icon"><use href="#i-more"/></svg><span class="nav__label">More</span>
+        </button>
+        <div class="nav__more-menu" id="nav-more-menu" role="group" aria-label="More sections" hidden>
+          <button class="nav__item" data-view="skills"><svg class="icon"><use href="#i-skills"/></svg><span class="nav__label">Skills</span></button>
+          <button class="nav__item" data-view="memory"><svg class="icon"><use href="#i-memory"/></svg><span class="nav__label">Memory</span></button>
+          <button class="nav__item" data-view="models"><svg class="icon"><use href="#i-models"/></svg><span class="nav__label">Models</span></button>
+          <button class="nav__item" data-view="tools"><svg class="icon"><use href="#i-tools"/></svg><span class="nav__label">Tools</span></button>
+          <button class="nav__item" data-view="integrations"><svg class="icon"><use href="#i-integrations"/></svg><span class="nav__label">Integrations</span></button>
+          <button class="nav__item" data-view="events"><svg class="icon"><use href="#i-events"/></svg><span class="nav__label">Events</span></button>
+          <a class="nav__item" href="/agent-activity/live" aria-label="Live agent activity dashboard"><svg class="icon"><use href="#i-agents"/></svg><span class="nav__label">Agent Activity</span></a>
+          <div class="nav__more-sep" role="separator"></div>
+          <button class="nav__item" data-view="settings"><svg class="icon"><use href="#i-settings"/></svg><span class="nav__label">Settings</span></button>
+        </div>
+      </div>
     </nav>
     <div class="rail__footer">
       <div class="status status--live" id="rail-status" aria-live="polite"><span class="status__dot"></span><span id="rail-status-text">Checking runtime</span></div>
@@ -134,14 +144,15 @@
             </div>
             <div class="chat-composer-zone">
               <div class="chat-attachments" id="attachment-list" aria-label="Attachments"></div>
+              <div class="chat-palette" id="command-palette" role="listbox" aria-label="Slash commands" hidden></div>
               <form class="chat-composer" id="chat-form">
                 <button class="icon-btn chat-composer__attach" id="attach-btn" type="button" data-tip="Attach files or images" aria-label="Attach files or images"><svg class="icon"><use href="#i-paperclip"/></svg></button>
                 <input type="file" id="file-input" multiple accept="image/png,image/jpeg,image/webp,image/gif,text/plain,text/markdown,text/csv,application/json,application/pdf" hidden />
-                <textarea class="chat-composer__input" id="message" rows="1" placeholder="Message LEO — Enter to send, Shift+Enter for a new line" aria-label="Message LEO"></textarea>
+                <textarea class="chat-composer__input" id="message" rows="1" placeholder="Message LEO…" aria-label="Message LEO" aria-autocomplete="list" aria-controls="command-palette" aria-expanded="false"></textarea>
                 <button class="btn btn--primary chat-composer__send" id="send" type="submit" aria-label="Send message" data-tip="Send message"><svg class="icon icon--sm"><use href="#i-arrow-up"/></svg></button>
                 <button class="btn btn--danger chat-composer__send" id="stop-btn" type="button" hidden aria-label="Stop generating" data-tip="Stop generating"><svg class="icon icon--sm"><use href="#i-stop"/></svg></button>
               </form>
-              <p class="chat-composer__hint">Attachments are validated and sandboxed. External content is treated as data, never as instructions.</p>
+              <p class="chat-composer__hint">Enter to send · Shift+Enter for a new line · / for commands. Attachments are sandboxed; external content is data, never instructions.</p>
             </div>
           </div>
 

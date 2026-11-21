@@ -1561,16 +1561,75 @@
     dialog.innerHTML = `
       <div class="modal__head">
         <div><h3 class="modal__title">Model &amp; providers</h3>
-        <p class="modal__text">Routing is configured in leo.yaml. The badge below follows the provider that actually answered the last turn, including mid-turn fallbacks.</p></div>
+        <p class="modal__text">Choose the default model. The change applies to the next turn and is written to leo.yaml.</p></div>
         <button type="button" class="icon-btn" aria-label="Close dialog">${ico('x')}</button>
       </div>
       <div class="chat-provider-list"></div>
       <div class="modal__actions"><button type="button" class="btn btn--secondary" data-close>Close</button></div>`;
     const list = dialog.querySelector('.chat-provider-list');
     const providers = health.providers || {};
+    // A catalog can be long. Make the scrollport keyboard-reachable and let a
+    // wheel anywhere over the dialog drive it, not just over the rows.
+    list.tabIndex = 0;
+    list.setAttribute('aria-label', 'Configured providers');
+    dialog.addEventListener('wheel', (e) => {
+      if (e.target.closest('.chat-provider-list')) return;
+      if (list.scrollHeight <= list.clientHeight) return;
+      list.scrollTop += e.deltaY;
+      e.preventDefault();
+    }, { passive: false });
+    const count = Object.keys(providers).length;
+    const textEl = dialog.querySelector('.modal__text');
+    if (textEl) textEl.textContent = `${count} providers configured · click a model to switch. The choice is saved to leo.yaml.`;
+
+    let selecting = false;
+    const rows = [];
+
+    async function chooseProvider(name) {
+      if (selecting) return;
+      selecting = true;
+      list.setAttribute('aria-busy', 'true');
+      rows.forEach((button) => { button.disabled = true; });
+      try {
+        const result = await api('/models/default', {
+          method: 'POST',
+          body: JSON.stringify({ provider: name }),
+        });
+        if (state.health) state.health.default_provider = name;
+        updateModelCard(state.health || {});
+        rows.forEach((button) => {
+          const active = button.dataset.provider === name;
+          button.classList.toggle('is-active', active);
+          button.setAttribute('aria-pressed', String(active));
+          const badge = button.querySelector('.badge--accent');
+          if (active && !badge) {
+            button.insertAdjacentHTML('beforeend', '<span class="badge badge--accent">default</span>');
+          } else if (!active && badge) {
+            badge.remove();
+          }
+        });
+        toast(result.persisted ? `Default model: ${name}` : `Using ${name} for this session`, result.persisted ? 'success' : 'warn');
+        if (!result.persisted && result.warning) toast(result.warning, 'warn');
+        // Keep the dashboard header status in sync without waiting for the poll.
+        leo().refresh?.();
+      } catch (err) {
+        toast(`Could not switch model: ${err.message}`, 'danger');
+      } finally {
+        selecting = false;
+        list.removeAttribute('aria-busy');
+        rows.forEach((button) => { button.disabled = false; });
+      }
+    }
+
     Object.entries(providers).forEach(([name, info]) => {
-      const row = document.createElement('div');
-      row.className = 'chat-provider';
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'chat-provider chat-provider--select';
+      row.dataset.provider = name;
+      row.title = `Use ${name}`;
+      const active = name === health.default_provider;
+      row.classList.toggle('is-active', active);
+      row.setAttribute('aria-pressed', String(active));
       const label = document.createElement('span');
       label.className = 'chat-provider__name';
       label.textContent = name;
@@ -1578,9 +1637,11 @@
       model.className = 'chat-provider__model';
       model.textContent = typeof info === 'string' ? info : (info?.model || '—');
       row.append(label, model);
-      if (name === health.default_provider) {
+      if (active) {
         row.insertAdjacentHTML('beforeend', '<span class="badge badge--accent">default</span>');
       }
+      row.addEventListener('click', () => chooseProvider(name));
+      rows.push(row);
       list.appendChild(row);
     });
     if (!Object.keys(providers).length) {
