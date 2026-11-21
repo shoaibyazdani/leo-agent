@@ -1,0 +1,24 @@
+LEO — third-party notices and attribution
+==========================================
+
+This file records licenses and attribution for third-party projects studied
+during the 2026-11-18 integration research. No upstream source code was copied
+into LEO in that work: capabilities were independently implemented or
+described, and only declarative SKILL.md metadata is translated for review.
+
+Hermes Agent — https://github.com/NousResearch/hermes-agent
+  MIT License
+  Copyright (c) 2025 Nous Research
+
+OpenClaw — https://github.com/openclaw/openclaw
+  MIT License
+  Copyright (c) 2026 OpenClaw Foundation
+  OpenClaw also publishes THIRD_PARTY_NOTICES.md covering its own transitive
+  dependencies and adapted code; consult it directly if any such material is
+  ever imported into LEO.
+
+MIT licenses permit reuse and redistribution provided the copyright and
+permission notices are included in copies or substantial portions. Individual
+third-party skills, plugins, model libraries and registries carry their own
+licenses and must be reviewed separately before distribution. See
+THIRD_PARTY_NOTICES.md for the shipped dependency inventory and license texts.

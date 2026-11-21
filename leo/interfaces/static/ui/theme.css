@@ -1,0 +1,129 @@
+/* LEO Night Instrument — tokens and base layer. */
+@font-face { font-family: 'Space Grotesk'; font-style: normal; font-weight: 500; font-display: swap; src: url('/assets/fonts/space-grotesk-500.ttf') format('truetype'); }
+@font-face { font-family: 'Space Grotesk'; font-style: normal; font-weight: 600; font-display: swap; src: url('/assets/fonts/space-grotesk-600.ttf') format('truetype'); }
+@font-face { font-family: 'Space Grotesk'; font-style: normal; font-weight: 700; font-display: swap; src: url('/assets/fonts/space-grotesk-700.ttf') format('truetype'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 400; font-display: swap; src: url('/assets/fonts/ibm-plex-sans-400.ttf') format('truetype'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 500; font-display: swap; src: url('/assets/fonts/ibm-plex-sans-500.ttf') format('truetype'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 600; font-display: swap; src: url('/assets/fonts/ibm-plex-sans-600.ttf') format('truetype'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 700; font-display: swap; src: url('/assets/fonts/ibm-plex-sans-700.ttf') format('truetype'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url('/assets/fonts/ibm-plex-mono-400.ttf') format('truetype'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 500; font-display: swap; src: url('/assets/fonts/ibm-plex-mono-500.ttf') format('truetype'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 600; font-display: swap; src: url('/assets/fonts/ibm-plex-mono-600.ttf') format('truetype'); }
+
+:root {
+  /* Primitive colours */
+  --c-graphite-950: #070a0d;
+  --c-graphite-900: #0a0e12;
+  --c-graphite-850: #11171d;
+  --c-graphite-800: #172028;
+  --c-graphite-750: #1d2832;
+  --c-line-400: #24313c;
+  --c-line-300: #344653;
+  --c-ivory-100: #e9efea;
+  --c-ivory-300: #b3c0c6;
+  --c-ivory-500: #8a9aa3;
+  --c-teal-400: #58d6c1;
+  --c-teal-950: #051512;
+  --c-mint-400: #7fd49b;
+  --c-amber-400: #e8b86d;
+  --c-rose-400: #f28b82;
+  --c-blue-400: #8fb8e8;
+
+  /* Semantic colours */
+  --bg-base: var(--c-graphite-900);
+  --bg-sunken: var(--c-graphite-950);
+  --surface-1: var(--c-graphite-850);
+  --surface-2: var(--c-graphite-800);
+  --surface-3: var(--c-graphite-750);
+  --border-subtle: var(--c-line-400);
+  --border-strong: var(--c-line-300);
+  --text-primary: var(--c-ivory-100);
+  --text-secondary: var(--c-ivory-300);
+  --text-muted: var(--c-ivory-500);
+  --accent: var(--c-teal-400);
+  --accent-soft: rgba(88, 214, 193, .14);
+  --on-accent: var(--c-teal-950);
+  --success: var(--c-mint-400);
+  --warn: var(--c-amber-400);
+  --danger: var(--c-rose-400);
+  --info: var(--c-blue-400);
+  --grid-line: rgba(233, 239, 234, .022);
+
+  /* Spacing */
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+  --space-5: 24px; --space-6: 32px; --space-7: 48px;
+
+  /* Radii */
+  --radius-xs: 4px; --radius-sm: 8px; --radius-md: 12px;
+  --radius-lg: 16px; --radius-pill: 999px;
+
+  /* Elevation */
+  --shadow-1: 0 1px 0 rgba(255,255,255,.03), 0 2px 8px rgba(0,0,0,.24);
+  --shadow-2: 0 12px 32px rgba(0,0,0,.42);
+  --glow-accent: 0 0 0 1px var(--accent-soft), 0 0 24px rgba(88,214,193,.12);
+  --focus-ring: 0 0 0 2px var(--bg-base), 0 0 0 4px var(--accent);
+
+  /* Typography */
+  --font-display: 'Space Grotesk', 'Trebuchet MS', sans-serif;
+  --font-ui: 'IBM Plex Sans', 'Segoe UI', sans-serif;
+  --font-mono: 'IBM Plex Mono', 'Menlo', monospace;
+  --text-2xs: 12px; --text-xs: 12px; --text-sm: 14px; --text-base: 16px;
+  --text-lg: 20px; --text-xl: 28px; --text-2xl: 36px;
+  --leading-tight: 1.15; --leading-body: 1.55;
+
+  /* Layers */
+  --z-base: 0; --z-raised: 10; --z-sticky: 20; --z-dropdown: 30;
+  --z-modal: 40; --z-toast: 50; --z-tooltip: 60;
+
+  /* Motion */
+  --dur-fast: 150ms; --dur-base: 200ms; --dur-slow: 300ms;
+  --ease-standard: cubic-bezier(.2,.8,.2,1);
+  --ease-enter: cubic-bezier(.16,1,.3,1);
+  --ease-exit: cubic-bezier(.4,0,1,1);
+
+  /* Component aliases */
+  --button-min-height: 36px;
+  --button-pad-x: var(--space-4);
+  --button-radius: var(--radius-sm);
+  --input-bg: var(--bg-sunken);
+  --input-border: var(--border-strong);
+  --input-focus: var(--accent);
+  --panel-bg: var(--surface-1);
+  --panel-border: var(--border-subtle);
+  --panel-radius: var(--radius-md);
+  --panel-pad: var(--space-5);
+  --rail-width: 248px;
+  --topbar-height: 76px;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background-color: var(--bg-base);
+  background-image: linear-gradient(var(--grid-line) 1px, transparent 1px),
+                    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 24px 24px;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, h4 { color: var(--text-primary); font-family: var(--font-display); line-height: var(--leading-tight); margin: 0; font-weight: 600; }
+p { margin: 0; }
+button, input, textarea, select { font: inherit; }
+button { cursor: pointer; }
+a { color: var(--info); }
+/* Do not force a corner radius here: box-shadow already follows each control's
+   own radius, and overriding it makes pill/8px controls jump shape on focus. */
+:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+::selection { background: var(--accent-soft); color: var(--text-primary); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: var(--radius-pill); border: 2px solid var(--bg-base); }
+::-webkit-scrollbar-track { background: transparent; }
+[hidden] { display: none !important; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: 100ms !important; scroll-behavior: auto !important; }
+}

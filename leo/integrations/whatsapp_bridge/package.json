@@ -1,0 +1,19 @@
+{
+  "name": "leo-whatsapp-device-link-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Opt-in, loopback-only WhatsApp Web device-link bridge for LEO. Not wired into the app by default.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bridge.js",
+    "check": "node --check bridge.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "express": "4.21.2",
+    "qrcode": "1.5.4"
+  }
+}

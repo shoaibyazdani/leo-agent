@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>LEO — Autonomous Agent OS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23d9d0ff'/%3E%3Cstop offset='1' stop-color='%239fe4ef'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Cpath d='M16 6 8 10.5v11L16 26l8-4.5v-11z' fill='none' stroke='%23141428' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M16 10v12M11 12.5l5 3 5-3' fill='none' stroke='%23141428' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/assets/ui/theme.css" />
+<link rel="stylesheet" href="/assets/ui/components.css" />
+<link rel="stylesheet" href="/assets/ui/onboarding.css" data-ob-styles="1" />
+<link rel="stylesheet" href="/assets/ui/conversation/chat.css?v=20261122a" />
+<link rel="stylesheet" href="/assets/ui/motion.css" />
+<link rel="stylesheet" href="/assets/ui/quiet-depth.css?v=20261122a" />
+<script src="/assets/ui/onboarding.js" defer></script>
+<script src="/assets/ui/app.js?v=20261122a" defer></script>
+<script src="/assets/ui/conversation/markdown.js?v=20261122a" defer></script>
+<script src="/assets/ui/conversation/chat.js?v=20261122a" defer></script>
+</head>
+<body>
+<svg aria-hidden="true" width="0" height="0" style="position:absolute">
+  <symbol id="i-logo" viewBox="0 0 24 24"><path d="M12 2 4 7v10l8 5 8-5V7z"/><path d="M12 7v10M7 9.5l5 3 5-3"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/><path d="M8 10h8M8 14h5"/></symbol>
+  <symbol id="i-tasks" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m8 12 3 3 5-6"/></symbol>
+  <symbol id="i-agents" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"/><path d="M5 20a7 7 0 0 1 14 0M19 5l1.5-1.5M4 5 2.5 3.5"/></symbol>
+  <symbol id="i-skills" viewBox="0 0 24 24"><path d="M12 3 2 8l10 5 10-5z"/><path d="m2 13 10 5 10-5M2 18l10 5 10-5"/></symbol>
+  <symbol id="i-memory" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-models" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+  <symbol id="i-tools" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0 5.1 5.1L21 15l-6 6-3.6-3.6a4 4 0 0 1-5.1-5.1L8 10 5 7l3-3 3 3z"/></symbol>
+  <symbol id="i-approvals" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-integrations" viewBox="0 0 24 24"><path d="M9 3v6M15 3v6M6 9h12v4a6 6 0 0 1-12 0zM12 19v3"/></symbol>
+  <symbol id="i-events" viewBox="0 0 24 24"><path d="M2 12h4l3-8 5 16 3-8h5"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6.7M20 4v7h-7"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="m3 11 18-8-8 18-2-8zM13 13l8-10"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m4 12 5 5L20 6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2 21h20z"/><path d="M12 9v5M12 18h.01"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M15 5H5a2 2 0 0 0-2 2v10"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="m7 4 12 8-12 8z"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 .5l3-3a5 5 0 0 0-7-7l-2 2M14 11a5 5 0 0 0-7-.5l-3 3a5 5 0 0 0 7 7l2-2"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5"/><path d="M12 8v4l3 2"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></symbol>
+  <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21 11.5 12.2 20.3a5 5 0 0 1-7.1-7.1l8.5-8.5a3.4 3.4 0 0 1 4.8 4.8l-8.5 8.5a1.8 1.8 0 0 1-2.5-2.5l7.8-7.8"/></symbol>
+  <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v5M14 11v5"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></symbol>
+</svg>
+
+<div class="app" id="app">
+  <aside class="rail">
+    <div class="brand">
+      <span class="brand__mark"><svg class="icon icon--lg"><use href="#i-logo"/></svg></span>
+      <span><span class="brand__name">LEO</span><span class="brand__sub">AGENT OS · LOCAL</span></span>
+    </div>
+    <nav class="nav" id="nav" aria-label="Primary navigation">
+      <button class="nav__item is-active" data-view="chat" aria-current="page"><svg class="icon"><use href="#i-chat"/></svg><span class="nav__label">Conversation</span></button>
+      <button class="nav__item" data-view="tasks"><svg class="icon"><use href="#i-tasks"/></svg><span class="nav__label">Tasks</span></button>
+      <button class="nav__item" data-view="agents"><svg class="icon"><use href="#i-agents"/></svg><span class="nav__label">Agents</span></button>
+      <button class="nav__item" data-view="approvals"><svg class="icon"><use href="#i-approvals"/></svg><span class="nav__label">Approvals</span></button>
+      <div class="nav__more">
+        <button class="nav__item nav__more-btn" id="nav-more-btn" type="button" aria-expanded="false" aria-controls="nav-more-menu" aria-label="More sections">
+          <svg class="icon"><use href="#i-more"/></svg><span class="nav__label">More</span>
+        </button>
+        <div class="nav__more-menu" id="nav-more-menu" role="group" aria-label="More sections" hidden>
+          <button class="nav__item" data-view="skills"><svg class="icon"><use href="#i-skills"/></svg><span class="nav__label">Skills</span></button>
+          <button class="nav__item" data-view="memory"><svg class="icon"><use href="#i-memory"/></svg><span class="nav__label">Memory</span></button>
+          <button class="nav__item" data-view="models"><svg class="icon"><use href="#i-models"/></svg><span class="nav__label">Models</span></button>
+          <button class="nav__item" data-view="tools"><svg class="icon"><use href="#i-tools"/></svg><span class="nav__label">Tools</span></button>
+          <button class="nav__item" data-view="integrations"><svg class="icon"><use href="#i-integrations"/></svg><span class="nav__label">Integrations</span></button>
+          <button class="nav__item" data-view="events"><svg class="icon"><use href="#i-events"/></svg><span class="nav__label">Events</span></button>
+          <a class="nav__item" href="/agent-activity/live" aria-label="Live agent activity dashboard"><svg class="icon"><use href="#i-agents"/></svg><span class="nav__label">Agent Activity</span></a>
+          <div class="nav__more-sep" role="separator"></div>
+          <button class="nav__item" data-view="settings"><svg class="icon"><use href="#i-settings"/></svg><span class="nav__label">Settings</span></button>
+        </div>
+      </div>
+    </nav>
+    <div class="rail__footer">
+      <div class="status status--live" id="rail-status" aria-live="polite"><span class="status__dot"></span><span id="rail-status-text">Checking runtime</span></div>
+      <div class="status" id="shell-status" aria-live="polite" hidden><span class="status__dot"></span><span id="shell-status-text"></span></div>
+      <div class="rail__meta" id="rail-meta">LOCAL · v0.1.0</div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div><p class="eyebrow" id="view-eyebrow">UNIFIED SESSION</p><h1 class="title" id="view-title">Conversation</h1></div>
+      <div class="topbar__right">
+        <span class="status" id="health-pill" aria-live="polite"><span class="status__dot"></span><span id="health-text">checking…</span></span>
+        <button class="icon-btn" id="refresh-btn" data-tip="Refresh all data" aria-label="Refresh all data"><svg class="icon"><use href="#i-refresh"/></svg></button>
+        <div class="menu-wrap">
+          <button class="icon-btn" id="menu-btn" aria-label="More actions" aria-haspopup="true" aria-expanded="false"><svg class="icon"><use href="#i-more"/></svg></button>
+          <div class="menu" id="menu" hidden role="menu">
+            <button class="menu__item" data-action="refresh" role="menuitem"><svg class="icon icon--sm"><use href="#i-refresh"/></svg> Refresh data</button>
+            <button class="menu__item" data-action="copy-health" role="menuitem"><svg class="icon icon--sm"><use href="#i-copy"/></svg> Copy runtime status</button>
+            <button class="menu__item" data-action="compact" role="menuitem"><svg class="icon icon--sm"><use href="#i-bolt"/></svg> Toggle compact density</button>
+            <button class="menu__item" data-view="settings" role="menuitem"><svg class="icon icon--sm"><use href="#i-settings"/></svg> Open settings</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="content" id="content">
+      <!-- conversation -->
+      <section class="view is-active" id="view-chat">
+        <div class="chat-shell" id="chat-shell">
+          <aside class="chat-sessions panel" id="chat-sessions" aria-label="Conversations">
+            <div class="chat-sessions__head">
+              <button class="btn btn--primary btn--sm" id="chat-new" type="button"><svg class="icon icon--sm"><use href="#i-plus"/></svg> New chat</button>
+              <button class="icon-btn" id="chat-sessions-refresh" type="button" data-tip="Refresh conversations" aria-label="Refresh conversations"><svg class="icon icon--sm"><use href="#i-refresh"/></svg></button>
+            </div>
+            <div class="field chat-sessions__search">
+              <label class="sr-only" for="chat-search">Search conversations</label>
+              <input class="input" id="chat-search" type="search" placeholder="Search conversations…" autocomplete="off" />
+            </div>
+            <div class="chat-sessions__list" id="chat-session-list" role="list" aria-label="Conversation list"></div>
+            <div class="chat-sessions__foot">
+              <div class="status" id="chat-sessions-status" aria-live="polite"><span class="status__dot"></span><span id="chat-sessions-status-text">Loading…</span></div>
+            </div>
+          </aside>
+
+          <div class="chat-main panel panel--flush">
+            <div class="chat-main__head">
+              <div class="chat-main__title">
+                <p class="eyebrow">CONVERSATION</p>
+                <h2 class="chat-title" id="chat-title">New conversation</h2>
+              </div>
+              <div class="chat-main__head-actions">
+                <span class="status" id="chat-status" aria-live="polite"><span class="status__dot"></span><span id="chat-status-text">Ready</span></span>
+                <span class="badge badge--accent" id="chat-channel-badge">web</span>
+                <button class="icon-btn chat-only-narrow" id="chat-history-toggle" type="button" data-tip="Conversations" aria-label="Toggle conversation list"><svg class="icon icon--sm"><use href="#i-history"/></svg></button>
+                <button class="icon-btn chat-only-wide" id="chat-panel-toggle" type="button" data-tip="Toggle side panel" aria-label="Toggle side panel"><svg class="icon icon--sm"><use href="#i-panel"/></svg></button>
+              </div>
+            </div>
+            <div class="chat-scroll" id="chat-scroll">
+              <div class="chat-thread" id="chat-thread"></div>
+            </div>
+            <div class="chat-composer-zone">
+              <div class="chat-attachments" id="attachment-list" aria-label="Attachments"></div>
+              <div class="chat-palette" id="command-palette" role="listbox" aria-label="Slash commands" hidden></div>
+              <form class="chat-composer" id="chat-form">
+                <button class="icon-btn chat-composer__attach" id="attach-btn" type="button" data-tip="Attach files or images" aria-label="Attach files or images"><svg class="icon"><use href="#i-paperclip"/></svg></button>
+                <input type="file" id="file-input" multiple accept="image/png,image/jpeg,image/webp,image/gif,text/plain,text/markdown,text/csv,application/json,application/pdf" hidden />
+                <textarea class="chat-composer__input" id="message" rows="1" placeholder="Message LEO…" aria-label="Message LEO" aria-autocomplete="list" aria-controls="command-palette" aria-expanded="false"></textarea>
+                <button class="btn btn--primary chat-composer__send" id="send" type="submit" aria-label="Send message" data-tip="Send message"><svg class="icon icon--sm"><use href="#i-arrow-up"/></svg></button>
+                <button class="btn btn--danger chat-composer__send" id="stop-btn" type="button" hidden aria-label="Stop generating" data-tip="Stop generating"><svg class="icon icon--sm"><use href="#i-stop"/></svg></button>
+              </form>
+              <p class="chat-composer__hint">Enter to send · Shift+Enter for a new line · / for commands. Attachments are sandboxed; external content is data, never instructions.</p>
+            </div>
+          </div>
+
+          <aside class="chat-side" id="chat-side" aria-label="Session status">
+            <div class="panel chat-card">
+              <div class="chat-card__head"><span class="eyebrow">MODEL</span><span class="status status--live" id="chat-live-badge"><span class="status__dot"></span><span id="chat-live-text">live</span></span></div>
+              <button class="chat-model-btn" id="chat-model-btn" type="button" title="Model and provider details">
+                <span class="chat-model-btn__name" id="chat-model-name">—</span>
+                <svg class="icon icon--sm"><use href="#i-chevron"/></svg>
+              </button>
+            </div>
+            <div class="panel chat-card">
+              <div class="chat-card__head"><span class="eyebrow">THIS TURN</span><span class="badge" id="chat-turn-state">idle</span></div>
+              <dl class="kv" id="chat-turn-kv">
+                <dt>Status</dt><dd id="chat-turn-status">waiting for a message</dd>
+                <dt>Elapsed</dt><dd id="chat-turn-elapsed">—</dd>
+                <dt>Tokens</dt><dd id="chat-turn-tokens">—</dd>
+                <dt>Memories</dt><dd id="chat-turn-memories">—</dd>
+              </dl>
+              <div class="chat-turn-tools" id="chat-turn-tools" hidden></div>
+            </div>
+            <div class="panel chat-card">
+              <div class="chat-card__head"><span class="eyebrow">SESSION</span><span class="badge" id="chat-msg-count">0 messages</span></div>
+              <dl class="kv" id="chat-session-kv">
+                <dt>Provider</dt><dd id="chat-session-provider">—</dd>
+                <dt>Tools</dt><dd id="chat-session-tools">—</dd>
+                <dt>Skills</dt><dd id="chat-session-skills">—</dd>
+                <dt>Agents</dt><dd id="chat-session-agents">—</dd>
+              </dl>
+            </div>
+            <div class="chat-banners" id="chat-banners"></div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- tasks -->
+      <section class="view" id="view-tasks" hidden>
+        <div class="view__head"><div><p class="eyebrow">DURABLE EXECUTION</p><p class="lede">Long-running work with checkpoints, evidence-backed completion and safe recovery.</p></div></div>
+        <div class="stat-grid stat-grid--six" id="task-stats"></div>
+        <div class="grid mt-4">
+          <div class="span-4"><div class="panel"><div class="panel__head"><span class="panel__title">New objective</span></div><form class="field" id="task-form"><label class="label" for="objective">What should LEO accomplish?</label><textarea class="textarea" id="objective" placeholder="Research X, then write a short report…" required></textarea><button class="btn btn--primary" type="submit"><svg class="icon icon--sm"><use href="#i-plus"/></svg> Queue objective</button><p class="hint" id="task-hint">Objectives are queued for durable workers.</p></form></div></div>
+          <div class="span-8"><div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Registry</span><span class="panel__meta" id="task-count">—</span></div><div class="panel__body" id="task-list"></div></div></div>
+        </div>
+        <div class="panel mt-4"><div class="panel__head"><span class="panel__title">Schedules</span><span class="badge" id="schedule-availability">checking</span></div><div class="panel__body">
+          <form class="form-row" id="schedule-form"><div class="field"><label class="label" for="schedule-name">Name</label><input class="input" id="schedule-name" required /></div><div class="field"><label class="label" for="schedule-seconds">Interval (seconds)</label><input class="input" id="schedule-seconds" type="number" min="1" step="1" value="3600" required /></div><div class="field"><label class="label" for="schedule-objective">Objective</label><input class="input" id="schedule-objective" required /></div><button class="btn btn--secondary" id="schedule-submit" type="submit" disabled>Schedule objective</button></form>
+          <div id="schedule-list" class="mt-4" aria-live="polite"></div><pre class="code" id="schedule-output" hidden></pre>
+        </div></div>
+      </section>
+
+      <!-- agents -->
+      <section class="view" id="view-agents" hidden>
+        <div class="view__head"><div><p class="eyebrow">SPECIALIST FLEET</p><p class="lede" id="agent-lede">Loading specialist registry…</p></div></div>
+        <div class="stat-grid" id="agent-stats"></div>
+        <div class="grid mt-4"><div class="span-8"><div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Registry</span><span class="panel__meta" id="agent-count">—</span></div><div class="panel__body" id="agent-list"></div></div></div>
+        <div class="span-4"><div class="panel"><div class="panel__head"><span class="panel__title">Delegate objective</span><span class="badge" id="delegate-availability">checking</span></div><form class="field" id="delegate-form"><label class="label" for="delegate-agent">Specialist</label><select class="select" id="delegate-agent" disabled><option value="">Loading agents…</option></select><label class="label" for="delegate-objective">Objective</label><textarea class="textarea" id="delegate-objective" placeholder="Define a bounded, verifiable objective…" required></textarea><button class="btn btn--primary" id="delegate-submit" type="submit" disabled>Delegate objective</button><p class="hint" id="delegate-hint">Delegation requires the agent_delegate capability.</p></form><pre class="code" id="delegate-output" hidden></pre></div>
+        <div class="panel mt-4"><div class="panel__head"><span class="panel__title">Delegation policy</span></div><dl class="kv" id="agent-policy"><dt>Isolation</dt><dd>worktree + review</dd><dt>Verification</dt><dd>independent</dd><dt>Tool grants</dt><dd>declared per agent</dd></dl><p class="hint mt-4">Agent execution history is written to the event stream.</p></div></div></div>
+      </section>
+
+      <!-- skills -->
+      <section class="view" id="view-skills" hidden>
+        <div class="view__head"><div><p class="eyebrow">CAPABILITY LIBRARY</p><p class="lede">Native skills run locally. Imported legacy skills are metadata-only and never execute third-party scripts.</p></div></div>
+        <div class="panel"><div class="form-row"><div class="field"><label class="label" for="skill-search">Find a skill</label><input class="input" id="skill-search" type="search" placeholder="Search by name or category" /></div><button class="btn btn--secondary" id="skill-search-btn"><svg class="icon icon--sm"><use href="#i-search"/></svg> Search</button></div></div>
+        <div class="grid mt-4"><div class="span-12"><div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Registry</span><span class="panel__meta" id="skill-count">—</span></div><div class="panel__body" id="skill-list"></div></div></div></div>
+      </section>
+
+      <!-- memory -->
+      <section class="view" id="view-memory" hidden>
+        <div class="view__head"><div><p class="eyebrow">LAYERED RECALL</p><p class="lede">Facts, assumptions, procedures and project context with source, confidence and version history.</p></div></div>
+        <div class="grid">
+          <div class="span-4"><div class="panel"><div class="panel__head"><span class="panel__title">Remember</span></div><form class="field" id="memory-form"><label class="label" for="mem-content">Fact or note</label><textarea class="textarea" id="mem-content" placeholder="A stable preference or useful fact…" required></textarea><div class="form-row"><div class="field"><label class="label" for="mem-category">Category</label><select class="select" id="mem-category"><option>semantic</option><option>episodic</option><option>procedural</option><option>personal</option><option>project</option><option>working</option><option>organizational</option></select></div><button class="btn btn--primary" type="submit"><svg class="icon icon--sm"><use href="#i-plus"/></svg> Remember</button></div></form></div></div>
+          <div class="span-8"><div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Recent memories</span><span class="panel__meta" id="memory-count">—</span></div><div class="panel__body">
+            <form class="form-row" id="memory-search-form"><div class="field"><label class="label" for="mem-query">Search memory</label><input class="input" id="mem-query" type="search" placeholder="Keywords or concepts" /></div><button class="btn btn--secondary" type="submit"><svg class="icon icon--sm"><use href="#i-search"/></svg> Search</button></form>
+            <div id="memory-list" class="mt-4"></div>
+          </div></div></div>
+        </div>
+      </section>
+
+      <!-- models -->
+      <section class="view" id="view-models" hidden>
+        <div class="view__head"><div><p class="eyebrow">INTELLIGENCE ENGINE</p><p class="lede">Provider-independent routing, bounded escalation and measured usage.</p></div><div class="tabs" role="tablist" aria-label="Model views"><button class="tab is-active" role="tab" aria-selected="true" data-model-tab="usage">Usage</button><button class="tab" role="tab" aria-selected="false" data-model-tab="providers">Providers</button></div></div>
+        <div id="models-usage"><div class="stat-grid" id="usage-stats"></div><div class="panel mt-4"><div class="panel__head"><span class="panel__title">Measured calls</span><span class="panel__meta">estimated tokens are labelled</span></div><div id="usage-list"></div></div></div>
+        <div id="models-providers" hidden><div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Configured providers</span></div><div class="panel__body" id="provider-list"></div></div></div>
+      </section>
+
+      <!-- tools -->
+      <section class="view" id="view-tools" hidden>
+        <div class="view__head"><div><p class="eyebrow">TOOL ENGINE</p><p class="lede">Every invocation passes schema validation, permission checks and audit logging.</p></div></div>
+        <div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Registry</span><span class="panel__meta" id="tool-count">—</span></div><div class="panel__body"><div class="form-row"><div class="field"><label class="label" for="tool-search">Filter tools</label><input class="input" id="tool-search" type="search" placeholder="Name or category" /></div></div><div id="tool-list" class="mt-4"></div></div></div>
+      </section>
+
+      <!-- approvals -->
+      <section class="view" id="view-approvals" hidden>
+        <div class="view__head"><div><p class="eyebrow">HUMAN CONTROL</p><p class="lede">High-risk actions wait here. Approval is bound to actor, action, resource, risk and expiry.</p></div></div>
+        <div class="grid"><div class="span-6"><div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Pending requests</span><span class="panel__meta" id="approval-count">—</span></div><div class="panel__body" id="approval-list"></div></div></div>
+        <div class="span-6"><div class="panel"><div class="panel__head"><span class="panel__title">Recent decisions</span></div><div id="approval-audit"></div></div></div></div>
+      </section>
+
+      <!-- integrations -->
+      <section class="view" id="view-integrations" hidden>
+        <div class="view__head"><div><p class="eyebrow">CONNECTED SURFACES</p><p class="lede">Connect a channel in a few guided steps. LEO saves credentials in this local process and never shows their values again.</p></div></div>
+        <!-- #ob-root (the guided setup cards) is inserted here at runtime by
+             onboarding.js; the registry panel stays available if it cannot load. -->
+        <div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Adapters and nodes</span><span class="panel__meta" id="integration-count">—</span></div><div class="panel__body" id="integration-list"></div></div>
+        <div class="panel mt-4"><div class="panel__head"><span class="panel__title">Send via channel</span><span class="badge" id="send-availability">checking</span></div><div class="panel__body"><form class="field" id="send-form"><label class="label" for="send-channel">Configured channel</label><select class="select" id="send-channel" disabled><option value="">No configured channels</option></select><label class="label" for="send-target">Target <span class="ob-label-hint" id="send-target-hint">Choose a channel first</span></label><input class="input" id="send-target" placeholder="Channel, user or conversation id" required /><label class="label" for="send-text">Message</label><textarea class="textarea" id="send-text" required></textarea><button class="btn btn--primary" id="send-submit" type="submit" disabled>Send message</button><p class="hint" id="send-hint">Delivery status comes from the backend; acceptance is not reported as delivery.</p></form><button class="ob-btn ob-btn--secondary mt-4" id="send-connect" type="button">Connect a channel first</button><pre class="code" id="send-output" hidden></pre></div></div>
+      </section>
+
+      <!-- events -->
+      <section class="view" id="view-events" hidden>
+        <div class="view__head"><div><p class="eyebrow">EXECUTION TRACE</p><p class="lede">A durable audit-friendly stream of decisions, task transitions and agent activity.</p></div></div>
+        <div class="panel panel--flush"><div class="panel__head"><span class="panel__title">Latest activity</span><span class="panel__meta" id="event-count">—</span></div><div class="panel__body" id="event-list"></div></div>
+      </section>
+
+      <!-- settings -->
+      <section class="view" id="view-settings" hidden>
+        <div class="view__head"><div><p class="eyebrow">LOCAL CONFIGURATION</p><p class="lede">Runtime preferences stay in this browser session; credentials never leave the local process.</p></div></div>
+        <div class="grid">
+          <div class="span-6"><div class="panel"><div class="panel__head"><span class="panel__title">API access</span><span class="badge" id="auth-badge">no token</span></div><div class="field"><label class="label" for="api-token">LEO_API_TOKEN</label><input class="input" id="api-token" type="password" autocomplete="off" placeholder="Only required when the server was started with a token" /><p class="hint">Stored in this browser session only, never on disk.</p><button class="btn btn--secondary" id="save-token"><svg class="icon icon--sm"><use href="#i-check"/></svg> Save token</button></div></div></div>
+          <div class="span-6"><div class="panel"><div class="panel__head"><span class="panel__title">Display &amp; polling</span></div><div class="field"><label class="label" for="compact-toggle">Compact density</label><div class="form-row"><input class="switch" id="compact-toggle" type="checkbox" aria-label="Compact density" /><span class="hint">Tighter panels for small screens.</span></div></div><div class="field mt-5"><label class="label" for="poll-range">Refresh interval · <span id="poll-value">15</span>s</label><input class="range" id="poll-range" type="range" min="5" max="60" step="5" value="15" /></div></div></div>
+        </div>
+        <div class="panel mt-4"><div class="panel__head"><span class="panel__title">Runtime snapshot</span><button class="btn btn--ghost btn--sm" id="copy-health"><svg class="icon icon--sm"><use href="#i-copy"/></svg> Copy</button></div><pre class="code" id="settings-snapshot">Loading…</pre></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal__head"><div><h3 class="modal__title" id="modal-title">Run</h3><p class="modal__text" id="modal-text"></p></div><button class="icon-btn" id="modal-close" aria-label="Close dialog"><svg class="icon"><use href="#i-x"/></svg></button></div>
+    <div class="field" id="modal-args-field"><label class="label" id="modal-args-label" for="modal-args">Arguments (JSON)</label><textarea class="textarea" id="modal-args">{}</textarea><div id="modal-fields" style="display:none"></div><p class="error-text" id="modal-error" hidden></p></div>
+    <div class="modal__output" id="modal-output" hidden><span class="label">Backend output</span><pre class="code" id="modal-output-text"></pre></div>
+    <div class="modal__actions"><button class="btn btn--secondary" id="modal-cancel">Cancel</button><button class="btn btn--primary" id="modal-run"><svg class="icon icon--sm"><use href="#i-play"/></svg> <span id="modal-run-label">Run</span></button></div>
+  </div>
+</div>
+<div class="onboarding-backdrop" id="onboarding-backdrop" hidden>
+  <section class="onboarding" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" aria-describedby="onboarding-subtitle">
+    <header class="onboarding__head">
+      <div><p class="ob-eyebrow" id="onboarding-eyebrow">GUIDED SETUP</p><h2 class="ob-heading" id="onboarding-title">Connect a channel</h2><p class="ob-subtext" id="onboarding-subtitle">Answer a few questions. LEO checks your entries before saving anything.</p></div>
+      <button class="ob-icon-btn" id="onboarding-close" type="button" aria-label="Close guided setup"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+    </header>
+    <ol class="ob-steps" id="onboarding-steps" aria-label="Setup progress"></ol>
+    <div class="ob-body" id="onboarding-body"></div>
+    <details class="ob-guide" id="onboarding-guide"><summary><svg class="icon icon--sm" aria-hidden="true"><use href="#i-chevron"/></svg> What do I need?</summary><div class="ob-guide__body" id="onboarding-guide-body"></div></details>
+    <footer class="onboarding__foot">
+      <button class="ob-btn ob-btn--quiet" id="onboarding-back" type="button">Back</button>
+      <span class="ob-status" id="onboarding-status" role="status" aria-live="polite"></span>
+      <button class="ob-btn ob-btn--primary" id="onboarding-next" type="button">Continue</button>
+    </footer>
+  </section>
+</div>
+<div class="toast-stack" id="toasts" aria-live="polite"></div>
+</body>
+</html>

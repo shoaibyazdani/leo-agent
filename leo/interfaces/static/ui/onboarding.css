@@ -1,0 +1,203 @@
+/* LEO guided channel setup — macOS-style web view.
+   All selectors are scoped to .ob-* so the existing dashboard is untouched.
+   Tokens follow the Apple HIG: semantic colours, 8pt grid, 28pt pointer
+   controls, one accent, icon + text status, and Reduce Motion support. */
+
+.ob-root,
+.ob-modal {
+  --ob-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", var(--font-ui, "Segoe UI"), sans-serif;
+  --ob-mono: ui-monospace, SFMono-Regular, "SF Mono", var(--font-mono, Menlo), monospace;
+  --ob-bg: var(--surface-1, #1c1c1e);
+  --ob-surface: var(--surface-2, #2c2c2e);
+  --ob-sunken: var(--bg-sunken, #11171d);
+  --ob-text: var(--text-primary, #f5f5f7);
+  --ob-secondary: var(--text-secondary, #d1d1d6);
+  --ob-muted: var(--text-muted, #98989d);
+  --ob-border: var(--border-subtle, #38383a);
+  --ob-border-strong: var(--border-strong, #545458);
+  --ob-accent: var(--accent, #0a84ff);
+  --ob-accent-soft: var(--accent-soft, rgba(10, 132, 255, .14));
+  --ob-on-accent: var(--on-accent, #ffffff);
+  --ob-success: var(--success, #30d158);
+  --ob-warn: var(--warn, #ffd60a);
+  --ob-danger: var(--danger, #ff453a);
+  --ob-info: var(--info, #64d2ff);
+  --ob-radius: 12px;
+  --ob-focus: 0 0 0 2px var(--ob-bg), 0 0 0 4px var(--ob-accent);
+  color: var(--ob-text);
+  font-family: var(--ob-font);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Same semantic roles in light appearance. The surrounding dashboard keeps
+   its own theme; the self-contained setup card stays legible either way. */
+@media (prefers-color-scheme: light) {
+  .ob-root,
+  .ob-modal {
+    --ob-bg: #ffffff;
+    --ob-surface: #f5f5f7;
+    --ob-sunken: #f5f5f7;
+    --ob-text: #1d1d1f;
+    --ob-secondary: #3a3a3c;
+    --ob-muted: #6e6e73;
+    --ob-border: #d2d2d7;
+    --ob-border-strong: #a1a1a6;
+    --ob-accent: #00695e;
+    --ob-accent-soft: rgba(0, 105, 94, .10);
+    --ob-on-accent: #ffffff;
+    --ob-success: #1a7f37;
+    --ob-warn: #8a5a00;
+    --ob-danger: #b3261e;
+    --ob-info: #00529b;
+  }
+}
+
+/* ---- channel cards ------------------------------------------------------ */
+.ob-root { display: flex; flex-direction: column; gap: var(--space-5, 24px); margin-bottom: var(--space-5, 24px); }
+.ob-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--space-4, 16px); flex-wrap: wrap; }
+.ob-heading h2 { font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+.ob-heading p { color: var(--ob-muted); font-size: 12px; max-width: 68ch; }
+.ob-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4, 16px); }
+.ob-card { display: flex; flex-direction: column; gap: var(--space-3, 12px); min-width: 0; padding: var(--space-4, 16px); border: 1px solid var(--ob-border); border-radius: var(--ob-radius); background: var(--ob-bg); }
+.ob-card--featured { border-color: var(--ob-accent); box-shadow: inset 0 0 0 1px var(--ob-accent-soft); }
+.ob-card__head { display: flex; align-items: center; gap: var(--space-3, 12px); }
+.ob-card__icon { display: grid; place-items: center; flex: none; width: 36px; height: 36px; border-radius: var(--radius-sm, 8px); background: var(--ob-accent-soft); color: var(--ob-accent); }
+.ob-card__title { margin: 0; font-size: 15px; font-weight: 600; }
+.ob-card__subtitle { margin: 0; color: var(--ob-muted); font-size: 12px; }
+.ob-card__status { display: flex; align-items: flex-start; gap: var(--space-2, 8px); font-size: 12px; color: var(--ob-secondary); }
+.ob-card__status .icon { width: 14px; height: 14px; margin-top: 2px; flex: none; }
+.ob-card__status small { display: block; color: var(--ob-muted); }
+.ob-card__foot { display: flex; align-items: center; gap: var(--space-2, 8px); margin-top: auto; flex-wrap: wrap; }
+
+/* Status is always icon + words; colour is the secondary cue. */
+.ob-status--ok .icon, .ob-status--ok > svg { color: var(--ob-success); }
+.ob-status--warn .icon, .ob-status--warn > svg { color: var(--ob-warn); }
+.ob-status--blocked .icon, .ob-status--blocked > svg { color: var(--ob-danger); }
+.ob-status--idle .icon, .ob-status--idle > svg { color: var(--ob-muted); }
+
+.ob-more { border: 1px solid var(--ob-border); border-radius: var(--ob-radius); background: var(--ob-bg); padding: var(--space-3, 12px) var(--space-4, 16px); }
+.ob-more > summary { cursor: pointer; font-size: 12px; color: var(--ob-secondary); min-height: 28px; display: flex; align-items: center; }
+.ob-more > summary:hover { color: var(--ob-accent); }
+.ob-more__list { display: flex; flex-wrap: wrap; gap: var(--space-2, 8px); margin-top: var(--space-3, 12px); }
+
+/* ---- buttons, fields, guidance ----------------------------------------- */
+.ob-btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2, 8px); min-height: 28px; padding: 4px 12px; border: 1px solid var(--ob-border-strong); border-radius: var(--radius-sm, 8px); background: var(--ob-surface); color: var(--ob-text); font: inherit; font-size: 12px; font-weight: 500; text-decoration: none; transition: background var(--dur-fast, 150ms) var(--ease-standard, ease), border-color var(--dur-fast, 150ms) var(--ease-standard, ease); }
+.ob-btn:hover { background: var(--ob-sunken); border-color: var(--ob-muted); }
+.ob-btn:active { transform: translateY(1px); }
+.ob-btn:focus-visible, .ob-input:focus-visible, .ob-method:focus-visible, .ob-more > summary:focus-visible { outline: none; box-shadow: var(--ob-focus); }
+.ob-btn[disabled], .ob-btn[aria-disabled="true"] { opacity: .45; cursor: not-allowed; transform: none; }
+.ob-btn--primary { background: var(--ob-accent); border-color: var(--ob-accent); color: var(--ob-on-accent); font-weight: 600; }
+.ob-btn--primary:hover { background: var(--ob-accent); border-color: var(--ob-accent); filter: brightness(1.08); }
+.ob-btn--quiet { background: transparent; border-color: transparent; color: var(--ob-secondary); }
+.ob-btn--quiet:hover { background: var(--ob-surface); }
+/* Used by the Send panel's "Connect a channel first" call to action. */
+.ob-btn--secondary { background: transparent; border-color: var(--ob-accent); color: var(--ob-accent); }
+.ob-btn--secondary:hover { background: var(--ob-accent-soft); }
+.ob-btn .icon { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+.ob-guide { margin-top: var(--space-2, 8px); border-top: 1px solid var(--ob-border); padding-top: var(--space-2, 8px); }
+.ob-guide > summary { cursor: pointer; list-style: none; min-height: 28px; display: flex; align-items: center; gap: var(--space-2, 8px); color: var(--ob-accent); font-size: 12px; font-weight: 500; }
+.ob-guide > summary::-webkit-details-marker { display: none; }
+.ob-guide > summary .icon { width: 14px; height: 14px; transition: transform var(--dur-fast, 150ms) var(--ease-standard, ease); }
+.ob-guide[open] > summary .icon { transform: rotate(180deg); }
+.ob-guide ol { margin: var(--space-2, 8px) 0 0; padding-left: 20px; color: var(--ob-secondary); font-size: 12px; }
+.ob-guide li + li { margin-top: var(--space-2, 8px); }
+.ob-note { margin: 0; color: var(--ob-muted); font-size: 12px; }
+.ob-note--warn { color: var(--ob-warn); }
+.ob-note--danger { color: var(--ob-danger); }
+.ob-link { color: var(--ob-accent); font-size: 12px; }
+.ob-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.ob-label-hint { margin-left: 6px; font-size: 11px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--ob-muted); }
+
+/* ---- wizard dialog ------------------------------------------------------ */
+.ob-modal-backdrop { position: fixed; inset: 0; z-index: calc(var(--z-modal, 40) + 2); display: grid; place-items: center; padding: var(--space-4, 16px); background: rgba(0, 0, 0, .56); backdrop-filter: saturate(180%) blur(20px); isolation: isolate; }
+/* Opaque surface and its own stacking context: dashboard text behind the
+   dialog must never bleed through a translucent select or its popup. */
+.ob-modal { position: relative; z-index: 1; isolation: isolate; width: min(720px, 100%); max-height: min(840px, calc(100dvh - 32px)); overflow: auto; border: 1px solid var(--ob-border-strong); border-radius: 16px; background-color: var(--ob-bg); background-image: none; box-shadow: 0 24px 64px rgba(0, 0, 0, .32); animation: ob-modal-in 240ms cubic-bezier(.2, .8, .2, 1) both; }
+@keyframes ob-modal-in { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
+.ob-modal__head { position: sticky; z-index: 3; top: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4, 16px); padding: var(--space-5, 24px) var(--space-5, 24px) var(--space-3, 12px); background-color: var(--ob-bg); border-bottom: 1px solid var(--ob-border); }
+.ob-modal__title { font-size: 20px; font-weight: 600; letter-spacing: -.01em; }
+.ob-modal__subtitle { margin: 4px 0 0; color: var(--ob-muted); font-size: 12px; }
+.ob-modal__body { position: relative; z-index: 1; padding: var(--space-5, 24px); display: flex; flex-direction: column; gap: var(--space-4, 16px); }
+.ob-modal__foot { position: sticky; z-index: 3; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3, 12px); padding: var(--space-3, 12px) var(--space-5, 24px); background-color: var(--ob-bg); border-top: 1px solid var(--ob-border); }
+.ob-modal__foot-actions { display: flex; gap: var(--space-2, 8px); }
+/* Inactive wizard steps are removed from layout and interaction entirely. */
+.ob-step[hidden], [hidden] { display: none !important; }
+.ob-step[inert] { pointer-events: none; user-select: none; }
+/* Native pickers render above sibling content, not behind a sticky footer. */
+select.ob-input, .ob-select { position: relative; z-index: 2; background-color: var(--ob-sunken); }
+.ob-select option { background-color: var(--ob-bg); color: var(--ob-text); }
+
+.ob-progress { display: flex; gap: var(--space-2, 8px); margin: 0; padding: 0; list-style: none; }
+.ob-progress li { display: flex; align-items: center; gap: 6px; flex: 1; color: var(--ob-muted); font-size: 11px; white-space: nowrap; }
+.ob-progress li::before { content: attr(data-step); display: grid; place-items: center; flex: none; width: 22px; height: 22px; border: 1px solid var(--ob-border-strong); border-radius: 50%; font-family: var(--ob-mono); font-size: 10px; }
+.ob-progress li.is-current { color: var(--ob-text); font-weight: 600; }
+.ob-progress li.is-current::before { background: var(--ob-accent); border-color: var(--ob-accent); color: var(--ob-on-accent); }
+.ob-progress li.is-done::before { border-color: var(--ob-accent); color: var(--ob-accent); }
+
+.ob-section { display: flex; flex-direction: column; gap: var(--space-3, 12px); }
+.ob-section__title { font-size: 14px; font-weight: 600; }
+.ob-section__text { color: var(--ob-secondary); font-size: 13px; margin: 0; }
+.ob-list { margin: 0; padding-left: 20px; color: var(--ob-secondary); font-size: 12px; }
+.ob-list li + li { margin-top: var(--space-2, 8px); }
+.ob-callout { display: flex; gap: var(--space-3, 12px); align-items: flex-start; padding: var(--space-3, 12px); border: 1px solid var(--ob-border); border-radius: var(--ob-radius); background: var(--ob-surface); font-size: 12px; color: var(--ob-secondary); }
+.ob-callout .icon { width: 16px; height: 16px; flex: none; margin-top: 2px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.ob-callout--accent { border-color: var(--ob-accent); }
+.ob-callout--accent .icon { color: var(--ob-accent); }
+.ob-callout--warn .icon { color: var(--ob-warn); }
+
+/* Connection-method choice: a segmented pair of explanatory cards. */
+.ob-methods { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3, 12px); }
+.ob-method { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2, 8px); min-height: 96px; padding: var(--space-4, 16px); border: 1px solid var(--ob-border); border-radius: var(--ob-radius); background: var(--ob-surface); color: var(--ob-text); text-align: left; font: inherit; }
+.ob-method:hover { border-color: var(--ob-accent); }
+.ob-method[aria-pressed="true"] { border-color: var(--ob-accent); box-shadow: inset 0 0 0 1px var(--ob-accent); }
+.ob-method[disabled] { cursor: default; }
+.ob-method__title { display: flex; align-items: center; gap: var(--space-2, 8px); font-size: 13px; font-weight: 600; }
+.ob-method__text { color: var(--ob-muted); font-size: 12px; }
+
+/* Local setup QR: white QR surface stays scannable in every appearance. */
+.ob-qr { display: grid; grid-template-columns: 208px minmax(0, 1fr); gap: var(--space-5, 24px); align-items: start; }
+.ob-qr__visual { display: flex; flex-direction: column; align-items: center; gap: var(--space-2, 8px); }
+.ob-qr__image { display: block; width: 192px; height: 192px; padding: 8px; border: 1px solid var(--ob-border-strong); border-radius: var(--ob-radius); background: #ffffff; }
+.ob-qr__placeholder { display: grid; place-items: center; width: 192px; height: 192px; padding: var(--space-4, 16px); border: 1px dashed var(--ob-border-strong); border-radius: var(--ob-radius); color: var(--ob-muted); text-align: center; font-size: 12px; }
+.ob-qr__caption { color: var(--ob-muted); font-size: 11px; text-align: center; }
+.ob-qr__details { display: flex; flex-direction: column; gap: var(--space-3, 12px); min-width: 0; }
+.ob-qr__status { display: flex; align-items: center; gap: var(--space-2, 8px); font-size: 13px; font-weight: 600; }
+.ob-qr__status .icon { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.ob-qr__message { font-size: 12px; color: var(--ob-secondary); margin: 0; }
+.ob-qr__countdown { font-variant-numeric: tabular-nums; font-family: var(--ob-mono); font-size: 12px; color: var(--ob-muted); }
+.ob-qr__actions { display: flex; gap: var(--space-2, 8px); flex-wrap: wrap; }
+.ob-copy { display: flex; gap: var(--space-2, 8px); align-items: center; }
+.ob-input { min-height: 28px; width: 100%; padding: 4px 8px; border: 1px solid var(--ob-border-strong); border-radius: var(--radius-sm, 8px); background: var(--ob-sunken); color: var(--ob-text); font: inherit; font-size: 12px; }
+.ob-input::placeholder { color: var(--ob-muted); }
+.ob-input[aria-invalid="true"] { border-color: var(--ob-danger); }
+.ob-input--mono { font-family: var(--ob-mono); }
+.ob-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ob-field__label { font-size: 12px; font-weight: 600; }
+.ob-field__label span { color: var(--ob-muted); font-weight: 400; }
+.ob-field__hint { color: var(--ob-muted); font-size: 11px; }
+.ob-field__error { display: flex; gap: 6px; color: var(--ob-danger); font-size: 11px; }
+.ob-field__error[hidden] { display: none; }
+.ob-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4, 16px); }
+.ob-form > .ob-field--wide { grid-column: 1 / -1; }
+.ob-textarea { min-height: 72px; resize: vertical; }
+.ob-saved { color: var(--ob-success); font-size: 11px; }
+
+.ob-checklist { display: flex; flex-direction: column; gap: var(--space-2, 8px); margin: 0; padding: 0; list-style: none; }
+.ob-checklist li { display: flex; align-items: flex-start; gap: var(--space-2, 8px); font-size: 12px; color: var(--ob-secondary); }
+.ob-checklist .icon { width: 14px; height: 14px; flex: none; margin-top: 2px; }
+.ob-check-result[hidden] { display: none; }
+.ob-result { border-top: 1px solid var(--ob-border); padding-top: var(--space-3, 12px); font-size: 12px; }
+
+@media (max-width: 720px) {
+  .ob-cards, .ob-methods, .ob-form { grid-template-columns: minmax(0, 1fr); }
+  .ob-qr { grid-template-columns: minmax(0, 1fr); }
+  .ob-modal__head, .ob-modal__body, .ob-modal__foot { padding-inline: var(--space-4, 16px); }
+}
+@media (pointer: coarse) {
+  .ob-btn, .ob-method, .ob-input, .ob-guide > summary, .ob-more > summary { min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ob-root *, .ob-modal *, .ob-modal { animation: none !important; transition: none !important; transform: none !important; }
+}

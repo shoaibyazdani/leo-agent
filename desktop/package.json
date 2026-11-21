@@ -1,0 +1,14 @@
+{
+  "name": "leo-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LEO desktop shell \u2014 a localhost-only Electron wrapper around the LEO API",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "45.3.4"
+  },
+  "license": "MIT"
+}

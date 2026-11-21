@@ -1,0 +1,513 @@
+/* LEO shared motion layer — Apple HIG: purposeful,interruptible,reduce-motion aware.
+ *
+ * Load this file after theme.css (see the integration note in the report).
+ * It is self-contained: every duration, easing, distance and colour resolves
+ * through a custom property with a local fallback, so it works on both the
+ * dashboard and Agent Activity before their own token blocks are updated.
+ *
+ * Adoption is incremental:
+ *   - add data-motion="enter" when a card/row/banner/heading is created,
+ *   - add data-motion="leave" and wait for animationend before removing it,
+ *   - drawers use data-motion="open" / "close" (transitions, not keyframes),
+ *   - tool disclosures use <details> or .motion-disclosure[data-expanded],
+ *   - status changes add .is-status-changing to the badge host.
+ *
+ * Nothing here loops, animates font metrics, or animates layout geometry.
+ */
+
+:root {
+  /* One motion accent. Semantic status colours remain static meaning. */
+  --motion-accent: var(--accent, #58d6c1);
+  --motion-accent-soft: var(--accent-soft, rgba(88, 214, 193, .14));
+
+  /* UI feedback: 200-300 ms. Reduced motion uses the separate 120 ms token. */
+  --dur-micro: 200ms;
+  --dur-base: 240ms;
+  --dur-panel: 280ms;
+  --dur-reduced: 120ms;
+
+  /* Spring-like curves only: a small overshoot on entry, a clean settle out. */
+  --ease-spring: cubic-bezier(.2, 1.12, .32, 1);
+  --ease-spring-out: cubic-bezier(.32, 0, .24, 1);
+  --ease-crossfade: cubic-bezier(.37, 0, .63, 1);
+  --ease-press: cubic-bezier(.2, .9, .3, 1);
+
+  /* Back-compatible aliases: existing theme.css call sites keep working. */
+  --dur-fast: var(--dur-micro);
+  --dur-slow: var(--dur-panel);
+  --ease-standard: var(--ease-spring-out);
+  --ease-enter: var(--ease-spring);
+  --ease-exit: var(--ease-spring-out);
+
+  /* Transform-only travel limits; panel travel is element-relative. */
+  --motion-shift-xs: 2px;
+  --motion-shift-sm: 6px;
+  --motion-shift-md: 12px;
+  --motion-shift-panel: 100%;
+  --motion-scale-pop: .985;
+  --motion-scale-dot-low: .72;
+  --motion-scale-dot: 1.14;
+  /* Progress is a percentage width owned by components.css (--value).
+     Keeping this fallback a percentage prevents an invalid scaleX(0) overlay. */
+  --motion-progress: 0%;
+  --motion-stagger: 24ms;
+  --motion-index: 0;
+  --motion-dot-size: 7px;
+  --motion-no-delay: 0ms;
+  --motion-one-iteration: 1;
+  --motion-focus-width: 2px;
+  --motion-focus-offset: 2px;
+  --motion-hc-border-width: 2px;
+}
+
+/* ---- one-shot keyframes ------------------------------------------------ */
+
+@keyframes motion-card-in {
+  from { opacity: 0; transform: translate3d(0, var(--motion-shift-sm), 0) scale(var(--motion-scale-pop)); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes motion-card-out {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: translate3d(0, var(--motion-shift-xs), 0) scale(var(--motion-scale-pop)); }
+}
+@keyframes motion-drawer-in {
+  from { opacity: 0; transform: translate3d(var(--motion-shift-panel), 0, 0); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes motion-drawer-out {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: translate3d(var(--motion-shift-panel), 0, 0); }
+}
+@keyframes motion-toast-in {
+  from { opacity: 0; transform: translate3d(0, var(--motion-shift-md), 0) scale(var(--motion-scale-pop)); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes motion-toast-out {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: translate3d(0, var(--motion-shift-xs), 0) scale(var(--motion-scale-pop)); }
+}
+@keyframes motion-banner-in {
+  from { opacity: 0; transform: translate3d(0, var(--motion-shift-xs), 0); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes motion-banner-out {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: translate3d(0, var(--motion-shift-xs), 0); }
+}
+/* Views and modals contain long prose: opacity only, no travel or scale. */
+@keyframes motion-view-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes motion-view-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+@keyframes motion-disclosure-in {
+  from { opacity: 0; transform: translate3d(0, var(--motion-shift-xs), 0); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes motion-disclosure-out {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: translate3d(0, var(--motion-shift-xs), 0); }
+}
+/* Finite status feedback on a 7px dot only; the text label carries meaning. */
+@keyframes motion-dot-once {
+  0%   { opacity: .45; transform: scale(var(--motion-scale-dot-low)); }
+  60%  { opacity: 1; transform: scale(var(--motion-scale-dot)); }
+  100% { opacity: 1; transform: scale(1); }
+}
+/* The status flash is painted on a pseudo-element and ends at opacity 0, so a
+   retrigger never leaves a permanent overlay over the real state colour. */
+@keyframes motion-dot-flash {
+  0%   { opacity: 0; transform: scale(var(--motion-scale-dot-low)); }
+  50%  { opacity: .9; transform: scale(var(--motion-scale-dot)); }
+  100% { opacity: 0; transform: scale(1); }
+}
+
+/* ---- generic opt-in hooks ---------------------------------------------
+ * Callers that remove a node on animationend MUST also arm a setTimeout
+ * fallback: a node that is hidden, removed or never rendered emits no event,
+ * and reduced motion must still finish the one-shot animation (see below).
+ */
+
+[data-motion="enter"] {
+  animation: motion-card-in var(--dur-base) var(--ease-spring) both;
+  animation-delay: calc(var(--motion-index) * var(--motion-stagger));
+}
+[data-motion="leave"] {
+  animation: motion-card-out var(--dur-base) var(--ease-spring-out) both;
+}
+[data-motion="enter"][hidden],
+[data-motion="leave"][hidden] { display: none; }
+
+/* ---- views, modals, menus --------------------------------------------- */
+
+.view,
+[data-motion="view"] {
+  animation: motion-view-in var(--dur-panel) var(--ease-spring-out) both;
+}
+.view[data-motion="leave"],
+.modal[data-motion="leave"] {
+  animation: motion-view-out var(--dur-micro) var(--ease-spring-out) both;
+}
+/* app.js focuses the first modal control synchronously after clearing
+   [hidden]. Fading the modal itself from opacity 0 would hide that focus ring
+   for the whole animation, so only the backdrop fades; the modal is instant. */
+.modal,
+[data-motion="modal"] {
+  animation: none;
+}
+.modal-backdrop:not([hidden]) {
+  animation: motion-view-in var(--dur-micro) var(--ease-crossfade) both;
+}
+.menu,
+[data-motion="menu"] {
+  animation: motion-toast-in var(--dur-micro) var(--ease-spring) both;
+}
+.menu[data-motion="leave"] {
+  animation: motion-toast-out var(--dur-micro) var(--ease-spring-out) both;
+}
+
+/* ---- cards, rows, banners, toasts ------------------------------------- */
+
+.card, .row, .agent-card, .sess-row, [data-motion="card"] {
+  animation: motion-card-in var(--dur-base) var(--ease-spring) both;
+  animation-delay: calc(var(--motion-index) * var(--motion-stagger));
+}
+.card[data-motion="leave"], .row[data-motion="leave"],
+.agent-card[data-motion="leave"], .sess-row[data-motion="leave"] {
+  animation: motion-card-out var(--dur-base) var(--ease-spring-out) both;
+}
+.chat-banner, .notice, [data-motion="banner"] {
+  animation: motion-banner-in var(--dur-base) var(--ease-spring) both;
+  animation-delay: calc(var(--motion-index) * var(--motion-stagger));
+}
+.chat-banner[data-motion="leave"], .notice[data-motion="leave"] {
+  animation: motion-banner-out var(--dur-base) var(--ease-spring-out) both;
+}
+.toast {
+  animation: motion-toast-in var(--dur-base) var(--ease-spring) both;
+}
+.toast[data-motion="leave"], .toast.is-leaving {
+  animation: motion-toast-out var(--dur-base) var(--ease-spring-out) both;
+}
+
+/* ---- drawers and sheets: transitions stay interruptible ---------------
+ * The shipped panels toggle the [hidden] attribute (agents-live.js) or a
+ * class (chat.js). Every drawer rule below is [hidden]-aware: a hidden drawer
+ * keeps the closed frame, a displayed drawer gets the open frame.
+ */
+
+.drawer, [data-motion="drawer"] {
+  opacity: 0;
+  visibility: hidden;
+  transform: translate3d(var(--motion-shift-panel), 0, 0);
+  transition:
+    transform var(--dur-panel) var(--ease-spring),
+    opacity var(--dur-panel) var(--ease-spring-out),
+    visibility 0s var(--ease-crossfade) var(--dur-panel),
+    display var(--dur-panel) allow-discrete;
+}
+.drawer[hidden],
+[data-motion="drawer"][hidden] {
+  opacity: 0;
+  visibility: hidden;
+  transform: translate3d(var(--motion-shift-panel), 0, 0);
+}
+.drawer:not([hidden]),
+[data-motion="drawer"]:not([hidden]),
+.drawer[data-motion="open"],
+[data-motion="drawer"][data-motion="open"] {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  transition-delay: var(--motion-no-delay) var(--motion-no-delay) var(--motion-no-delay);
+}
+.drawer[data-motion="close"],
+[data-motion="drawer"][data-motion="close"] {
+  opacity: 0;
+  visibility: hidden;
+  transform: translate3d(var(--motion-shift-panel), 0, 0);
+}
+/* display:none gives the browser no previous frame to interpolate from.
+   @starting-style supplies the closed frame, and allow-discrete keeps display
+   switched on until the fade ends (where a UA [hidden] !important rule does
+   not force the switch). This is what makes the shipped hidden toggle animate
+   instead of snapping. */
+@starting-style {
+  .drawer:not([hidden]),
+  [data-motion="drawer"]:not([hidden]) {
+    opacity: 0;
+    visibility: hidden;
+    transform: translate3d(var(--motion-shift-panel), 0, 0);
+  }
+}
+/* Drawers reverse via transitions; the generic entry keyframes must not run. */
+.drawer[data-motion="enter"], .drawer[data-motion="leave"] { animation: none; }
+/* Keyframe variants are available when a one-shot slide is the right tool. */
+.drawer[data-motion="slide-in"] {
+  animation: motion-drawer-in var(--dur-panel) var(--ease-spring) both;
+}
+.drawer[data-motion="slide-out"] {
+  animation: motion-drawer-out var(--dur-panel) var(--ease-spring-out) both;
+}
+
+/* ---- tool disclosure and expandable details ---------------------------
+ * Only real <details>/<summary> pairs get disclosure styling: a div with a
+ * <summary> child has no native open state and no keyboard semantics.
+ * Collapsed content is hidden with visibility (or [hidden]/[inert]), never
+ * just opacity 0 — otherwise its links/buttons stay in the tab order and the
+ * accessibility tree. JS-driven .motion-disclosure wrappers must set
+ * aria-expanded="false" plus [inert] or [hidden] on their content.
+ */
+
+.chat-tool details,
+details.disclosure,
+details[data-motion="disclosure"] {
+  --motion-disclosure-rows: 1fr;
+}
+.chat-tool details > summary,
+details.disclosure > summary,
+details[data-motion="disclosure"] > summary {
+  cursor: pointer;
+  list-style: none;
+}
+.chat-tool details > summary::-webkit-details-marker,
+details.disclosure > summary::-webkit-details-marker,
+details[data-motion="disclosure"] > summary::-webkit-details-marker { display: none; }
+.chat-tool details > summary::after,
+details.disclosure > summary::after,
+details[data-motion="disclosure"] > summary::after {
+  content: "";
+  display: inline-block;
+  vertical-align: middle;
+  width: var(--motion-shift-sm);
+  height: var(--motion-shift-sm);
+  margin-inline-start: var(--motion-shift-xs);
+  border-inline-end: var(--motion-focus-width) solid currentColor;
+  border-block-end: var(--motion-focus-width) solid currentColor;
+  transform: rotate(45deg);
+  transition: transform var(--dur-base) var(--ease-spring);
+}
+.chat-tool details[open] > summary::after,
+details.disclosure[open] > summary::after,
+details[data-motion="disclosure"][open] > summary::after { transform: rotate(225deg); }
+.chat-tool details > :not(summary),
+details.disclosure > :not(summary),
+details[data-motion="disclosure"] > :not(summary) {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+  transition:
+    opacity var(--dur-base) var(--ease-spring-out),
+    transform var(--dur-base) var(--ease-spring);
+}
+.chat-tool details:not([open]) > :not(summary),
+details.disclosure:not([open]) > :not(summary),
+details[data-motion="disclosure"]:not([open]) > :not(summary),
+.motion-disclosure[data-expanded="false"] > :not(summary):not([data-motion-toggle]),
+.motion-disclosure[aria-expanded="false"] > :not(summary):not([data-motion-toggle]),
+.motion-disclosure > [inert] {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate3d(0, var(--motion-shift-xs), 0);
+}
+.chat-tool details[open] > :not(summary),
+details.disclosure[open] > :not(summary),
+details[data-motion="disclosure"][open] > :not(summary),
+.motion-disclosure[data-expanded="true"] > :not(summary):not([data-motion-toggle]),
+.motion-disclosure[aria-expanded="true"] > :not(summary):not([data-motion-toggle]) {
+  visibility: visible;
+  pointer-events: auto;
+  animation: motion-disclosure-in var(--dur-base) var(--ease-spring) both;
+}
+/* Grid wrapper alternative for JS-driven disclosure (grid-rows is the only
+   layout property we interpolate; it is a transition, so it can reverse). */
+.motion-disclosure {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows var(--dur-panel) var(--ease-spring-out);
+}
+.motion-disclosure[data-expanded="false"] { grid-template-rows: 0fr; }
+.motion-disclosure[aria-expanded="false"] { grid-template-rows: 0fr; }
+.motion-disclosure > * { min-height: 0; overflow: hidden; }
+.motion-disclosure[data-motion="enter"] {
+  animation: motion-disclosure-in var(--dur-base) var(--ease-spring) both;
+}
+.motion-disclosure[data-motion="leave"] {
+  animation: motion-disclosure-out var(--dur-base) var(--ease-spring-out) both;
+}
+
+/* ---- status, progress, micro feedback --------------------------------- */
+
+/* Semantic colour is state, not decoration: a 200 ms colour tween delays the
+   danger/success meaning. State colours switch immediately; the one-shot flash
+   is painted on a separate layer so it can be retriggered without delaying or
+   masking the current state. Callers retrigger by clearing then re-adding
+   .is-status-changing / data-changing="true" on a new change. */
+.status, .badge, .chat-turn-state, .connection {
+  transition: none;
+}
+.status__dot, [data-motion="status-dot"] {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: var(--motion-dot-size);
+  height: var(--motion-dot-size);
+  border-radius: 50%;
+  background: currentColor;
+  transition: none;
+}
+.status__dot::after, [data-motion="status-dot"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: currentColor;
+  opacity: 0;
+  pointer-events: none;
+}
+.is-status-changing .status__dot::after,
+[data-motion="status-dot"][data-changing="true"]::after {
+  animation: motion-dot-flash var(--dur-base) var(--ease-spring)
+             var(--motion-one-iteration) both;
+}
+/* components.css owns progress width via --value. A scaleX(0) overlay made
+   every bar look empty, so state is width only and width is never animated. */
+.progress__fill {
+  width: var(--value, var(--motion-progress));
+  transform: none;
+  transition: background-color var(--dur-micro) var(--ease-spring-out);
+}
+.btn, .icon-btn, .nav__item, .tab, .control, .role-filter, .examples .badge {
+  transition:
+    color var(--dur-micro) var(--ease-spring-out),
+    background-color var(--dur-micro) var(--ease-spring-out),
+    border-color var(--dur-micro) var(--ease-spring-out),
+    transform var(--dur-micro) var(--ease-press);
+}
+.btn:active, .icon-btn:active, .nav__item:active, .examples .badge:active {
+  transform: translate3d(0, var(--motion-shift-xs), 0);
+}
+.switch, .switch::before {
+  transition:
+    transform var(--dur-base) var(--ease-spring),
+    background-color var(--dur-micro) var(--ease-spring-out);
+}
+
+/* Focus is never animated and never carried by a glow. This selector must
+   OUTSPECIFY theme.css `:focus-visible { outline: none; box-shadow: ... }`:
+   :where() had zero specificity and let that rule erase the outline, leaving
+   no indicator at all in forced-colors mode where box-shadow is stripped. */
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible,
+textarea:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+  outline: var(--motion-focus-width) solid var(--motion-accent);
+  outline-offset: var(--motion-focus-offset);
+  box-shadow: none;
+  transition: none;
+  animation: none;
+}
+
+/* Numeric counters must not jitter on the 2 s / 15 s polling loops. */
+.stat__value, .badge, .panel__meta, .chat-turn-elapsed, .numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Reduce Motion: short opacity cross-fades, no travel -------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-micro: 0ms;
+    --dur-base: var(--dur-reduced);
+    --dur-panel: var(--dur-reduced);
+    --ease-spring: var(--ease-crossfade);
+    --ease-spring-out: var(--ease-crossfade);
+    --ease-press: var(--ease-crossfade);
+    --motion-shift-xs: 0px;
+    --motion-shift-sm: 0px;
+    --motion-shift-md: 0px;
+    --motion-shift-panel: 0px;
+    --motion-scale-pop: 1;
+    --motion-scale-dot-low: 1;
+    --motion-scale-dot: 1;
+    --motion-stagger: 0ms;
+  }
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: var(--dur-reduced) !important;
+    animation-iteration-count: var(--motion-one-iteration) !important;
+    transition-property: opacity, color, background-color, border-color, outline-color !important;
+    transition-duration: var(--dur-reduced) !important;
+  }
+  /* Panels snap to their final position; only opacity changes. The mobile
+     conversation drawer hides itself with a transform in chat.css — a blanket
+     `.chat-sessions { transform: none }` here would permanently expose the
+     CLOSED drawer, so only the explicit open state is allowed here. */
+  .drawer, [data-motion="drawer"],
+  .drawer[data-motion="open"], [data-motion="drawer"][data-motion="open"],
+  .drawer[data-motion="close"], [data-motion="drawer"][data-motion="close"],
+  .motion-disclosure, .motion-disclosure[data-expanded="false"] {
+    transform: none !important;
+    transition: opacity var(--dur-reduced) var(--ease-crossfade) !important;
+  }
+  .chat-shell.chat-history-open .chat-sessions { transform: none !important; }
+  /* Leave hooks must still fire animationend under reduced motion or removal
+     code waits forever. The one-shot animation above is truncated to a single
+     120 ms pass instead of being switched off; callers must ALSO keep a
+     setTimeout fallback for hidden/removed nodes that emit no event. */
+  [data-motion="enter"], [data-motion="leave"],
+  .card, .row, .agent-card, .sess-row, .toast, .chat-banner, .notice,
+  .view, .modal, .menu {
+    animation-delay: var(--motion-no-delay) !important;
+    animation-duration: var(--dur-reduced) !important;
+    animation-iteration-count: var(--motion-one-iteration) !important;
+  }
+  /* Pure decoration is switched off; semantic state colour is already
+     immediate and never waits for the flash to finish. */
+  .chat-tool details > :not(summary),
+  .status__dot, [data-motion="status-dot"],
+  .status__dot::after, [data-motion="status-dot"]::after {
+    animation: none !important;
+  }
+}
+
+/* ---- Increase Contrast / forced colors: safe borders, solid states ---- */
+
+@media (prefers-contrast: more) {
+  :root {
+    --motion-focus-width: 3px;
+    --motion-hc-border-width: 2px;
+  }
+  .toast, .menu, .modal, .card, .row, .chat-banner, .notice,
+  .drawer, .badge, .status, .chat-tool {
+    border-style: solid;
+    border-width: var(--motion-hc-border-width);
+    border-color: currentColor;
+  }
+  /* Meaning-bearing states never depend on a translucent frame. */
+  .badge, .status, .chat-turn-state, .connection, .status__dot { opacity: 1 !important; }
+  .status__dot, .status__dot::after { animation: none !important; }
+  .modal-backdrop { backdrop-filter: none; }
+}
+
+@media (forced-colors: active) {
+  .toast, .menu, .modal, .card, .row, .chat-banner, .notice,
+  .drawer, .badge, .status, .chat-tool {
+    border: var(--motion-hc-border-width) solid CanvasText;
+  }
+  /* theme.css sets `outline: none` and components.css/chat.css rely on a
+     box-shadow ring, which forced-colors strips. Restore a real outline with
+     !important so focus stays visible on every control. */
+  a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible,
+  textarea:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+    outline: var(--motion-focus-width) solid Highlight !important;
+    outline-offset: var(--motion-focus-offset) !important;
+    outline-color: Highlight !important;
+    box-shadow: none !important;
+  }
+  .status__dot, [data-motion="status-dot"] { background: CanvasText; }
+  .status__dot, .status__dot::after { animation: none !important; }
+}
