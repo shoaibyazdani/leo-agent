@@ -71,12 +71,14 @@ the gateway expects. This checkout's `leo.yaml` pins `opencode-go` to
 `deepseek-v4.1-flash` and also lists the other 30 models returned by
 `GET /inference/go/anthropic/v1/models`, each as its own provider named by the
 exact model id. Change `models.default` to any of those keys — or pick one in
-the dashboard's Model & providers dialog — to switch models; `escalation_limit: 0`
-keeps a failed turn from silently moving to another model. A provider name is a
-local routing key only — never put a model alias in the provider slot or a
-different vendor's model ID in `model`, or traffic goes to the wrong backend.
-`mock` provider is always available for offline use and tests. Never put a
-secret value in config, prompts, logs or tool output.
+the dashboard's Model & providers dialog — to switch models. Per-model context
+windows (256k–1.05M), vision flags and pricing come from models.dev's
+`opencode-go` metadata; `escalation_limit: 0` keeps a failed turn from silently
+moving to another model. A provider name is a local routing key only — never put
+a model alias in the provider slot or a different vendor's model ID in `model`,
+or traffic goes to the wrong backend. `mock` provider is always available for
+offline use and tests. Never put a secret value in config, prompts, logs or
+tool output.
 
 ## Architecture and status
 
