@@ -321,8 +321,25 @@ class MessagingAdapter:
     def verify_webhook(self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None) -> bool:
         raise NotImplementedError
 
+    async def typing(self, target: str) -> None:
+        """Best-effort 'is typing' indicator. Channels without one do nothing."""
+        return None
+
     async def send(self, target: str, text: str) -> dict[str, Any]:
         raise NotImplementedError
+
+    async def typing(self, target: str) -> None:
+        """sendChatAction(typing). Cosmetic: failures are swallowed by the caller."""
+        token = credential("TELEGRAM_BOT_TOKEN")
+        if not token:
+            return None
+        url = f"{self.API_BASE}/bot{token}/sendChatAction"
+        response = await self._http().post(
+            url, json={"chat_id": str(target), "action": "typing"}, timeout=self.timeout
+        )
+        if response.status_code >= 400:
+            raise MessagingError(f"telegram typing failed: HTTP {response.status_code}")
+        return None
 
     async def handle_webhook(
         self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None
