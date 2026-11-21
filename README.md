@@ -80,6 +80,23 @@ or traffic goes to the wrong backend. `mock` provider is always available for
 offline use and tests. Never put a secret value in config, prompts, logs or
 tool output.
 
+## Agent persona
+
+The repository ships **empty templates only** in `agent/templates/`. LEO loads
+`SOUL.md` (character), `USER.md` (operator profile) and `MEMORY.md` (durable
+facts) from `$LEO_HOME` or `~/.config/leo`, in Hermes order and with the same
+8,000 / 1,375 / 2,200 character caps. Copy the templates into the runtime
+location and edit the local copies:
+
+```sh
+mkdir -p ~/.config/leo
+cp agent/templates/SOUL.md agent/templates/USER.md agent/templates/MEMORY.md ~/.config/leo/
+```
+
+Never commit a personal persona. `AGENTS.md` and `IDENTITY.md` are optional
+reference files and are not injected into the prompt. The loader is read-only;
+durable memory writes stay in the SQLite memory module.
+
 ## Architecture and status
 
 - [LEO_ARCHITECTURE.md](LEO_ARCHITECTURE.md) — module boundaries and state model

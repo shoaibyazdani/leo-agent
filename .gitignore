@@ -29,6 +29,14 @@ leo.yaml.bak
 desktop/dist/
 desktop/.vite/
 
+# Personal agent persona — keep it in ~/.config/leo, never in the repo.
+agent/SOUL.md
+agent/USER.md
+agent/MEMORY.md
+agent/AGENTS.md
+agent/IDENTITY.md
+agent/config/openclaw.json
+
 # Personal notes and QA scratch — never published. The release gates
 # (Gate P/PF) treat `ls-files --cached --others --exclude-standard` as the
 # publish path set, so these must not appear in it.
