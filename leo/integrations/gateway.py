@@ -11,6 +11,7 @@ queried across channels, subject to permission checks.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import hashlib
 import json
 import time
@@ -109,6 +110,15 @@ def _delivery_confirmed(result: Any) -> bool:
         if str(result.get("status", "")).lower() in {"failed", "error", "incomplete", "cancelled"}:
             return False
     return True
+
+
+def _poll_accepts_state(poll: Any) -> bool:
+    """True when a bound adapter poll() takes a state argument."""
+    try:
+        params = inspect.signature(poll).parameters
+    except (TypeError, ValueError):
+        return False
+    return len(params) >= 1
 
 
 class Gateway:
@@ -495,7 +505,13 @@ class Gateway:
         # Durable position + liveness, owned by the gateway rather than the
         # adapter: a transport must not have to know where state is kept.
         state = TransportState(channel)
-        messages = await adapter.poll(state)
+        # Backwards compatible: adapters written before durable state exists
+        # define poll(self) with no parameter. Pass the state only when the
+        # adapter's own poll accepts it, rather than breaking every custom adapter.
+        messages = (
+            await adapter.poll(state) if _poll_accepts_state(adapter.poll)
+            else await adapter.poll()
+        )
         await state.beat(note=f"{len(messages)} inbound")
         # Same route pinning and durable message-id dedupe as the webhook path.
         return await self.receive_batch(messages, route_channel=channel)
