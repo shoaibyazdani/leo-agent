@@ -342,6 +342,9 @@ class LeoApp:
             events=self.events,
             permissions=self.permissions,
             admission=ChannelAdmission.from_settings(self.settings, events=self.events),
+            # Resolved once, here: the tool and CLI layers cannot widen the
+            # attachment whitelist because they never name a root.
+            outbound_media_root=self.settings.resolve(self.settings.paths.outbound_media),
         )
         services.update(
             memory=self.memory, search=self.search, tasks=self.tasks,

@@ -66,6 +66,7 @@ _ENV_KEY_MAP: dict[str, str] = {
     "LEO_PATHS_LOGS": "paths.logs",
     "LEO_PATHS_WORKSPACES": "paths.workspaces",
     "LEO_PATHS_EXPORTS": "paths.exports",
+    "LEO_PATHS_OUTBOUND_MEDIA": "paths.outbound_media",
     "LEO_SECURITY_WORKSPACE_ONLY": "security.workspace_only",
     "LEO_SECURITY_ALLOW_MEDIUM_RISK": "security.allow_medium_risk",
     "LEO_SECURITY_HIGH_RISK_REQUIRES_APPROVAL": "security.high_risk_requires_approval",

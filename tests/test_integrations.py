@@ -207,7 +207,9 @@ async def test_telegram_send_uses_injected_client_and_hides_token(monkeypatch):
         result = await adapter.send("12345", "hi")
     assert result["success"] and result["message_id"] == "99"
     assert str(requests[0].url).startswith("https://api.telegram.org/bot")
-    assert json.loads(requests[0].content) == {"chat_id": "12345", "text": "hi"}
+    assert json.loads(requests[0].content) == {
+        "chat_id": "12345", "text": "hi", "parse_mode": "Markdown"
+    }
 
     def failing(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"ok": False})

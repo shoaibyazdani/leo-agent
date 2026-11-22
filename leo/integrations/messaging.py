@@ -19,6 +19,7 @@ import json
 import time
 from datetime import datetime, timezone
 import logging
+from pathlib import Path
 from typing import Any, Callable, Mapping, Type
 
 import httpx
@@ -37,6 +38,19 @@ MAX_MESSAGE_CHUNKS = 20
 # Legacy Markdown: **bold**, _italic_, `code` and ``` blocks. Agent replies are
 # written in markdown, so plain text showed the user their own markup as noise.
 TELEGRAM_PARSE_MODE = "Markdown"
+
+# Outbound media: only files under this directory may leave the box. A caller
+# supplied absolute path would otherwise let a prompt-injected agent attach
+# ~/.ssh/id_rsa or /etc/shadow to a chat.
+OUTBOUND_MEDIA_DIRNAME = ".leo/media/outbound"
+# Telegram's Bot API caps a bot upload at 50 MB for both sendPhoto and
+# sendDocument. Refuse locally: a 413 from the API wastes the whole upload.
+TELEGRAM_MAX_MEDIA_BYTES = 50 * 1024 * 1024
+# Extensions Telegram renders inline; everything else goes as a document so the
+# file arrives intact instead of being re-encoded as an image.
+_MEDIA_PHOTO_SUFFIXES = frozenset({
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
+})
 
 
 def _is_entity_error(response: Any) -> bool:
@@ -96,6 +110,66 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS,
 
 class MessagingError(RuntimeError):
     """Adapter could not send or process a message."""
+
+
+def outbound_media_root(root: str | Path | None = None) -> Path:
+    """Directory that is allowed to contain outbound attachments.
+
+    In production the root comes from ``settings.paths.outbound_media`` and is
+    resolved once at the composition root, so callers never choose it. The
+    explicit argument exists for tests and for the adapter's own keyword.
+    """
+    base = Path(root) if root is not None else Path.cwd() / OUTBOUND_MEDIA_DIRNAME
+    return Path(base)
+
+
+def resolve_outbound_media(
+    media: str | Path, root: str | Path | None = None
+) -> Path:
+    """Return the real path of an outbound attachment, or raise ``MessagingError``.
+
+    Confinement is checked on the *resolved* parent, not on the raw string: a
+    symlink inside the whitelist that points at ``/root/.ssh/id_rsa`` must not
+    be a way out. The file itself is resolved too, so a symlinked leaf fails the
+    same containment test.
+    """
+    if media is None or str(media).strip() == "":
+        raise MessagingError("outbound media blocked: empty path")
+    allowed = outbound_media_root(root)
+    try:
+        allowed_real = allowed.resolve(strict=False)
+    except OSError as exc:  # unreadable parent chain
+        raise MessagingError(f"outbound media blocked: {type(exc).__name__}") from None
+    candidate = Path(str(media))
+    if not candidate.is_absolute():
+        # A bare name means "the attachment I just wrote", not "relative to
+        # whatever directory the worker happens to run in". Resolve it inside the
+        # whitelist first, and only fall back to the cwd-relative path when that
+        # file exists and is inside the root.
+        inside = allowed / candidate
+        if inside.exists() or not candidate.exists():
+            candidate = inside
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        raise MessagingError("outbound media blocked: file does not exist") from None
+    except OSError as exc:
+        raise MessagingError(f"outbound media blocked: {type(exc).__name__}") from None
+    if resolved != allowed_real and allowed_real not in resolved.parents:
+        # The offending path is deliberately not echoed back: an error string
+        # ends up in logs and in a chat message.
+        raise MessagingError(
+            f"outbound media blocked: path is not under {OUTBOUND_MEDIA_DIRNAME}"
+        )
+    if not resolved.is_file():
+        raise MessagingError("outbound media blocked: not a regular file")
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        raise MessagingError(f"outbound media blocked: {type(exc).__name__}") from None
+    if size <= 0:
+        raise MessagingError("outbound media blocked: file is empty")
+    return resolved
 
 
 class WebhookVerificationError(MessagingError):
@@ -399,6 +473,22 @@ class MessagingAdapter:
     async def send(self, target: str, text: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    async def send_media(
+        self,
+        target: str,
+        media: str | Path,
+        *,
+        caption: str = "",
+        root: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Send one local file as an attachment.
+
+        Default is "unsupported", not "silently send the caption only": a
+        channel without attachment support must make the caller see that the
+        file did not arrive.
+        """
+        raise MessagingError(f"{self.channel} does not support outbound media")
+
     async def typing(self, target: str) -> None:
         """sendChatAction(typing). Cosmetic: failures are swallowed by the caller."""
         token = credential("TELEGRAM_BOT_TOKEN")
@@ -468,6 +558,77 @@ class TelegramAdapter(MessagingAdapter):
     supplied ``X-Hub-Signature-256`` HMAC is also accepted. Both use
     constant-time comparison.
     """
+
+    async def send_media(
+        self,
+        target: str,
+        media: str | Path,
+        *,
+        caption: str = "",
+        root: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Send one whitelisted local file via ``sendPhoto`` or ``sendDocument``.
+
+        The path is confined to the outbound media root (resolved, so a symlink
+        cannot escape) and refused above 50 MB *before* any bytes leave the box.
+        Every failure raises ``MessagingError``: an attachment that did not
+        arrive must never be reported as sent.
+        """
+        token = credential("TELEGRAM_BOT_TOKEN")
+        if not token:
+            raise MessagingError("telegram media blocked: TELEGRAM_BOT_TOKEN is not set")
+        path = resolve_outbound_media(media, root)
+        size = path.stat().st_size
+        if size > TELEGRAM_MAX_MEDIA_BYTES:
+            raise MessagingError(
+                f"telegram media blocked: {size} bytes exceeds the "
+                f"{TELEGRAM_MAX_MEDIA_BYTES} byte limit"
+            )
+        method = "sendPhoto" if path.suffix.lower() in _MEDIA_PHOTO_SUFFIXES else "sendDocument"
+        field_name = "photo" if method == "sendPhoto" else "document"
+        # The token appears in the URL: never echo the URL or httpx's exception text.
+        url = f"{self.API_BASE}/bot{token}/{method}"
+        form: dict[str, Any] = {"chat_id": str(target)}
+        if caption:
+            # 1024 is Telegram's caption limit; a longer one is rejected outright.
+            form["caption"] = str(caption)[:1024]
+            form["parse_mode"] = TELEGRAM_PARSE_MODE
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise MessagingError(f"telegram media failed: {type(exc).__name__}") from None
+        files = {field_name: (path.name, content)}
+        try:
+            response = await self._http().post(url, data=form, files=files, timeout=self.timeout)
+        except httpx.HTTPError as exc:
+            raise MessagingError(f"telegram media failed: {type(exc).__name__}") from None
+        if response.status_code == 400 and "parse_mode" in form and _is_entity_error(response):
+            # Same rule as text: an unclosed `**` in the caption must not lose the file.
+            form.pop("parse_mode", None)
+            try:
+                response = await self._http().post(
+                    url, data=form, files=files, timeout=self.timeout
+                )
+            except httpx.HTTPError as exc:
+                raise MessagingError(f"telegram media failed: {type(exc).__name__}") from None
+        if response.status_code >= 400:
+            raise MessagingError(f"telegram media failed: HTTP {response.status_code}")
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise MessagingError("telegram media failed: invalid response") from exc
+        if not isinstance(body, dict) or not body.get("ok"):
+            raise MessagingError("telegram media failed: API reported failure")
+        result = body.get("result") if isinstance(body.get("result"), dict) else {}
+        return {
+            "channel": self.channel,
+            "target": str(target),
+            "success": True,
+            "message_id": _ref(result.get("message_id")),
+            "media": path.name,
+            "media_method": method,
+            "media_bytes": size,
+        }
 
     channel = "telegram"
     credential_env = ("TELEGRAM_BOT_TOKEN",)

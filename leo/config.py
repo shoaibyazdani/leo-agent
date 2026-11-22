@@ -66,6 +66,10 @@ class PathConfig(BaseModel):
     logs: Path = Path(".leo/logs")
     workspaces: Path = Path(".leo/workspaces")
     exports: Path = Path(".leo/exports")
+    # Whitelist root for outbound attachments. Configured here, resolved by the
+    # composition root and handed to the Gateway once: no per-call argument can
+    # widen it, so a tool call cannot turn the whitelist into "anywhere".
+    outbound_media: Path = Path(".leo/media/outbound")
 
 
 class SecurityConfig(BaseModel):
@@ -357,7 +361,7 @@ class Settings(BaseModel):
         if os.getenv("LEO_ENVIRONMENT"):
             settings.environment = os.environ["LEO_ENVIRONMENT"]
         for group, fields in {
-            "paths": ["data", "logs", "workspaces", "exports"],
+            "paths": ["data", "logs", "workspaces", "exports", "outbound_media"],
             "security": [
                 "workspace_only", "allow_medium_risk", "high_risk_requires_approval",
                 "max_tool_calls_per_task", "max_tool_calls_ceiling",
@@ -383,5 +387,8 @@ class Settings(BaseModel):
         return settings
 
     def ensure_dirs(self) -> None:
-        for p in (self.paths.data, self.paths.logs, self.paths.workspaces, self.paths.exports):
+        for p in (
+            self.paths.data, self.paths.logs, self.paths.workspaces,
+            self.paths.exports, self.paths.outbound_media,
+        ):
             self.resolve(p).mkdir(parents=True, exist_ok=True)
