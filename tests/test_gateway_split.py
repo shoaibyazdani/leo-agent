@@ -9,6 +9,8 @@ completed turn is terminal.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -52,7 +54,8 @@ async def test_an_expired_lease_comes_back_to_the_queue():
     reclaimed = await store.reclaim_expired()
     claimed_again = await store.claim("worker-b", lease_seconds=60)
 
-    assert reclaimed == 1
+    # The ids matter, not the count: the caller stops one typing task per id.
+    assert len(reclaimed) == 1 and reclaimed[0].startswith("adm_")
     assert claimed_again is not None
     assert claimed_again["claimed_by"] == "worker-b"
 
@@ -205,3 +208,82 @@ async def test_worker_answers_a_claimed_turn_once():
     assert brain.asked and brain.asked[0][0] == "ping"
     assert adapter.sent == [("100000001", "pong")]
     assert (await store.admission_by_status("done")) is not None
+
+
+class _TypingAdapter(_FakeAdapter):
+    """Counts typing pulses so a leaked one is observable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pulses = 0
+
+    async def typing(self, target: str) -> dict:
+        self.pulses += 1
+        return {"ok": True}
+
+
+async def test_reclaim_reports_a_stranded_claim_so_its_typing_pulse_can_stop():
+    """The leak that made a finished agent look like it was still working.
+
+    An admission can end in a non-retryable state (`cancelled`) while still
+    holding a claim row. `reclaim_expired` only requeued `claimed` rows, so such
+    a row kept its typing task alive forever: nothing else ever posts
+    /v1/complete or /v1/fail for it. The ids must be reported even though the
+    row is not requeued, because the pulse belongs to this process.
+    """
+    from leo import db as _db
+
+    store = GatewayStore()
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000001", payload=payload()
+    )
+    await store.claim("dead-worker", lease_seconds=1)
+    # A stop path ends the admission but leaves the claim columns behind.
+    await _db.execute(
+        "UPDATE gateway_queue SET status='cancelled', claim_expires_at=? "
+        "WHERE admission_id=?",
+        ("2020-01-01T00:00:00+00:00", admission_id),
+    )
+
+    reclaimed = await store.reclaim_expired()
+
+    assert admission_id in reclaimed, "stranded claim was not reported, so its typing task leaks"
+    # It must not be requeued: cancelled work is terminal.
+    row = await _db.fetchone(
+        "SELECT status FROM gateway_queue WHERE admission_id=?", (admission_id,)
+    )
+    assert row["status"] == "cancelled"
+
+
+async def test_a_settled_claim_is_reported_once_and_lets_go_of_its_claim() -> None:
+    """Clearing the pulse must also settle the row.
+
+    A terminal row that kept `claim_expires_at` matched the next poll again, so the
+    same dead id called `_stop_typing` about once a second for as long as the row
+    lived. Reporting once is the whole point: the task is stopped, then forgotten.
+    """
+    from leo import db as _db
+
+    store = GatewayStore()
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000002", payload=payload()
+    )
+    await store.claim("dead-worker", lease_seconds=1)
+    await _db.execute(
+        "UPDATE gateway_queue SET status='cancelled', claim_expires_at=? "
+        "WHERE admission_id=?",
+        ("2020-01-01T00:00:00+00:00", admission_id),
+    )
+
+    first = await store.reclaim_expired()
+    second = await store.reclaim_expired()
+
+    assert admission_id in first
+    assert admission_id not in second, "a settled claim must not be reported again"
+    row = await _db.fetchone(
+        "SELECT status, claim_expires_at, claimed_by FROM gateway_queue WHERE admission_id=?",
+        (admission_id,),
+    )
+    assert row["status"] == "cancelled", "terminal state must not be rewritten"
+    assert row["claim_expires_at"] is None
+    assert row["claimed_by"] is None
