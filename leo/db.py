@@ -192,6 +192,12 @@ CREATE TABLE IF NOT EXISTS gateway_attach_tickets (
   expires_at TEXT NOT NULL, used_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS gateway_sessions (
+  session_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  last_seen_at TEXT, revoked_at TEXT
+);
+
 -- Durable, actor-scoped tool-call quotas, one row per bucket/window. The
 -- executor increments it inside BEGIN IMMEDIATE so the check and charge are
 -- atomic across processes and survive restarts.
