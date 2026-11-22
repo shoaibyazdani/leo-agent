@@ -471,9 +471,13 @@ class MessagingAdapter:
         return None
 
     async def send(
-        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None
+        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None,
+        silent: bool = False,
     ) -> dict[str, Any]:
         """Send one text message.
+
+        ``silent`` asks the channel not to notify the human — a live progress line
+        is an update, not an interruption.
 
         ``reply_markup`` is an optional keyboard. A channel that cannot render one
         ignores it rather than failing the send: the text still carries the
@@ -668,7 +672,8 @@ class TelegramAdapter(MessagingAdapter):
         return _signature_matches(signature, _hmac_hex(secret, _body_bytes(payload, raw_body)))
 
     async def send(
-        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None
+        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None,
+        silent: bool = False,
     ) -> dict[str, Any]:
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -681,7 +686,7 @@ class TelegramAdapter(MessagingAdapter):
             # The keyboard belongs to the message the human reads last, not to a
             # continuation that may arrive before it.
             keyboard = reply_markup if index + 1 == len(chunks) else None
-            last = await self._send_one(token, target, chunk, reply_markup=keyboard)
+            last = await self._send_one(token, target, chunk, reply_markup=keyboard, silent=silent)
             if index + 1 < len(chunks):
                 _LOG.info("telegram long message split", extra={
                     "chunks": len(chunks), "part": index + 1})
@@ -740,6 +745,7 @@ class TelegramAdapter(MessagingAdapter):
     async def _send_one(
         self, token: str, target: str, text: str,
         reply_markup: dict[str, Any] | None = None,
+        silent: bool = False,
     ) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
@@ -747,6 +753,9 @@ class TelegramAdapter(MessagingAdapter):
                                    "parse_mode": TELEGRAM_PARSE_MODE}
         if reply_markup:
             payload["reply_markup"] = reply_markup
+        if silent:
+            # A live progress line is an update, not an interruption.
+            payload["disable_notification"] = True
         try:
             response = await self._http().post(url, json=payload, timeout=self.timeout)
         except httpx.HTTPError as exc:
