@@ -34,6 +34,19 @@ _LOG = logging.getLogger(__name__)
 # part marker so a split never lands exactly on the limit.
 TELEGRAM_MAX_CHARS = 4000
 MAX_MESSAGE_CHUNKS = 20
+# Legacy Markdown: **bold**, _italic_, `code` and ``` blocks. Agent replies are
+# written in markdown, so plain text showed the user their own markup as noise.
+TELEGRAM_PARSE_MODE = "Markdown"
+
+
+def _is_entity_error(response: Any) -> bool:
+    """True when Telegram rejected the text because its entities do not parse."""
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    description = str((body or {}).get("description") or "").lower()
+    return "parse" in description or "entit" in description
 
 
 def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS,
@@ -55,6 +68,9 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS,
             remaining = ""      # consumed: a leftover here would add a false "truncated"
             break
         window = remaining[:limit]
+        # Never split inside a fenced block: close the open fence at the cut and
+        # reopen it in the next part, or the remainder renders as broken markup.
+        fences = window.count("```")
         cut = window.rfind("\n\n")
         if cut < limit // 2:
             cut = window.rfind("\n")
@@ -62,10 +78,19 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS,
             cut = window.rfind(" ")
         if cut <= 0:
             cut = limit
-        parts.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip("\n")
+        head = remaining[:cut].rstrip()
+        tail = remaining[cut:].lstrip("\n")
+        if fences % 2 == 1 and cut < len(remaining):
+            head = head + "\n```"
+            tail = "```\n" + tail
+        parts.append(head)
+        remaining = tail
     if remaining:
         parts.append(remaining[:limit].rstrip() + "\n\n… (truncated)")
+    # A source that never closed its own fence would leave the final part inside
+    # an open block, and every later marker in the chat renders literally.
+    if parts and parts[-1].count("```") % 2 == 1:
+        parts[-1] = parts[-1].rstrip() + "\n```"
     return parts
 
 
@@ -483,12 +508,21 @@ class TelegramAdapter(MessagingAdapter):
     async def _send_one(self, token: str, target: str, text: str) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
+        payload: dict[str, Any] = {"chat_id": str(target), "text": text,
+                                   "parse_mode": TELEGRAM_PARSE_MODE}
         try:
-            response = await self._http().post(
-                url, json={"chat_id": str(target), "text": text}, timeout=self.timeout
-            )
+            response = await self._http().post(url, json=payload, timeout=self.timeout)
         except httpx.HTTPError as exc:
             raise MessagingError(f"telegram send failed: {type(exc).__name__}") from None
+        if response.status_code == 400 and _is_entity_error(response):
+            # The text is markdown-ish but not valid Telegram entities (an unclosed
+            # `**` or a stray underscore). Plain text keeps the content; a 400 loses
+            # the whole message, and a user would rather read raw markers than nothing.
+            payload.pop("parse_mode", None)
+            try:
+                response = await self._http().post(url, json=payload, timeout=self.timeout)
+            except httpx.HTTPError as exc:
+                raise MessagingError(f"telegram send failed: {type(exc).__name__}") from None
         if response.status_code >= 400:
             raise MessagingError(f"telegram send failed: HTTP {response.status_code}")
         try:
