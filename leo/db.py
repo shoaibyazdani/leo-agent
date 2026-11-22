@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS approvals (
   reason TEXT, requested_by TEXT, metadata TEXT
 );
 
+CREATE TABLE IF NOT EXISTS turn_cancels (
+  conversation_id TEXT PRIMARY KEY, requested_at TEXT NOT NULL, requested_by TEXT
+);
+
 CREATE TABLE IF NOT EXISTS approval_grants (
   id TEXT PRIMARY KEY, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
   action TEXT NOT NULL, resource TEXT, granted_by TEXT, scope TEXT NOT NULL DEFAULT 'session',
