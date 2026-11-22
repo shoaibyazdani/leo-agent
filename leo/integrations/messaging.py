@@ -829,6 +829,20 @@ class TelegramAdapter(MessagingAdapter):
             if not isinstance(message, dict):
                 continue
             sender_data = message.get("from") if isinstance(message.get("from"), dict) else {}
+            # A bot's own traffic is not a human turn. Telegram hands an agent back
+            # its own messages in some topologies, and the approval notifier writes
+            # a notice into the same chat: ingesting either makes the agent answer
+            # itself, which reads to the operator as the agent "mixing things up".
+            if sender_data.get("is_bot"):
+                _LOG.info("inbound from a bot ignored", extra={
+                    "channel": self.channel, "sender_id": _ref(sender_data.get("id"))})
+                continue
+            _body = str(message.get("text") or message.get("caption") or "").lstrip()
+            if _body.startswith("🔐 Approval needed"):
+                # The approval itself is already a durable row with buttons; its
+                # notification text is not something the operator said.
+                _LOG.info("approval notice echoed back ignored", extra={"channel": self.channel})
+                continue
             reply = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
             chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
             # The numeric id is the admission identity and the chat id is the
