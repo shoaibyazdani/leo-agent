@@ -1372,6 +1372,10 @@ class LeoApp:
         return status
 
     CONVERSATION_HISTORY_LIMIT = 50
+    # A message count alone is not a bound: fifty rows of shell output can be tens
+    # of megabytes, and the model then answers from a flooded prompt (or not at
+    # all). The character budget is the real ceiling.
+    CONVERSATION_HISTORY_MAX_CHARS = 120_000
 
     def _compaction_config(self) -> compaction.CompactionConfig:
         """Translate ``settings.compaction`` into the engine's own config type.
@@ -1677,7 +1681,34 @@ class LeoApp:
                 # An assistant/user/system row (or the oldest stored row)
                 # closes the group: no more history needs to be fetched.
                 break
-        return selected
+        return self._budget_history(selected)
+
+    def _budget_history(self, selected: list[Any]) -> list[Any]:
+        """Keep the newest rows that fit the character budget.
+
+        Tool results dominate a long session; counting messages lets one
+        `du -sh /root/*` flood the whole prompt. Trimming from the oldest end keeps
+        the recent exchange intact, and an orphaned tool result is dropped rather
+        than sent without the assistant row that opened it.
+        """
+        budget = max(4_000, int(getattr(self, "CONVERSATION_HISTORY_MAX_CHARS", 120_000)))
+        kept: list[Any] = []
+        total = 0
+        for row in reversed(selected):
+            length = len(str(row["content"] or ""))
+            if kept and total + length > budget:
+                break
+            kept.append(row)
+            total += length
+        kept.reverse()
+        while kept and str(kept[0]["role"] or "") == "tool":
+            kept.pop(0)
+        if len(kept) != len(selected):
+            _LOG.info("conversation history trimmed to budget", extra={
+                "rows_before": len(selected), "rows_after": len(kept),
+                "chars": total, "budget": budget,
+            })
+        return kept
 
     def _rows_to_messages(self, selected: list[Any]) -> list[ChatMessage]:
         history: list[ChatMessage] = []

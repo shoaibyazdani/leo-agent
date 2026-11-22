@@ -468,3 +468,64 @@ async def test_second_compaction_carries_previous_summary_forward(test_env):
     assert second.ok, second.reason
     # The previous summary was offered to the summarizer as carry-forward text.
     assert any("first summary" in str(getattr(req, "messages", "")) for req in provider.requests)
+
+
+class FlakyProvider:
+    """Fails a few times, then answers — a transient empty-output provider."""
+
+    def __init__(self, failures: int, text: str = "recovered summary") -> None:
+        self.failures = failures
+        self.text = text
+        self.calls = 0
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise RuntimeError("ModelEmptyOutputError")
+        return ModelResponse(
+            content=self.text, model="fake-1", provider="fake", usage=Usage(estimated=True)
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_transient_summarizer_failure_is_retried(test_env):
+    conversation_id = "conv-compact-retry"
+    rows = [("user", f"q{i}", None) for i in range(8)]
+    await _seed(conversation_id, rows)
+    engine = CompactionEngine(CompactionConfig(keep_recent_tokens=20, memory_flush=False))
+    messages = [ChatMessage(role=role, content=text) for role, text, _ in rows]
+    provider = FlakyProvider(failures=1)
+
+    result = await engine.compact(
+        conversation_id,
+        messages,
+        provider=provider,
+        budget=10_000,
+        message_ids=list(range(1, len(rows) + 1)),
+    )
+
+    assert provider.calls >= 2, "one provider hiccup must not abandon the summary"
+    assert result.ok
+
+
+@pytest.mark.asyncio
+async def test_empty_summarizer_still_commits_a_boundary(test_env):
+    """A dead summarizer must not leave the session uncompacted forever."""
+    conversation_id = "conv-compact-empty"
+    rows = [("user", f"q{i}", None) for i in range(10)]
+    await _seed(conversation_id, rows)
+    engine = CompactionEngine(
+        CompactionConfig(keep_recent_tokens=20, memory_flush=False, on_timeout="deterministic")
+    )
+    messages = [ChatMessage(role=role, content=text) for role, text, _ in rows]
+
+    result = await engine.compact(
+        conversation_id,
+        messages,
+        provider=FlakyProvider(failures=99),
+        budget=10_000,
+        message_ids=list(range(1, len(rows) + 1)),
+    )
+
+    assert result.ok, result.reason
+    assert await compaction.latest(conversation_id) is not None
