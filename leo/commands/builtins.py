@@ -363,12 +363,13 @@ async def context_command(ctx: CommandContext) -> CommandResult:
         "memory_records": len(await app.memory.list(limit=MAX_LIMIT)),
         "tool_specs": len(tools),
         "conversation_id": conversation,
-        "compaction": "per-turn optimization only; no durable compaction",
+        "compaction": "durable: /compact summarizes older turns once and replays the summary",
     }
     message = (
         f"context budget={budget} tokens; history limit={history_limit}; "
         f"stored turns={len(rows)}; memory records={data['memory_records']}; "
-        f"tools={len(tools)}. LEO optimizes per turn; it does not compact durable history."
+        f"tools={len(tools)}. Older turns are compacted durably with /compact; "
+        f"each turn is also optimized to fit the budget."
     )
     return _summary(ctx, "context", message, data)
 
@@ -688,6 +689,108 @@ async def export_command(ctx: CommandContext) -> CommandResult:
         f"({result['bytes']} bytes, format={result['format']}, redacted=True)"
     )
     return _summary(ctx, "export", message, result)
+
+
+async def compact_command(ctx: CommandContext) -> CommandResult:
+    """Summarize older turns once and persist the boundary.
+
+    The transcript is never rewritten: only what the model is shown changes.
+    ``--preview`` shows the summary without committing; ``--clear`` drops the
+    stored boundary so the full history is replayed again.
+    """
+    conversation_id = ctx.conversation_id
+    if not conversation_id:
+        raise ValueError("/compact needs a conversation_id in the command context")
+
+    preview = False
+    clear = False
+    focus_words: list[str] = []
+    for token in ctx.argv:
+        text = str(token)
+        if text in ("--preview", "-n"):
+            preview = True
+        elif text in ("--clear", "--reset"):
+            clear = True
+        elif text in ("--focus", "-f"):
+            continue
+        elif text.startswith("-"):
+            raise ValueError(
+                f"unknown option {text!r}; usage: /compact [focus text] [--preview|--clear]"
+            )
+        else:
+            focus_words.append(text)
+    focus = " ".join(focus_words).strip()
+
+    if clear:
+        from ..models import compaction as compaction_module
+
+        removed = await compaction_module.clear(conversation_id)
+        await _audit(
+            ctx, "slash.compact.clear", conversation_id,
+            "durable compaction boundary cleared",
+            metadata={"removed": removed},
+        )
+        await _emit(ctx.app, "slash.session.compact_cleared",
+                    conversation_id=conversation_id, removed=removed)
+        message = (
+            f"Cleared {removed} compaction record(s). Full history replays again; "
+            "the transcript was never modified."
+        )
+        return _summary(ctx, "compact", message,
+                        {"conversation_id": conversation_id, "cleared": removed})
+
+    data = await ctx.app.compact_conversation(
+        conversation_id, focus=focus, preview=preview
+    )
+    if not data.get("ok"):
+        reason = str(data.get("reason") or "compaction did not run")
+        await _audit(
+            ctx, "slash.compact", conversation_id, "compaction declined",
+            metadata={"reason": reason, "preview": preview},
+        )
+        return CommandResult(
+            command="compact",
+            status="error",
+            success=False,
+            message=_redact(ctx, f"Compaction did not run: {reason}", MAX_MESSAGE),
+            data=data,
+        )
+
+    summarized = int(data.get("messages_summarized") or 0)
+    before = int(data.get("tokens_before") or 0)
+    after = int(data.get("tokens_after") or 0)
+    degraded = bool(data.get("degraded"))
+    await _audit(
+        ctx, "slash.compact" if not preview else "slash.compact.preview",
+        conversation_id,
+        "older turns summarized" if not preview else "compaction previewed",
+        metadata={
+            "messages_summarized": summarized,
+            "tokens_before": before,
+            "tokens_after": after,
+            "degraded": degraded,
+            "focus": focus[:200] or None,
+        },
+    )
+    if not preview:
+        await _emit(
+            ctx.app, "slash.session.compacted", conversation_id=conversation_id,
+            messages_summarized=summarized, tokens_before=before,
+            tokens_after=after, degraded=degraded,
+        )
+    note = ""
+    if degraded:
+        note = (
+            " Summary quality is degraded: some older details or identifiers may "
+            "be missing. Resend anything essential, or use /new on a larger model."
+        )
+    verb = "Previewed" if preview else "Compacted"
+    message = (
+        f"{verb} {summarized} older message(s); estimated context {before} -> "
+        f"{after} tokens. The transcript itself is unchanged and every original "
+        f"message stays on disk.{note}"
+    )
+    return _summary(ctx, "compact", message, data)
 
 
 async def title_command(ctx: CommandContext) -> CommandResult:
@@ -1378,9 +1481,6 @@ def _spec(
 
 # name, aliases, args_hint, help, reason
 UNAVAILABLE: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
-    ("compact", ("compress",), "[here N|focus topic|--preview]",
-     "Compress conversation context (compatibility alias)",
-     "LEO only optimizes context per turn; there is no durable compaction service or handler."),
     ("resume", (), "[name]", "Switch to a saved session",
      "Session switching is owned by the chat client; the backend cannot change the active UI conversation. Use /sessions list."),
     ("import", (), "<archive>", "Import a shared profile or session archive",
@@ -1639,6 +1739,11 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
         risk=RiskLevel.MEDIUM,
     ))
     registry.register(_spec(
+        "compact", "Summarize older turns durably; /compact <focus> guides the summary",
+        compact_command, aliases=("compress",), args_hint="[focus text] [--preview|--clear]",
+        category="session", risk=RiskLevel.MEDIUM,
+    ))
+    registry.register(_spec(
         "title", "Show or set this conversation's title",
         title_command, aliases=("name",), args_hint="[title]", category="session",
         risk=RiskLevel.MEDIUM,
@@ -1760,7 +1865,7 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
 
     # -- explicitly unavailable, but discoverable ---------------------------
     categories = {
-        "session": {"compact", "resume", "import", "retry", "undo", "rewind", "branch",
+        "session": {"resume", "import", "retry", "undo", "rewind", "branch",
                     "steer", "queue", "bg", "btw", "quit"},
         "goals": {"goal", "subgoal", "personality", "reasoning", "fast", "verbose", "yolo",
                   "approvals_mode", "memory_review", "learn", "plan", "review", "refine"},
