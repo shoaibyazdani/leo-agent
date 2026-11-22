@@ -284,6 +284,33 @@ class LeoApp:
             return False
         return str(row["requested_at"]) >= str(since)
 
+    async def _await_with_stop(self, awaitable: Any, conversation_id: str, since: str) -> Any:
+        """Await a long call while watching for a stop request.
+
+        A model call can run for minutes and the router retries it across
+        providers. Observing the stop only *between* rounds meant several /stop
+        messages could arrive while the turn kept working, which reads as the stop
+        being ignored. This polls the same durable flag while the call is in
+        flight, cancels it, and raises the same TurnStopped the caller handles.
+        """
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=0.75)
+                if done:
+                    return task.result()
+                if await self._turn_stop_requested(conversation_id, since):
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001 - result discarded
+                        pass
+                    await self._clear_turn_stop(conversation_id)
+                    raise TurnStopped(conversation_id)
+        finally:
+            if not task.done():
+                task.cancel()
+
     async def _clear_turn_stop(self, conversation_id: str) -> None:
         try:
             await db.execute("DELETE FROM turn_cancels WHERE conversation_id=?",
@@ -1688,8 +1715,8 @@ class LeoApp:
 
         Tool results dominate a long session; counting messages lets one
         `du -sh /root/*` flood the whole prompt. Trimming from the oldest end keeps
-        the recent exchange intact, and an orphaned tool result is dropped rather
-        than sent without the assistant row that opened it.
+        the recent exchange intact. Orphaned tool rows are not removed here —
+        `_rows_to_messages` demotes them to data text instead.
         """
         budget = max(4_000, int(getattr(self, "CONVERSATION_HISTORY_MAX_CHARS", 120_000)))
         kept: list[Any] = []
@@ -1701,8 +1728,9 @@ class LeoApp:
             kept.append(row)
             total += length
         kept.reverse()
-        while kept and str(kept[0]["role"] or "") == "tool":
-            kept.pop(0)
+        # Leading tool rows are left in place on purpose: _rows_to_messages demotes
+        # a result whose opener fell outside the window into data text, so dropping
+        # it here would discard the very evidence that path exists to preserve.
         if len(kept) != len(selected):
             _LOG.info("conversation history trimmed to budget", extra={
                 "rows_before": len(selected), "rows_after": len(kept),
@@ -2119,7 +2147,9 @@ class LeoApp:
                 final_call = force_final or iteration == self.round_budget
                 if final_call:
                     self._append_final_answer_instruction(request)
-                response = await self.router.complete(request)
+                response = await self._await_with_stop(
+                    self.router.complete(request), conversation_id, turn_started
+                )
                 # Match ask_stream: model output is redacted before it reaches
                 # durable storage, the provider payload or the caller.
                 content = self._redact(response.content)
@@ -2475,6 +2505,14 @@ class LeoApp:
             # one reserved model call for the final answer.
             typed_stream = getattr(self.router, "stream_events", None)
 
+            async def _guarded_chunks(source: AsyncIterator[StreamChunk]) -> AsyncIterator[StreamChunk]:
+                """Pass stream events through, ending the turn when a stop arrives."""
+                async for chunk in source:
+                    if await self._turn_stop_requested(conversation_id, turn_started):
+                        await self._clear_turn_stop(conversation_id)
+                        raise TurnStopped(conversation_id)
+                    yield chunk
+
             async def _text_only_chunks(model_request: Any) -> AsyncIterator[StreamChunk]:
                 """Compatibility path for routers/fakes with only ``stream()``.
 
@@ -2495,7 +2533,9 @@ class LeoApp:
                 tail = ""
                 reason_tail = ""
                 round_reasoning_seen = False
-                chunks = typed_stream(request) if callable(typed_stream) else _text_only_chunks(request)
+                chunks = _guarded_chunks(
+                    typed_stream(request) if callable(typed_stream) else _text_only_chunks(request)
+                )
                 async for chunk in chunks:
                     cancellation_guard()  # (a) inside the async chunk loop
                     delta = str(getattr(chunk, "text", "") or "")

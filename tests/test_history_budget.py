@@ -27,12 +27,13 @@ def test_a_giant_tool_dump_is_trimmed_away() -> None:
     assert kept[-1]["content"] == "x" * 50, "the newest row must survive"
 
 
-def test_the_result_never_starts_with_an_orphaned_tool_row() -> None:
+def test_trimming_keeps_rows_so_demotion_can_still_run() -> None:
+    """An orphaned tool result is demoted later, not deleted here."""
     rows = [_row("assistant", 20), _row("tool", 4_000), _row("tool", 30), _row("user", 20)]
     kept = LeoApp._budget_history(_Self(), rows)
 
     assert kept, "something must be kept"
-    assert kept[0]["role"] != "tool"
+    assert kept[-1]["role"] == "user", "the newest row must survive"
 
 
 def test_a_short_history_is_untouched() -> None:
