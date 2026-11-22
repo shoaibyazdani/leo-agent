@@ -78,7 +78,9 @@ class SecurityConfig(BaseModel):
     # hardline still denies. deny_commands are glob patterns that always deny.
     shell_enabled: bool = True
     shell_mode: Literal["smart", "manual", "off"] = "smart"
-    shell_timeout_seconds: int = Field(default=120, ge=1, le=3600)
+    # One command, one deadline. 180s is the default an operator expects for a
+    # real command; a hardcoded 30s ceiling elsewhere silently overrode this.
+    shell_timeout_seconds: int = Field(default=180, ge=1, le=3600)
     shell_max_output_bytes: int = Field(default=200_000, ge=1_000, le=2_000_000)
     deny_commands: list[str] = Field(default_factory=list)
     approval_timeout_seconds: int = 900
@@ -224,6 +226,10 @@ class Settings(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     computer: ComputerConfig = Field(default_factory=ComputerConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    # Tool-executing rounds one chat turn may use before it must answer. Bounded
+    # so a runaway loop cannot burn a budget, but large enough for the normal
+    # read -> edit -> test -> retry cycle to finish inside one turn.
+    max_chat_tool_rounds: int = Field(default=250, ge=1, le=2000)
 
     @property
     def root(self) -> Path:
