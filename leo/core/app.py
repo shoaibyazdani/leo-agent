@@ -27,6 +27,7 @@ from ..models.provider import ModelEmptyOutputError, ModelError
 from ..models.router import FINAL_ANSWER_ONLY_INSTRUCTION
 from ..security import ApprovalRequired, PermissionManagerImpl
 from ..security.notifier import ApprovalNotifier
+from ..integrations.progress import ProgressReporter
 
 _LOG = get_logger("core")
 
@@ -424,6 +425,9 @@ class LeoApp:
         # Approval buttons on the operator's own channel: a tap resolves the
         # approval through the privileged path, never as a chat turn.
         self.gateway.set_callback_sink(self.handle_channel_callback)
+        # Live progress on the channel that asked: one message, edited in place.
+        self.progress = ProgressReporter(self.gateway, self.settings)
+        services.update(progress=self.progress)
         # Only now is the adapter registry populated with enrolled channels.
         self.approval_notifier.start()
         # A pending approval that outlived its timeout is a decision nobody can
@@ -1982,6 +1986,9 @@ class LeoApp:
         await self.initialize()
         text = self._redact(text)
         conversation_id = conversation_id or new_id("conv")
+        # Live progress only where a human is watching; a CLI turn has no adapter
+        # and begin() declines quietly.
+        self.progress.begin(channel, str(subject or ""), self.round_budget)
         if text.lstrip().startswith("/"):
             # Slash input is an explicit command invocation, not a prompt. One
             # user row and one assistant row bracket the dispatch; no model call
@@ -2168,6 +2175,7 @@ class LeoApp:
                         )
                         try:
                             result = await self.executor.execute(call)
+                            self.progress.note(name, arguments, getattr(result, "success", None))
                             result_content = json.dumps(result.model_dump(mode="json"), default=str)
                         except ApprovalRequired as exc:
                             result_content = json.dumps({"approval_required": exc.approval_id, "reason": exc.reason})
@@ -2224,6 +2232,7 @@ class LeoApp:
                 (conversation_id, "assistant", final_content, json.dumps(assistant_meta, default=str), utcnow()),
             )
             await db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (utcnow(), conversation_id))
+            await self.progress.end("done")
             await self.events.emit("chat.completed", conversation_id=conversation_id, channel=channel, provider=response.provider)
             return {
                 "conversation_id": conversation_id,
@@ -2265,6 +2274,7 @@ class LeoApp:
         text = self._redact(text)
         run_id = new_id("run")
         conversation_id = conversation_id or new_id("conv")
+        self.progress.begin(channel, str(subject or ""), self.round_budget)
         seq = 0
         final_row_id: int | None = None
 
@@ -2568,6 +2578,7 @@ class LeoApp:
                         )
                         try:
                             result = await self.executor.execute(call)
+                            self.progress.note(name, arguments, getattr(result, "success", None))
                             result_content = json.dumps(result.model_dump(mode="json"), default=str)
                         except ApprovalRequired as exc:
                             result_content = json.dumps({"approval_required": exc.approval_id, "reason": exc.reason})
