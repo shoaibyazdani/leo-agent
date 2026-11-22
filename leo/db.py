@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS approvals (
   reason TEXT, requested_by TEXT, metadata TEXT
 );
 
+CREATE TABLE IF NOT EXISTS approval_grants (
+  id TEXT PRIMARY KEY, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  action TEXT NOT NULL, resource TEXT, granted_by TEXT, scope TEXT NOT NULL DEFAULT 'session',
+  metadata TEXT
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, objective TEXT NOT NULL, status TEXT NOT NULL,
   plan TEXT NOT NULL DEFAULT '[]', current_step INTEGER NOT NULL DEFAULT 0,

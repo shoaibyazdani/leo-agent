@@ -470,8 +470,24 @@ class MessagingAdapter:
         """Best-effort 'is typing' indicator. Channels without one do nothing."""
         return None
 
-    async def send(self, target: str, text: str) -> dict[str, Any]:
+    async def send(
+        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Send one text message.
+
+        ``reply_markup`` is an optional keyboard. A channel that cannot render one
+        ignores it rather than failing the send: the text still carries the
+        approval id, so a human can always resolve from the CLI.
+        """
         raise NotImplementedError
+
+    # Inline-keyboard taps arrive on the same transport as messages. The
+    # composition root installs a sink; without one a tap is acknowledged and
+    # dropped rather than left spinning on the user's screen.
+    callback_sink: Any = None
+
+    def set_callback_sink(self, sink: Any) -> None:
+        self.callback_sink = sink
 
     async def send_media(
         self,
@@ -651,7 +667,9 @@ class TelegramAdapter(MessagingAdapter):
         signature = _header(headers, "x-hub-signature-256") or _header(headers, "x-telegram-signature")
         return _signature_matches(signature, _hmac_hex(secret, _body_bytes(payload, raw_body)))
 
-    async def send(self, target: str, text: str) -> dict[str, Any]:
+    async def send(
+        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
             raise MessagingError("telegram send blocked: TELEGRAM_BOT_TOKEN is not set")
@@ -660,17 +678,60 @@ class TelegramAdapter(MessagingAdapter):
         chunks = split_message(str(text), TELEGRAM_MAX_CHARS)
         last: dict[str, Any] = {}
         for index, chunk in enumerate(chunks):
-            last = await self._send_one(token, target, chunk)
+            # The keyboard belongs to the message the human reads last, not to a
+            # continuation that may arrive before it.
+            keyboard = reply_markup if index + 1 == len(chunks) else None
+            last = await self._send_one(token, target, chunk, reply_markup=keyboard)
             if index + 1 < len(chunks):
                 _LOG.info("telegram long message split", extra={
                     "chunks": len(chunks), "part": index + 1})
         return last
 
-    async def _send_one(self, token: str, target: str, text: str) -> dict[str, Any]:
+    async def answer_callback_query(self, callback_id: str, text: str = "") -> bool:
+        """Stop the tap spinner and optionally show a one-line result."""
+        token = credential("TELEGRAM_BOT_TOKEN")
+        if not token or not callback_id:
+            return False
+        url = f"{self.API_BASE}/bot{token}/answerCallbackQuery"
+        payload: dict[str, Any] = {"callback_query_id": str(callback_id)}
+        if text:
+            payload["text"] = str(text)[:200]
+        try:
+            response = await self._http().post(url, json=payload, timeout=self.timeout)
+        except httpx.HTTPError:
+            return False
+        return response.status_code < 400
+
+    async def edit_message_text(
+        self, target: str, message_id: str, text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        """Replace the text of a sent message (best effort)."""
+        token = credential("TELEGRAM_BOT_TOKEN")
+        if not token or not message_id:
+            return False
+        url = f"{self.API_BASE}/bot{token}/editMessageText"
+        payload: dict[str, Any] = {
+            "chat_id": str(target), "message_id": str(message_id), "text": str(text),
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        try:
+            response = await self._http().post(url, json=payload, timeout=self.timeout)
+        except httpx.HTTPError:
+            return False
+        return response.status_code < 400
+
+    async def _send_one(
+        self, token: str, target: str, text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
         payload: dict[str, Any] = {"chat_id": str(target), "text": text,
                                    "parse_mode": TELEGRAM_PARSE_MODE}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         try:
             response = await self._http().post(url, json=payload, timeout=self.timeout)
         except httpx.HTTPError as exc:
@@ -860,7 +921,44 @@ class TelegramAdapter(MessagingAdapter):
                 self._cursor = update_id + 1
         if state is not None and latest is not None:
             await state.set_cursor(latest)
+        await self._dispatch_callbacks(updates)
         return self._messages_from_updates(updates)
+
+    async def _dispatch_callbacks(self, updates: list[Any]) -> None:
+        """Hand inline-keyboard taps to the composition root.
+
+        A tap is not a message: it must never be normalised into a chat turn, or
+        every button press would read as user text.
+        """
+        for update in updates or []:
+            if not isinstance(update, dict):
+                continue
+            tap = update.get("callback_query")
+            if not isinstance(tap, dict):
+                continue
+            message = tap.get("message") if isinstance(tap.get("message"), dict) else {}
+            chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+            sender = tap.get("from") if isinstance(tap.get("from"), dict) else {}
+            descriptor = {
+                "callback_id": _ref(tap.get("id")),
+                "data": str(tap.get("data") or ""),
+                "sender_id": _ref(sender.get("id")),
+                "chat_id": _ref(chat.get("id")),
+                "message_id": _ref(message.get("message_id")),
+            }
+            sink = self.callback_sink
+            if sink is None:
+                # No sink: acknowledge so the tap does not spin forever, and say
+                # plainly that nothing was decided.
+                await self.answer_callback_query(
+                    descriptor["callback_id"], "No handler for this button"
+                )
+                continue
+            try:
+                await sink(self.channel, descriptor)
+            except Exception as exc:  # noqa: BLE001 - a tap must not break polling
+                _LOG.warning("callback dispatch failed", extra={
+                    "channel": self.channel, "error": type(exc).__name__})
 
 
 # Discord signs ``timestamp + raw_body`` but does not bind the request to a

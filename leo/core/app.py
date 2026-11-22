@@ -8,6 +8,7 @@ import json
 import os
 import re
 from collections import deque
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -24,6 +25,7 @@ from ..logging import configure_logging, get_logger
 from ..models.provider import ModelEmptyOutputError, ModelError
 from ..models.router import FINAL_ANSWER_ONLY_INSTRUCTION
 from ..security import ApprovalRequired, PermissionManagerImpl
+from ..security.notifier import ApprovalNotifier
 
 _LOG = get_logger("core")
 
@@ -346,6 +348,14 @@ class LeoApp:
             # attachment whitelist because they never name a root.
             outbound_media_root=self.settings.resolve(self.settings.paths.outbound_media),
         )
+        # Approval requests are recorded in SQLite and exposed on /approvals,
+        # but nothing told the operator one was waiting: a gated action stalled
+        # until it expired. The notifier mirrors the event to the operator's own
+        # channel and never resolves anything.
+        self.approval_notifier = ApprovalNotifier(
+            self.gateway, self.settings, events=self.events
+        )
+        services.update(approval_notifier=self.approval_notifier)
         services.update(
             memory=self.memory, search=self.search, tasks=self.tasks,
             scheduler=self.scheduler, skills=self.skills,
@@ -374,6 +384,11 @@ class LeoApp:
         # Durable outbox turns are driven by app.ask and answered via Gateway.send.
         self.gateway.set_reply_handler(self._gateway_reply)
         self.gateway.set_attachment_sink(self._store_channel_attachment)
+        # Approval buttons on the operator's own channel: a tap resolves the
+        # approval through the privileged path, never as a chat turn.
+        self.gateway.set_callback_sink(self.handle_channel_callback)
+        # Only now is the adapter registry populated with enrolled channels.
+        self.approval_notifier.start()
         await self.gateway.recover_stale_outbox()
 
         # Channel matrix → dashboard: statuses are honest (blocked until the
@@ -552,6 +567,109 @@ class LeoApp:
         return await self.gateway.send(
             str(channel), str(target), text[:8000], subject=f"task:{getattr(task, 'id', '')}"
         )
+
+    # -- approval buttons --------------------------------------------------
+    def _approval_senders(self, channel: str) -> list[str]:
+        """Who may resolve an approval by tapping, for this channel.
+
+        The channel allowlist is the authority; the environment variable is only
+        a fallback for a deployment that has not written a policy yet.
+        """
+        policies = getattr(self.settings.channels, "policies", None) or {}
+        policy = policies.get(channel) if isinstance(policies, Mapping) else None
+        allow = list(getattr(policy, "allow", []) or [])
+        if allow:
+            return allow
+        raw = os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "") if channel == "telegram" else ""
+        return [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
+
+    async def _resolve_tap_id(self, parsed: dict[str, str]) -> str | None:
+        """Turn a button payload into a real approval id.
+
+        Exact ids pass through. A 43-character locator is a hash, so it is only
+        accepted when it reproduces for a pending approval we already own.
+        """
+        approval_id = str(parsed.get("approval_id") or "")
+        if parsed.get("is_ref") != "1":
+            return approval_id or None
+        from ..security.approval_buttons import resolve_locator
+
+        rows = await db.fetchall("SELECT id FROM approvals WHERE status='pending'")
+        candidates = [str(row["id"]) for row in rows or []]
+        return resolve_locator(str(parsed.get("approval_kind") or ""), approval_id, candidates)
+
+    async def handle_channel_callback(self, channel: str, descriptor: dict[str, Any]) -> None:
+        """Handle one inline-keyboard tap from a chat channel."""
+        from ..security.approval_buttons import (
+            SESSION_GRANT_SECONDS, is_authorized, parse_callback_data,
+        )
+
+        adapter = self.gateway._adapter(channel)  # noqa: SLF001 - same package
+        callback_id = str(descriptor.get("callback_id") or "")
+        chat_id = str(descriptor.get("chat_id") or "")
+        message_id = str(descriptor.get("message_id") or "")
+        sender_id = str(descriptor.get("sender_id") or "")
+
+        async def reply(note: str) -> None:
+            if callback_id:
+                await adapter.answer_callback_query(callback_id, note)  # type: ignore[attr-defined]
+
+        if not is_authorized(sender_id, self._approval_senders(channel)):
+            await reply("You are not allowed to resolve approvals")
+            self.log.info("approval tap refused", extra={
+                "channel": channel, "sender_id": sender_id, "reason": "not authorized"})
+            return
+
+        parsed = parse_callback_data(descriptor.get("data"))
+        if not parsed:
+            await reply("Unrecognised button")
+            return
+        approval_id = await self._resolve_tap_id(parsed)
+        if not approval_id:
+            await reply("That approval is no longer available")
+            return
+
+        decision = str(parsed.get("decision") or "")
+        actor = f"{channel}-button:{sender_id}"
+        granted = ""
+        if decision == "session":
+            row = await db.fetchone("SELECT action, resource FROM approvals WHERE id=?", (approval_id,))
+            if row is None:
+                await reply("Unknown approval")
+                return
+            granted = await self.permissions.grant_session(
+                str(row["action"]), row["resource"], SESSION_GRANT_SECONDS, actor,
+            )
+            decision = "approve"
+
+        approved = decision == "approve"
+        try:
+            result = await self.operator_resolve_approval(approval_id, approved, actor=actor)
+        except Exception as exc:  # noqa: BLE001 - a tap must never crash the poller
+            await reply(f"Could not resolve: {type(exc).__name__}")
+            return
+
+        ok = bool(result.get("success"))
+        verdict = "approved" if approved else "rejected"
+        note = f"{verdict}: {approval_id}"
+        if granted:
+            note += f" · always for {SESSION_GRANT_SECONDS // 3600}h"
+        await reply(note if ok else f"Failed: {result.get('error') or 'unknown error'}")
+
+        # The message keeps the record; the buttons go away so a resolved
+        # approval cannot be tapped twice.
+        text = "\n".join(filter(None, [
+            "🔐 Approval", f"id: {approval_id}",
+            ("✅ " + verdict) if ok else "⚠️ could not resolve",
+            note if not ok else "",
+        ]))
+        if chat_id and message_id:
+            await adapter.edit_message_text(  # type: ignore[attr-defined]
+                chat_id, message_id, text, {"inline_keyboard": []},
+            )
+        self.log.info("approval tap resolved", extra={
+            "channel": channel, "approval_id": approval_id, "decision": verdict,
+            "grant_id": granted or None, "sender_id": sender_id})
 
     async def _store_channel_attachment(self, channel: str, descriptor: dict[str, Any]) -> str | None:
         """Download a channel's file and store it, returning the attachment id.

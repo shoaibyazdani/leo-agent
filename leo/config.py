@@ -72,6 +72,23 @@ class PathConfig(BaseModel):
     outbound_media: Path = Path(".leo/media/outbound")
 
 
+class ApprovalNotifyConfig(BaseModel):
+    """Where a pending HIGH-risk approval is announced to the operator.
+
+    Without this, a request only lands in SQLite and ``GET /approvals``, so a
+    gated action stalls silently until it expires. ``enabled`` is False by
+    default: the operator opts in by naming a channel and a target they own.
+    Notification never grants authority — it only tells a human that a decision
+    is waiting.
+    """
+
+    enabled: bool = False
+    channel: str = ""
+    # The operator's own address on that channel. Never a value taken from a
+    # model or a chat message.
+    target: str = ""
+
+
 class SecurityConfig(BaseModel):
     workspace_only: bool = True
     allow_medium_risk: bool = True
@@ -126,6 +143,7 @@ class SecurityConfig(BaseModel):
     # list — including an empty one — makes ToolSpec.permissions mandatory and
     # fails closed on any missing/partial grant.
     grants: list[str] | None = None
+    notify: ApprovalNotifyConfig = Field(default_factory=ApprovalNotifyConfig)
 
 
 class ModelProviderConfig(BaseModel):
