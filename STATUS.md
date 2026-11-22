@@ -8,7 +8,7 @@ narrative changelog.
 - Provider-independent agent platform: streaming chat in the dashboard and in
   the terminal (`leo chat`), durable tasks, layered memory, specialist agents,
   native tools and skills, approvals with audit, integrations adapters.
-- Measured from the live `LeoApp.initialize()` composition root: 95
+- Measured from the live `LeoApp.initialize()` composition root: 94
   registered tools, 37 available slash commands (126 registered slash
   commands in total) and 24 specialist agents.
 - Vision: image attachments route to providers that declare the `vision`

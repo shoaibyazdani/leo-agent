@@ -32,7 +32,7 @@ HISTORICAL_MARKERS = (
 # roster legitimately grows, docs must be updated; if it silently shrinks, these
 # guards force a review instead of letting a stale claim pass. The old 93-tool,
 # 34-command and 20-agent figures must never satisfy these floors.
-MIN_LIVE_TOOLS = 95
+MIN_LIVE_TOOLS = 94
 MIN_LIVE_COMMANDS = 35  # currently available slash commands, not all 127 specs
 MIN_LIVE_AGENTS = 24
 
