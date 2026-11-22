@@ -265,6 +265,19 @@ class ChannelsConfig(BaseModel):
     policies: dict[str, ChannelPolicyConfig] = Field(default_factory=dict)
 
 
+class ProgressConfig(BaseModel):
+    """Live "what am I doing right now" report for a working turn.
+
+    One message per turn, edited in place. Off by default: it is a chat surface,
+    and a deployment that never talks to a human should not open one.
+    """
+
+    enabled: bool = False
+    min_interval_seconds: float = Field(default=4.0, ge=0.5, le=60.0)
+    max_steps: int = Field(default=6, ge=1, le=20)
+    idle_seconds: float = Field(default=45.0, ge=5.0, le=600.0)
+
+
 class Settings(BaseModel):
     app_name: str = "LEO"
     environment: str = "local"
@@ -272,6 +285,7 @@ class Settings(BaseModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     models: ModelConfig = Field(default_factory=ModelConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    progress: ProgressConfig = Field(default_factory=ProgressConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     computer: ComputerConfig = Field(default_factory=ComputerConfig)
