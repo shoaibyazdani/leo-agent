@@ -217,7 +217,23 @@ class PermissionManagerImpl:
         if allowed and risk is RiskLevel.MEDIUM and not self.settings.security.allow_medium_risk:
             allowed, reason = False, "medium-risk actions disabled by policy"
 
-        if allowed and risk is RiskLevel.HIGH and self.settings.security.high_risk_requires_approval and not verified_approval:
+        # A session grant answers "the operator already said yes to this exact
+        # action on this exact resource, minutes ago". It is checked before a new
+        # approval is created, and it can never waive a path violation.
+        grant_applied = False
+        if (
+            allowed and not violation and risk is RiskLevel.HIGH and not verified_approval
+            and self.settings.security.high_risk_requires_approval
+            and await self._has_live_grant(action, resource)
+        ):
+            allowed, reason, grant_applied = True, "session grant", True
+
+        # A grant already answered this request; asking again would queue a
+        # second approval for an action the operator just allowed.
+        if (
+            allowed and not grant_applied and risk is RiskLevel.HIGH
+            and self.settings.security.high_risk_requires_approval and not verified_approval
+        ):
             approval_id = new_id("apr")
             metadata = _safe_approval_metadata(context)
             if current_digest:
@@ -261,6 +277,38 @@ class PermissionManagerImpl:
             (utcnow(), approval_id),
         )
         return cursor.rowcount == 1
+
+    async def _has_live_grant(self, action: str, resource: str | None) -> bool:
+        """True when an unexpired session grant covers this action/resource."""
+        try:
+            row = await db.fetchone(
+                "SELECT id FROM approval_grants WHERE action=? AND resource IS ? "
+                "AND expires_at > ? LIMIT 1",
+                (action, resource, utcnow()),
+            )
+        except Exception:  # noqa: BLE001 - a grant lookup must never crash a decision
+            return False
+        return row is not None
+
+    async def grant_session(
+        self, action: str, resource: str | None, seconds: int, granted_by: str,
+        scope: str = "session",
+    ) -> str:
+        """Record a scoped, expiring grant for one action/resource pair."""
+        from datetime import timedelta
+
+        grant_id = new_id("grn")
+        created = utcnow()
+        expires = (datetime.fromisoformat(created) + timedelta(seconds=max(60, int(seconds)))).isoformat()
+        await db.execute(
+            "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,granted_by,scope,metadata) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (grant_id, created, expires, action, resource, granted_by, scope, "{}"),
+        )
+        if self.events:
+            await self.events.emit("approval.granted", grant_id=grant_id, action=action,
+                                   resource=resource, granted_by=granted_by, scope=scope)
+        return grant_id
 
     async def resolve_approval(self, approval_id: str, approved: bool, resolver: str = "user") -> Decision:
         resolver_name = str(resolver).strip()

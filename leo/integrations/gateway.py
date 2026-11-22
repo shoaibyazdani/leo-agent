@@ -140,6 +140,8 @@ class Gateway:
     ) -> None:
         self.adapters: dict[str, MessagingAdapter] = dict(adapters or {})
         self.attachment_sink: Callable[[str, dict[str, Any]], Awaitable[str | None]] | None = None
+        # Inline-keyboard taps (approval buttons) are handled here, not as turns.
+        self.callback_sink: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
         self.events = events or EventBus()
         self.permissions = permissions or PermissionManagerImpl(Settings.load())
         self.actor = actor
@@ -169,12 +171,30 @@ class Gateway:
         """
         self.attachment_sink = sink
 
+    def set_callback_sink(
+        self, sink: Callable[[str, dict[str, Any]], Awaitable[Any]] | None
+    ) -> None:
+        """Register the handler for inline-keyboard taps, on every adapter.
+
+        A tap is not a chat message: it must reach the approval path directly
+        instead of being normalised into a turn.
+        """
+        self.callback_sink = sink
+        for adapter in self.adapters.values():
+            setter = getattr(adapter, "set_callback_sink", None)
+            if callable(setter):
+                setter(sink)
+
     def set_reply_handler(self, handler: OutboxHandler | None) -> None:
         """Register (or clear with ``None``) the durable outbox consumer hook."""
         self._reply_handler = handler
 
     def register(self, adapter: MessagingAdapter) -> None:
         self.adapters[adapter.channel] = adapter
+        if self.callback_sink is not None:
+            setter = getattr(adapter, "set_callback_sink", None)
+            if callable(setter):
+                setter(self.callback_sink)
 
     def _adapter(self, channel: str) -> MessagingAdapter:
         adapter = self.adapters.get(channel)

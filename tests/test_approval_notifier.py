@@ -1,0 +1,180 @@
+"""Approval notifications must reach the operator and never grant authority."""
+
+from __future__ import annotations
+
+import pytest
+
+from leo.config import Settings
+from leo.contracts import RiskLevel
+from leo.events import Event, EventBus
+from leo.security.notifier import ApprovalNotifier
+
+
+class FakeAdapter:
+    channel = "telegram"
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+        self.raise_on_send: Exception | None = None
+
+    async def send(self, target: str, text: str) -> dict:
+        if self.raise_on_send is not None:
+            raise self.raise_on_send
+        self.sent.append((target, text))
+        return {"message_id": "1"}
+
+
+class FakeGateway:
+    def __init__(self, adapter: FakeAdapter | None = None, events: EventBus | None = None) -> None:
+        self._adapters = {"telegram": adapter or FakeAdapter()}
+        self.events = events
+
+    def _adapter(self, channel: str):
+        return self._adapters[channel]
+
+
+def _settings(enabled: bool = True, channel: str = "telegram", target: str = "525083981") -> Settings:
+    settings = Settings()
+    settings.security.notify.enabled = enabled
+    settings.security.notify.channel = channel
+    settings.security.notify.target = target
+    return settings
+
+
+def _request(approval_id: str = "apr_test", action: str = "gateway.send") -> Event:
+    return Event(
+        topic="approval.requested",
+        payload={
+            "approval_id": approval_id,
+            "actor": "gateway",
+            "action": action,
+            "resource": "telegram:525083981",
+            "risk": "high",
+        },
+    )
+
+
+async def _pending_approval(approval_id: str, action: str = "gateway.send") -> None:
+    """A notification must correspond to a real, still-pending approval."""
+    from leo import db
+    from leo.contracts import utcnow
+
+    await db.execute(
+        "INSERT OR REPLACE INTO approvals(id,created_at,status,actor,action,resource,risk,"
+        "reason,requested_by,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (approval_id, utcnow(), "pending", "operator", action, None, "high",
+         "test", "operator", "{}"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_is_pushed_to_operator_channel() -> None:
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    assert notifier.start() is True
+
+    await _pending_approval("apr_1")
+    await bus.emit("approval.requested", approval_id="apr_1", action="gateway.send",
+                   resource="telegram:525083981", risk="high")
+
+    assert len(adapter.sent) == 1
+    target, text = adapter.sent[0]
+    assert target == "525083981"
+    assert "apr_1" in text
+    assert "gateway.send" in text
+    assert notifier.stats()["sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_disabled_does_not_subscribe() -> None:
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(enabled=False), events=bus)
+
+    assert notifier.start() is False
+    await _pending_approval("apr_1")
+    await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_partial_config_is_not_enough() -> None:
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    for settings in (_settings(channel=""), _settings(target="")):
+        notifier = ApprovalNotifier(FakeGateway(adapter, bus), settings, events=bus)
+        assert notifier.start() is False
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_send_failure_never_breaks_the_requesting_call() -> None:
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    adapter.raise_on_send = RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    notifier.start()
+
+    # publish() gathers handlers with return_exceptions=True, so this must not raise.
+    await _pending_approval("apr_1")
+    await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
+
+    assert adapter.sent == []
+    assert notifier.stats()["failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_notifier_cannot_resolve_an_approval() -> None:
+    """Notification is informational: it holds no permission manager."""
+    notifier = ApprovalNotifier(FakeGateway(), _settings())
+    assert not hasattr(notifier, "permissions")
+    assert not hasattr(notifier, "resolve_approval")
+
+
+@pytest.mark.asyncio
+async def test_notifier_uses_adapter_directly_not_gateway_send() -> None:
+    """Gateway.send would re-enter authorize(HIGH) and loop on itself."""
+    calls: list[str] = []
+
+    class RecordingGateway(FakeGateway):
+        async def send(self, *args, **kwargs):  # pragma: no cover - must not run
+            calls.append("gateway.send")
+            raise AssertionError("notifier must not route through Gateway.send")
+
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(RecordingGateway(adapter, bus), _settings(), events=bus)
+    notifier.start()
+    await _pending_approval("apr_1")
+    await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
+
+    assert calls == []
+    assert len(adapter.sent) == 1
+
+
+def test_message_contains_no_secret_material() -> None:
+    notifier = ApprovalNotifier(FakeGateway(), _settings())
+    text = notifier._message(
+        {"approval_id": "apr_1", "action": "gateway.send",
+         "resource": "telegram:525083981", "risk": "high"}
+    )
+    assert "token" not in text.lower()
+    assert "525083981" in text
+
+
+def test_start_is_idempotent() -> None:
+    bus = EventBus(persist=False)
+    notifier = ApprovalNotifier(FakeGateway(events=bus), _settings(), events=bus)
+    assert notifier.start() is True
+    assert notifier.start() is True
+    handlers = bus._handlers["approval.requested"]
+    assert len(handlers) == 1
+
+
+def test_stop_unsubscribes() -> None:
+    bus = EventBus(persist=False)
+    notifier = ApprovalNotifier(FakeGateway(events=bus), _settings(), events=bus)
+    notifier.start()
+    notifier.stop()
+    assert bus._handlers["approval.requested"] == []
