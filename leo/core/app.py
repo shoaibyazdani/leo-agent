@@ -306,8 +306,12 @@ class LeoApp:
                     })
                     task.cancel()
                     try:
-                        await task
-                    except (asyncio.CancelledError, Exception):  # noqa: BLE001 - result discarded
+                        # Bounded: a handler that ignores cancellation (a blocked
+                        # subprocess wait does) must not keep the turn alive. Waiting
+                        # on it forever was the last reason /stop appeared to do
+                        # nothing while the agent kept working.
+                        await asyncio.wait_for(task, timeout=2.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):  # noqa: BLE001
                         pass
                     await self._clear_turn_stop(conversation_id)
                     raise TurnStopped(conversation_id)
