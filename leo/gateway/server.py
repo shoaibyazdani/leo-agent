@@ -22,6 +22,10 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .. import db
+
+# One send attempt may not outlive this: a stuck platform call is a failed send,
+# and an unbounded one keeps the worker's lease (and its typing pulse) alive.
+DELIVERY_TIMEOUT_SECONDS = 45.0
 from ..integrations.channels import default_adapters, polling_channels
 from ..integrations.messaging import implements_polling
 from ..integrations.secrets import credential
@@ -172,7 +176,20 @@ def create_api(
                 delivered, error = False, f"no adapter for {admission['channel']}"
             else:
                 try:
-                    await adapter.send(admission["subject"], request.answer)
+                    # A hung platform call must not keep the turn (and its typing
+                    # pulse) alive forever: the worker renews the lease until this
+                    # returns, so an unbounded send is an endless "still typing".
+                    await asyncio.wait_for(
+                        adapter.send(admission["subject"], request.answer),
+                        timeout=DELIVERY_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    delivered, error = False, "delivery timed out"
+                    _LOG.warning(
+                        "gateway delivery timed out for %s after %ss",
+                        admission["channel"], DELIVERY_TIMEOUT_SECONDS,
+                        extra={"channel": admission["channel"], "kind": "delivery_timeout"},
+                    )
                 except Exception as exc:  # delivery failure must not lose the turn
                     delivered, error = False, f"{type(exc).__name__}: {exc}"[:300]
                     # The reason belongs in the message, not only in an `extra` field
