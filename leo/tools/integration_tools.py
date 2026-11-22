@@ -263,6 +263,66 @@ async def _channel_send(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, 
     }
 
 
+async def _channel_react(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """Put one emoji reaction on a message the channel adapter can address.
+
+    A reaction writes nothing to the conversation, so it is LOW risk and needs
+    no approval. ``reacted`` is only True when the provider accepted it: a
+    channel without reaction support, an unknown message id, or a provider
+    rejection all come back as an explicit failure with a reason.
+    """
+    services = _services(ctx)
+    gateway = _gateway(services, require_send=True)
+    channel = args["channel"]
+    target = args["target"]
+    message_id = args["message_id"]
+    emoji = args.get("emoji") or "\u2764"
+
+    record = next(
+        (item for item in _records(services, gateway) if item.get("name") == channel), None
+    )
+    if record is None:
+        return await _blocked(
+            ctx, channel, target,
+            f"no integration record for channel '{channel}': credentials not configured",
+        )
+    status = str(record.get("status") or "unknown")
+    if status != "configured":
+        metadata = record.get("metadata") or {}
+        reason = metadata.get("reason") if isinstance(metadata, Mapping) else None
+        return await _blocked(
+            ctx, channel, target,
+            str(reason or f"channel '{channel}' is {status}: credentials not configured"),
+        )
+
+    try:
+        result = await _await(
+            gateway.react(channel, target, message_id, emoji)
+        )
+    except GatewayError as exc:
+        return await _blocked(ctx, channel, target, f"gateway refused reaction: {exc}")
+    except MessagingError as exc:
+        return await _blocked(ctx, channel, target, f"gateway refused reaction: {exc}")
+    if not isinstance(result, Mapping):
+        return await _blocked(
+            ctx, channel, target, "gateway returned an invalid reaction result"
+        )
+    if result.get("success") is False or result.get("reacted") is False:
+        return await _blocked(
+            ctx, channel, target,
+            str(result.get("error") or f"gateway could not react on {channel}"),
+        )
+    return {
+        "status": "reacted",
+        "success": True,
+        "reacted": True,
+        "channel": channel,
+        "target": target,
+        "message_id": message_id,
+        "emoji": emoji,
+    }
+
+
 async def _enrollment_status(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     services = _services(ctx)
     gateway = _gateway(services)
@@ -366,6 +426,41 @@ _SPECS: tuple[tuple[ToolSpec, Any], ...] = (
             },
         ),
         _channel_send,
+    ),
+    (
+        ToolSpec(
+            name="channel_react",
+            description=(
+                "Put one emoji reaction on a message the channel adapter can address. "
+                "LOW risk and non-destructive. Returns an explicit blocked/failure result "
+                "with a reason when the channel cannot react, the message id is not "
+                "addressable, or the provider rejects it; never reports an unplaced "
+                "reaction as placed."
+            ),
+            category="integrations",
+            risk=RiskLevel.LOW,
+            permissions=["integration:send", "network:write"],
+            resource_field="",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "minLength": 1},
+                    "target": {"type": "string", "minLength": 1},
+                    "message_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Provider message id to react to.",
+                    },
+                    "emoji": {
+                        "type": "string",
+                        "description": "Single emoji. Defaults to \u2764.",
+                    },
+                },
+                "required": ["channel", "target", "message_id"],
+                "additionalProperties": False,
+            },
+        ),
+        _channel_react,
     ),
     (
         ToolSpec(

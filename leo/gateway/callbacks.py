@@ -60,6 +60,44 @@ async def resolve_tap_id(parsed: Mapping[str, str]) -> str | None:
     return resolve_locator(str(parsed.get("approval_kind") or ""), approval_id, candidates)
 
 
+async def tap_blocked_reason(approval_id: str, timeout_seconds: float) -> str | None:
+    """Why this button can no longer decide anything, or None when it still can.
+
+    A button outlives the decision it was made for: it sits in chat history long
+    after the approval was resolved, consumed or expired. Tapping it used to
+    surface a raw exception name ("Could not resolve: ValueError"), which reads
+    like a crash in LEO rather than "you already answered this". Status is read
+    first so the operator gets the truth in one short line.
+    """
+    from datetime import datetime
+
+    row = await db.fetchone(
+        "SELECT status, created_at FROM approvals WHERE id=?", (approval_id,)
+    )
+    if row is None:
+        return "That approval no longer exists"
+    status = str(row["status"] or "")
+    if status == "approved":
+        return "Already approved \u2014 no action needed"
+    if status == "consumed":
+        return "Already approved and used \u2014 no action needed"
+    if status == "denied":
+        return "Already rejected \u2014 no action needed"
+    if status == "expired":
+        return "Expired \u2014 the request timed out before it was answered"
+    if status != "pending":
+        return f"No longer pending ({status})"
+    try:
+        created = datetime.fromisoformat(str(row["created_at"]))
+        age = (datetime.now(created.tzinfo) - created).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    if timeout_seconds > 0 and age > timeout_seconds:
+        minutes = max(1, int(timeout_seconds) // 60)
+        return f"Expired \u2014 this request was only valid for {minutes} min"
+    return None
+
+
 async def handle_tap(
     channel: str,
     descriptor: Mapping[str, Any],
@@ -99,6 +137,15 @@ async def handle_tap(
     if not approval_id:
         await reply("That approval is no longer available")
         return {"ok": False, "reason": "unknown approval"}
+
+    blocked = await tap_blocked_reason(
+        approval_id, float(getattr(settings.security, "approval_timeout_seconds", 900) or 0)
+    )
+    if blocked:
+        await reply(blocked)
+        _LOG.info("approval tap ignored", extra={
+            "channel": channel, "approval_id": approval_id, "reason": blocked})
+        return {"ok": False, "reason": "not actionable", "note": blocked}
 
     decision = str(parsed.get("decision") or "")
     actor = f"{channel}-button:{sender_id}"

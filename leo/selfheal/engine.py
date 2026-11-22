@@ -65,6 +65,14 @@ WATCHED_TOPICS = (
 )
 
 ACTION_APPLY = "selfheal.apply"
+
+# Actions whose failure is not an incident. A reaction is cosmetic and
+# non-destructive: the provider refusing one (an old message id, a chat that
+# disallows reactions) is expected, and turning that into a HIGH-risk repair
+# proposal asks a human to approve non-work.
+COSMETIC_TOOLS: frozenset[str] = frozenset({
+    "channel_react", "react", "gateway.react", "message_react",
+})
 ACTION_ROLLBACK = "selfheal.rollback"
 ACTOR = "heal:selfheal"
 
@@ -394,6 +402,12 @@ class SelfHealingEngine:
             return None
 
         payload = dict(event.payload or {})
+        tool = _text(payload.get("tool") or payload.get("tool_name"), 80).strip()
+        action = _text(payload.get("action"), 120).strip()
+        if tool in COSMETIC_TOOLS or action in COSMETIC_TOOLS:
+            # Recorded by the caller's own logs; never an incident, never an
+            # approval. A reaction that could not be placed is not damage.
+            return None
         kind = classify_failure(event.topic, payload)
         target = _target_for(event.topic, payload)
         decision = _text(payload.get("decision"), 80) or "error"
