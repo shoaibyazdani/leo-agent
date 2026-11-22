@@ -170,8 +170,15 @@ def create_api(
                     await adapter.send(admission["subject"], request.answer)
                 except Exception as exc:  # delivery failure must not lose the turn
                     delivered, error = False, f"{type(exc).__name__}: {exc}"[:300]
-                    _LOG.warning("gateway delivery failed",
-                                 extra={"channel": admission["channel"], "error": error})
+                    # The reason belongs in the message, not only in an `extra` field
+                    # that the default formatter drops: a silent "delivery failed"
+                    # line is what made a 400 from the chat platform look like a
+                    # healthy turn that simply never arrived.
+                    _LOG.warning(
+                        "gateway delivery failed for %s: %s",
+                        admission["channel"], error,
+                        extra={"channel": admission["channel"], "error": error},
+                    )
         if request.conversation_id:
             await store.save_route(admission["channel"], admission["subject"],
                                    request.conversation_id)
