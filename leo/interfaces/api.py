@@ -225,11 +225,19 @@ def sanitize_conversation_feed(payload: dict[str, Any], request: Request) -> dic
     return cleaned
 
 
+def _disable_inbound() -> bool:
+    """True when polling is owned by a separate gateway process."""
+    value = os.getenv("LEO_DISABLE_INBOUND", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     global _app
     _app = LeoApp()
-    await _app.start_background()
+    # A brain running beside a gateway must not poll the same bot token.
+    inbound_enabled = not _disable_inbound()
+    await _app.start_background(inbound=inbound_enabled)
     yield
     await _app.shutdown()
 

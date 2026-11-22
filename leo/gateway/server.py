@@ -35,8 +35,14 @@ WORKER_IDLE_SLICE = 0.5
 
 class ClaimRequest(BaseModel):
     worker: str = Field(min_length=1)
-    lease_seconds: int = Field(default=60, ge=5, le=900)
+    lease_seconds: int = Field(default=30, ge=1, le=900)
     wait_seconds: float = Field(default=0.0, ge=0.0, le=60.0)
+
+
+class RenewRequest(BaseModel):
+    admission_id: str
+    worker: str = Field(min_length=1)
+    lease_seconds: int = Field(default=30, ge=1, le=900)
 
 
 class CompleteRequest(BaseModel):
@@ -93,6 +99,13 @@ def create_api(
                 return {"admission": None}
             await asyncio.sleep(WORKER_IDLE_SLICE)
             await store.reclaim_expired()
+
+    @api.post("/v1/renew")
+    async def renew(request: RenewRequest,
+                    authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        auth(authorization)
+        held = await store.renew(request.admission_id, request.worker, request.lease_seconds)
+        return {"renewed": held}
 
     @api.post("/v1/complete")
     async def complete(request: CompleteRequest,

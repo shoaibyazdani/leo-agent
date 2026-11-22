@@ -73,6 +73,17 @@ class GatewayClient:
             raise GatewayClientError(f"complete failed: HTTP {response.status_code}")
         return response.json()
 
+    async def renew(self, admission_id: str, worker: str,
+                    lease_seconds: int = 30) -> bool:
+        response = await self._http().post(
+            "/v1/renew",
+            json={"admission_id": admission_id, "worker": worker,
+                  "lease_seconds": lease_seconds},
+        )
+        if response.status_code != 200:
+            return False
+        return bool(response.json().get("renewed"))
+
     async def fail(self, admission_id: str, error: str, *, retry: bool = True) -> dict[str, Any]:
         response = await self._http().post(
             "/v1/fail", json={"admission_id": admission_id, "error": error, "retry": retry}
@@ -110,12 +121,25 @@ def resolve_token(token: str | None = None) -> str:
     return stored
 
 
+async def _keep_lease(
+    client: GatewayClient, admission_id: str, worker: str, lease_seconds: int
+) -> None:
+    """Renew a lease while a turn runs, so a slow brain does not look dead."""
+    interval = max(1.0, lease_seconds / 3)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await client.renew(admission_id, worker, lease_seconds)
+        except (httpx.HTTPError, GatewayClientError):
+            continue  # a transient gateway blip must not abort the turn
+
+
 async def run_worker(
     base_url: str,
     *,
     token: str | None = None,
     wait_seconds: float = 25.0,
-    lease_seconds: int = 120,
+    lease_seconds: int = 30,
     once: bool = False,
     brain: Any = None,
 ) -> int:
@@ -153,6 +177,9 @@ async def run_worker(
             payload = admission.get("payload") or {}
             text = str(payload.get("text") or "")
             admission_id = str(admission.get("admission_id") or "")
+            keepalive = asyncio.create_task(
+                _keep_lease(client, admission_id, me, lease_seconds), name="leo-lease"
+            )
             try:
                 result = await app.ask(
                     text,
@@ -173,6 +200,9 @@ async def run_worker(
                     await client.fail(admission_id, f"{type(exc).__name__}: {exc}")
                 except (httpx.HTTPError, GatewayClientError):
                     pass
+            finally:
+                keepalive.cancel()
+                await asyncio.gather(keepalive, return_exceptions=True)
             if once:
                 return answered
     finally:

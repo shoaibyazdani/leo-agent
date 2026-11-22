@@ -386,13 +386,20 @@ class LeoApp:
         _LOG.info("LEO initialized", extra={"db": str(self.settings.db_path)})
         return self
 
-    async def start_background(self) -> None:
+    async def start_background(self, *, inbound: bool = True) -> None:
+        """Start the long-lived loops.
+
+        ``inbound=False`` leaves polling to a gateway process. Two pollers on one
+        bot token fight over ``getUpdates`` and one of them loses messages, so a
+        brain running beside a gateway must not poll, even when all it wants is
+        the dashboard.
+        """
         await self.initialize()
         if self._scheduler_task is None or self._scheduler_task.done():
             self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="leo-scheduler")
         if self._gateway_task is None or self._gateway_task.done():
             self._gateway_task = asyncio.create_task(self._gateway_loop(), name="leo-gateway-outbox")
-        if self._inbound_task is None or self._inbound_task.done():
+        if inbound and (self._inbound_task is None or self._inbound_task.done()):
             self._inbound_task = asyncio.create_task(self._inbound_loop(), name="leo-gateway-inbound")
 
     async def _inbound_loop(self) -> None:
