@@ -147,6 +147,10 @@ def serve(
     host: str | None = None,
     port: int | None = None,
     worker: bool = typer.Option(False, "--worker", help="Answer turns claimed from a gateway"),
+    no_inbound: bool = typer.Option(
+        False, "--no-inbound",
+        help="Serve the API/dashboard but leave polling to a gateway process",
+    ),
     gateway_url: str | None = typer.Option(None, "--gateway-url", help="Gateway base URL"),
     once: bool = typer.Option(False, "--once", help="Answer one turn and exit"),
 ) -> None:
@@ -168,6 +172,9 @@ def serve(
     effective_port = port or settings.server.port
     if not 1 <= effective_port <= 65535:
         fail(f"invalid port: {effective_port} (expected 1-65535)", code=2)
+    if no_inbound:
+        # uvicorn imports the module-level app, so the switch travels by env.
+        os.environ["LEO_DISABLE_INBOUND"] = "1"
     uvicorn.run(
         "leo.interfaces.api:api",
         host=effective_host,

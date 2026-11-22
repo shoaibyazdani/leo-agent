@@ -109,7 +109,7 @@ class GatewayStore:
         return await self.admission(str(row[0]))
 
     # --------------------------------------------------------------------- queue
-    async def claim(self, worker: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+    async def claim(self, worker: str, lease_seconds: int = 30) -> dict[str, Any] | None:
         """Lease the oldest claimable admission, or None when the queue is empty."""
         now = _now()
         async with db.transaction() as conn:
@@ -139,6 +139,23 @@ class GatewayStore:
             record["claimed_by"] = worker
             record["lease_expires_at"] = _iso(now + timedelta(seconds=lease_seconds))
         return record
+
+    async def renew(self, admission_id: str, worker: str, lease_seconds: int = 30) -> bool:
+        """Extend a live lease. False when the caller no longer holds it.
+
+        A brain that is still working must be able to say so: without renewal the
+        only signal a lease gives is the passage of time, so a slow-but-healthy
+        turn competes with a dead one. Renewal separates "alive" from "expired".
+        """
+        now = _now()
+        cursor = await db.execute(
+            "UPDATE gateway_queue SET claim_expires_at=?, updated_at=? "
+            "WHERE admission_id=? AND status=? AND claimed_by=? "
+            "AND claim_expires_at IS NOT NULL AND claim_expires_at > ?",
+            (_iso(now + timedelta(seconds=lease_seconds)), _iso(now), admission_id,
+             ADMISSION_CLAIMED, worker, _iso(now)),
+        )
+        return bool(getattr(cursor, "rowcount", 0))
 
     async def complete(self, admission_id: str) -> None:
         now = _iso(_now())
