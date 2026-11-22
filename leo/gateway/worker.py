@@ -135,17 +135,98 @@ def resolve_token(token: str | None = None) -> str:
     return stored
 
 
+DEFAULT_TURN_MAX_SECONDS = 600.0
+
+
 async def _keep_lease(
-    client: GatewayClient, admission_id: str, worker: str, lease_seconds: int
+    client: GatewayClient,
+    admission_id: str,
+    worker: str,
+    lease_seconds: int,
+    max_seconds: float = DEFAULT_TURN_MAX_SECONDS,
 ) -> None:
-    """Renew a lease while a turn runs, so a slow brain does not look dead."""
+    """Renew a lease while a turn runs, but never past ``max_seconds``.
+
+    Renewal exists so a slow turn is not mistaken for a dead one. Without a
+    ceiling it does the opposite: a turn that is genuinely stuck keeps renewing
+    forever, so it can never expire, never gets retried, and from the outside
+    looks exactly like a busy worker. After the ceiling the renewals stop, the
+    lease runs out and the queue hands the work to someone else with the attempt
+    counted.
+    """
     interval = max(1.0, lease_seconds / 3)
+    deadline = asyncio.get_running_loop().time() + max(0.0, float(max_seconds))
     while True:
         await asyncio.sleep(interval)
+        if asyncio.get_running_loop().time() >= deadline:
+            _LOG.warning(
+                "turn exceeded its maximum lifetime; letting the lease expire",
+                extra={"admission_id": admission_id, "max_seconds": max_seconds},
+            )
+            return
         try:
             await client.renew(admission_id, worker, lease_seconds)
         except (httpx.HTTPError, GatewayClientError):
             continue  # a transient gateway blip must not abort the turn
+
+
+async def _claim_loop(
+    client: GatewayClient,
+    app: Any,
+    me: str,
+    *,
+    wait_seconds: float,
+    lease_seconds: int,
+    once: bool,
+    turn_max_seconds: float,
+) -> int:
+    """One claim/answer loop. Several of these share a client and a brain."""
+    answered = 0
+    while True:
+        try:
+            admission = await client.claim(me, lease_seconds=lease_seconds,
+                                           wait_seconds=wait_seconds)
+        except (httpx.HTTPError, GatewayClientError) as exc:
+            _LOG.warning("gateway unreachable, retrying", extra={"error": str(exc)})
+            await asyncio.sleep(2.0)
+            continue
+        if admission is None:
+            if once:
+                return answered
+            continue
+
+        payload = admission.get("payload") or {}
+        text = str(payload.get("text") or "")
+        admission_id = str(admission.get("admission_id") or "")
+        keepalive = asyncio.create_task(
+            _keep_lease(client, admission_id, me, lease_seconds, turn_max_seconds),
+            name="leo-lease",
+        )
+        try:
+            result = await app.ask(
+                text,
+                channel=str(admission.get("channel") or "gateway"),
+                subject=str(admission.get("subject") or ""),
+                conversation_id=admission.get("conversation_id") or None,
+            )
+            answer = str(result.get("content") or "")
+            await client.complete(admission_id, answer,
+                                  str(result.get("conversation_id") or ""))
+            answered += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # a broken turn must not stop the worker
+            _LOG.warning("turn failed", extra={"admission_id": admission_id,
+                                               "error": str(exc)})
+            try:
+                await client.fail(admission_id, f"{type(exc).__name__}: {exc}")
+            except (httpx.HTTPError, GatewayClientError):
+                pass
+        finally:
+            keepalive.cancel()
+            await asyncio.gather(keepalive, return_exceptions=True)
+        if once:
+            return answered
 
 
 async def run_worker(
@@ -156,8 +237,15 @@ async def run_worker(
     lease_seconds: int = 30,
     once: bool = False,
     brain: Any = None,
+    concurrency: int = 1,
+    turn_max_seconds: float = DEFAULT_TURN_MAX_SECONDS,
 ) -> int:
-    """Claim and answer turns until cancelled. Returns the number answered."""
+    """Claim and answer turns until cancelled. Returns the number answered.
+
+    ``concurrency`` runs that many claim loops against one brain. A single loop
+    is head-of-line blocking: one long turn leaves every later message queued,
+    which looks to a user exactly like the bot being down.
+    """
     from .. import db
     from ..core.app import LeoApp
 
@@ -180,51 +268,22 @@ async def run_worker(
     app = brain or LeoApp()
     await app.initialize()
     me = worker_id()
-    answered = 0
-    try:
-        while True:
-            try:
-                admission = await client.claim(me, lease_seconds=lease_seconds,
-                                               wait_seconds=wait_seconds)
-            except (httpx.HTTPError, GatewayClientError) as exc:
-                _LOG.warning("gateway unreachable, retrying", extra={"error": str(exc)})
-                await asyncio.sleep(2.0)
-                continue
-            if admission is None:
-                if once:
-                    return answered
-                continue
 
-            payload = admission.get("payload") or {}
-            text = str(payload.get("text") or "")
-            admission_id = str(admission.get("admission_id") or "")
-            keepalive = asyncio.create_task(
-                _keep_lease(client, admission_id, me, lease_seconds), name="leo-lease"
-            )
-            try:
-                result = await app.ask(
-                    text,
-                    channel=str(admission.get("channel") or "gateway"),
-                    subject=str(admission.get("subject") or ""),
-                    conversation_id=admission.get("conversation_id") or None,
-                )
-                answer = str(result.get("content") or "")
-                await client.complete(admission_id, answer,
-                                      str(result.get("conversation_id") or ""))
-                answered += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # a broken turn must not stop the worker
-                _LOG.warning("turn failed", extra={"admission_id": admission_id,
-                                                   "error": str(exc)})
-                try:
-                    await client.fail(admission_id, f"{type(exc).__name__}: {exc}")
-                except (httpx.HTTPError, GatewayClientError):
-                    pass
-            finally:
-                keepalive.cancel()
-                await asyncio.gather(keepalive, return_exceptions=True)
-            if once:
-                return answered
+    loops = [
+        asyncio.create_task(
+            _claim_loop(client, app, f"{me}:{index + 1}",
+                        wait_seconds=wait_seconds, lease_seconds=lease_seconds,
+                        once=once, turn_max_seconds=turn_max_seconds),
+            name=f"leo-claim-{index + 1}",
+        )
+        for index in range(max(1, int(concurrency)))
+    ]
+    try:
+        results = await asyncio.gather(*loops, return_exceptions=True)
     finally:
+        for task in loops:
+            task.cancel()
+        await asyncio.gather(*loops, return_exceptions=True)
         await client.aclose()
+
+    return sum(result for result in results if isinstance(result, int))

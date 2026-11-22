@@ -153,12 +153,21 @@ def serve(
     ),
     gateway_url: str | None = typer.Option(None, "--gateway-url", help="Gateway base URL"),
     once: bool = typer.Option(False, "--once", help="Answer one turn and exit"),
+    concurrency: int = typer.Option(
+        1, "--concurrency", min=1, max=32,
+        help="Turns answered in parallel; 1 means a long turn blocks the queue",
+    ),
+    turn_max_seconds: float = typer.Option(
+        600.0, "--turn-max-seconds",
+        help="Stop renewing a lease after this long, so a stuck turn can be retried",
+    ),
 ) -> None:
     """Start the local HTTP API and web dashboard, or run as a gateway worker."""
     import uvicorn
 
     if worker:
-        _serve_worker(gateway_url or os.getenv("LEO_GATEWAY_URL"), once=once)
+        _serve_worker(gateway_url or os.getenv("LEO_GATEWAY_URL"), once=once,
+                      concurrency=concurrency, turn_max_seconds=turn_max_seconds)
         return
 
     settings = _settings()
@@ -183,7 +192,8 @@ def serve(
     )
 
 
-def _serve_worker(url: str | None, *, once: bool = False) -> None:
+def _serve_worker(url: str | None, *, once: bool = False, concurrency: int = 1,
+                  turn_max_seconds: float = 600.0) -> None:
     """Run the brain against a gateway instead of owning the channels."""
     import asyncio
 
@@ -194,7 +204,8 @@ def _serve_worker(url: str | None, *, once: bool = False) -> None:
     from ..gateway.worker import GatewayClientError, run_worker
 
     try:
-        answered = asyncio.run(run_worker(url, once=once))
+        answered = asyncio.run(run_worker(url, once=once, concurrency=concurrency,
+                                          turn_max_seconds=turn_max_seconds))
     except GatewayClientError as exc:
         fail(str(exc), code=2)
         return
