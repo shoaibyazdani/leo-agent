@@ -818,11 +818,26 @@ async def title_command(ctx: CommandContext) -> CommandResult:
 
 
 async def stop_command(ctx: CommandContext) -> CommandResult:
+    """Stop work. With no id, stop the turn that is running right now.
+
+    A slash command can arrive while another worker is busy with a long turn, so
+    "stop" is a request the live turn observes between steps - not a process kill
+    and not a promise that an in-flight tool call is interrupted mid-command.
+    """
     run_id = ctx.argv[0] if ctx.argv else ctx.run_id
-    if not run_id:
-        raise ValueError("/stop needs a run id (or a streaming command context with run_id)")
-    outcome = await ctx.app.cancel_run(run_id)
-    return _summary(ctx, "stop", f"Run {run_id}: {outcome}", {"run_id": run_id, "status": outcome})
+    if run_id:
+        outcome = await ctx.app.cancel_run(run_id)
+        return _summary(ctx, "stop", f"Run {run_id}: {outcome}", {"run_id": run_id, "status": outcome})
+    conversation_id = ctx.conversation_id
+    if not conversation_id:
+        raise ValueError("/stop needs a run id here; no conversation is attached to this surface")
+    await ctx.app.request_turn_stop(conversation_id, requested_by=f"slash:{ctx.principal or ctx.channel}")
+    await _audit(ctx, "slash.stop", conversation_id, "turn stop requested via slash")
+    return _summary(
+        ctx, "stop",
+        "⏹ Stopping — this turn ends at its next step.",
+        {"conversation_id": conversation_id, "stopping": True},
+    )
 
 
 async def diff_command(ctx: CommandContext) -> CommandResult:
@@ -1494,7 +1509,7 @@ UNAVAILABLE: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
     ("branch", ("fork",), "[--here] [name]", "Branch or fork the current conversation",
      "LEO can create a new conversation (/new) but cannot copy an existing transcript into a branch."),
     ("steer", ("tell", "s"), "<prompt>", "Inject guidance into a running turn",
-     "No mid-turn message injection hook exists; /stop can cancel a live run."),
+     "Mid-turn text injection is not supported; /stop ends the live turn at its next step."),
     ("queue", ("q",), "<prompt>|list|rm N|clear", "Queue prompts for later turns",
      "LEO has no shared prompt queue; tasks are durable objectives (/tasks create)."),
     ("bg", ("background",), "<prompt>", "Run a prompt in a background session",

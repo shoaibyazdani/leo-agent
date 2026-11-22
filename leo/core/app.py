@@ -46,6 +46,10 @@ DURABLE_SUBSCRIPTIONS: tuple[tuple[str, str], ...] = (
 # the model can consume the last round's results and produce a final answer.
 # The last allowed model call can therefore only answer; if it asks for more
 # tools those calls are left unexecuted and reported as pending.
+class TurnStopped(Exception):
+    """The operator asked the live turn to stop; not a model or tool failure."""
+
+
 # Default tool-executing rounds per chat turn. An operator can raise it with
 # settings.max_chat_tool_rounds; this constant is only the fallback.
 MAX_CHAT_TOOL_ROUNDS = 250
@@ -248,6 +252,44 @@ class LeoApp:
         self._finish_run(run_id, status)
         self._cancelled_runs.discard(run_id)
         self._runs.pop(run_id, None)
+
+    # -- turn stop ---------------------------------------------------------
+    async def request_turn_stop(self, conversation_id: str, requested_by: str = "operator") -> bool:
+        """Ask the live turn for a conversation to stop at its next step.
+
+        A stop crosses processes: the command may be handled by one worker loop
+        while another runs the turn, so the request lives in SQLite, not in this
+        process's memory.
+        """
+        if not conversation_id:
+            return False
+        await db.execute(
+            "INSERT INTO turn_cancels(conversation_id, requested_at, requested_by) "
+            "VALUES(?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET "
+            "requested_at=excluded.requested_at, requested_by=excluded.requested_by",
+            (str(conversation_id), utcnow(), str(requested_by)),
+        )
+        return True
+
+    async def _turn_stop_requested(self, conversation_id: str, since: str) -> bool:
+        """True when a stop was requested after this turn started."""
+        try:
+            row = await db.fetchone(
+                "SELECT requested_at FROM turn_cancels WHERE conversation_id=?",
+                (str(conversation_id),),
+            )
+        except Exception:  # noqa: BLE001 - a stop lookup must never break a turn
+            return False
+        if row is None:
+            return False
+        return str(row["requested_at"]) >= str(since)
+
+    async def _clear_turn_stop(self, conversation_id: str) -> None:
+        try:
+            await db.execute("DELETE FROM turn_cancels WHERE conversation_id=?",
+                             (str(conversation_id),))
+        except Exception:  # noqa: BLE001
+            pass
 
     async def cancel_run(self, run_id: str) -> str:
         """Cancel a live run; unknown or terminal runs are rejected truthfully."""
@@ -1911,6 +1953,10 @@ class LeoApp:
         # Live progress only where a human is watching; a CLI turn has no adapter
         # and begin() declines quietly.
         self.progress.begin(channel, str(subject or ""), self.round_budget)
+        # A stop only counts if it arrives during THIS turn: clear any leftover
+        # request first, then remember when the turn started.
+        await self._clear_turn_stop(conversation_id)
+        turn_started = utcnow()
         if text.lstrip().startswith("/"):
             # Slash input is an explicit command invocation, not a prompt. One
             # user row and one assistant row bracket the dispatch; no model call
@@ -2037,6 +2083,8 @@ class LeoApp:
             # consume the final tool results (the N+1 invariant). A round whose
             # calls were all repeats also jumps straight to that reserved call.
             for iteration in range(self.round_budget + 1):
+                if await self._turn_stop_requested(conversation_id, turn_started):
+                    raise TurnStopped(conversation_id)
                 final_call = force_final or iteration == self.round_budget
                 if final_call:
                     self._append_final_answer_instruction(request)
@@ -2096,6 +2144,8 @@ class LeoApp:
                             task_id=conversation_id,
                         )
                         try:
+                            if await self._turn_stop_requested(conversation_id, turn_started):
+                                raise TurnStopped(conversation_id)
                             result = await self.executor.execute(call)
                             self.progress.note(name, arguments, getattr(result, "success", None))
                             result_content = json.dumps(result.model_dump(mode="json"), default=str)
@@ -2171,6 +2221,35 @@ class LeoApp:
                 "simulated": self._model_provenance()[0],
                 "model_status": self._model_provenance()[1],
             }
+        except TurnStopped:
+            # The operator asked for this. Persist one truthful row, close the
+            # progress message, and report "cancelled" - never "error".
+            await self._clear_turn_stop(conversation_id)
+            await self.progress.end("stopped")
+            stopped_content = "⏹ Stopped at your request."
+            await db.execute(
+                "INSERT INTO messages(conversation_id,role,content,metadata,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (conversation_id, "assistant", stopped_content,
+                 json.dumps({"run_status": "cancelled", "tool_calls": [],
+                             "tool_calls_pending": []}, default=str), utcnow()),
+            )
+            await db.execute("UPDATE conversations SET updated_at=? WHERE id=?",
+                             (utcnow(), conversation_id))
+            await self.events.emit("chat.stopped", conversation_id=conversation_id,
+                                   channel=channel)
+            return {
+                "conversation_id": conversation_id,
+                "content": stopped_content,
+                "provider": "", "model": "",
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                "memories_used": [],
+                "tool_results": [],
+                "tool_calls_pending": [],
+                "status": "cancelled",
+                "simulated": self._model_provenance()[0],
+                "model_status": self._model_provenance()[1],
+            }
         except Exception as exc:  # noqa: BLE001 - never surface an opaque 500
             # A failed model turn is terminal, not an opaque FastAPI 500: the
             # transcript gets one error row and the API gets a ChatResponse.
@@ -2197,6 +2276,10 @@ class LeoApp:
         run_id = new_id("run")
         conversation_id = conversation_id or new_id("conv")
         self.progress.begin(channel, str(subject or ""), self.round_budget)
+        # A stop only counts if it arrives during THIS turn: clear any leftover
+        # request first, then remember when the turn started.
+        await self._clear_turn_stop(conversation_id)
+        turn_started = utcnow()
         seq = 0
         final_row_id: int | None = None
 
@@ -2372,6 +2455,8 @@ class LeoApp:
 
             for iteration in range(self.round_budget + 1):
                 cancellation_guard()
+                if await self._turn_stop_requested(conversation_id, turn_started):
+                    raise TurnStopped(conversation_id)
                 final_call = force_final or iteration == self.round_budget
                 if final_call:
                     self._append_final_answer_instruction(request)
@@ -2499,6 +2584,8 @@ class LeoApp:
                             correlation_id=conversation_id, task_id=conversation_id,
                         )
                         try:
+                            if await self._turn_stop_requested(conversation_id, turn_started):
+                                raise TurnStopped(conversation_id)
                             result = await self.executor.execute(call)
                             self.progress.note(name, arguments, getattr(result, "success", None))
                             result_content = json.dumps(result.model_dump(mode="json"), default=str)
@@ -2627,6 +2714,12 @@ class LeoApp:
             yield ev(type="status", status="cancelled")
             self._end_run(run_id, "cancelled")
             yield ev(type="run.finished", status="cancelled")
+        except TurnStopped:
+            await self._clear_turn_stop(conversation_id)
+            await self.progress.end("stopped")
+            yield ev(type="assistant.message", content="⏹ Stopped at your request.")
+            yield ev(type="run.finished", status="cancelled")
+            return
         except Exception as exc:  # noqa: BLE001 - stream must report failures to the client
             code, content = self._model_error_content(exc)
             # Model failures are a terminal "error" turn (matching ask() and
