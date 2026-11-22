@@ -33,7 +33,7 @@ from ..logging import get_logger
 _LOG = get_logger("integrations.progress")
 
 DEFAULT_INTERVAL_SECONDS = 4.0
-DEFAULT_IDLE_SECONDS = 45.0
+DEFAULT_IDLE_SECONDS = 20.0
 DEFAULT_MAX_STEPS = 3
 ARGUMENT_PREVIEW_CHARS = 52
 
@@ -106,8 +106,15 @@ class ProgressReporter:
         self.failed = 0
 
     # -- lifecycle ---------------------------------------------------------
-    def begin(self, channel: str, target: str, budget: int = 0) -> bool:
-        """Start reporting for one turn. Returns False when nothing will be sent."""
+    async def begin(self, channel: str, target: str, budget: int = 0) -> bool:
+        """Start reporting for one turn. Returns False when nothing will be sent.
+
+        A previous report is closed first: two open "⏳ Working" messages in one
+        chat is how a log looks broken — the older one freezes at its last step
+        while the new turn starts another.
+        """
+        if self._active:
+            await self.end("done")
         if not self.enabled or not channel or not target:
             return False
         # Built-in surfaces have no outbound adapter: a CLI turn has no chat to

@@ -1952,7 +1952,7 @@ class LeoApp:
         conversation_id = conversation_id or new_id("conv")
         # Live progress only where a human is watching; a CLI turn has no adapter
         # and begin() declines quietly.
-        self.progress.begin(channel, str(subject or ""), self.round_budget)
+        await self.progress.begin(channel, str(subject or ""), self.round_budget)
         # A stop only counts if it arrives during THIS turn: clear any leftover
         # request first, then remember when the turn started.
         await self._clear_turn_stop(conversation_id)
@@ -2275,7 +2275,7 @@ class LeoApp:
         text = self._redact(text)
         run_id = new_id("run")
         conversation_id = conversation_id or new_id("conv")
-        self.progress.begin(channel, str(subject or ""), self.round_budget)
+        await self.progress.begin(channel, str(subject or ""), self.round_budget)
         # A stop only counts if it arrives during THIS turn: clear any leftover
         # request first, then remember when the turn started.
         await self._clear_turn_stop(conversation_id)
