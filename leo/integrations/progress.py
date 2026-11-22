@@ -226,7 +226,7 @@ class ProgressReporter:
         try:
             adapter = self.gateway._adapter(self._channel)  # noqa: SLF001 - same package
             if not self._message_id:
-                result = await adapter.send(self._target, text)
+                result = await adapter.send(self._target, text, silent=True)
                 if isinstance(result, dict):
                     self._message_id = str(result.get("message_id") or "")
                 self._last_text = text
@@ -241,7 +241,7 @@ class ProgressReporter:
                 if not edited:
                     # A message can be edited only for 48h and only if it still
                     # exists; when that fails, start a fresh one for the rest.
-                    result = await adapter.send(self._target, text)
+                    result = await adapter.send(self._target, text, silent=True)
                     if isinstance(result, dict):
                         self._message_id = str(result.get("message_id") or "")
                     self.sent += 1

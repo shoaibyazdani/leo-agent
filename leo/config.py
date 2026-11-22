@@ -160,6 +160,10 @@ class ModelProviderConfig(BaseModel):
     cost_per_million_output: float = 0.0
     timeout_seconds: float = 120.0
     max_retries: int = 2
+    # Output-token ceiling per turn. A reasoning model spends this budget on
+    # thinking first; too small a ceiling produces a turn with no text and no tool
+    # call, which is refused as an empty response.
+    max_tokens: int = 32_000
     # Non-secret headers required by some gateways, e.g. x-opencode-session.
     # Secret header VALUES are never stored: use extra_header_env instead.
     extra_headers: dict[str, str] = Field(default_factory=dict)

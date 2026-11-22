@@ -20,10 +20,12 @@ class FakeAdapter:
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.silent: list[bool] = []
         self.edits: list[tuple[str, str, str]] = []
         self.fail_send = False
 
-    async def send(self, target: str, text: str, *, reply_markup=None):
+    async def send(self, target: str, text: str, *, reply_markup=None, silent=False):
+        self.silent.append(bool(silent))
         if self.fail_send:
             raise RuntimeError("network down")
         self.sent.append((str(target), text))
@@ -214,3 +216,15 @@ async def test_a_new_turn_closes_the_previous_report(env) -> None:
     assert any("✅" in text for text in closing), "the previous report must be closed"
     assert reporter.stats()["active"] is True
     await reporter.end("done")
+
+
+async def test_every_progress_line_is_silent(env) -> None:
+    """The reporter must never ring the phone — the answer itself still notifies."""
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "ls"})
+    await reporter._flush(force=True)
+    await reporter.end("done")
+
+    assert env.adapter.silent, "the reporter sent nothing"
+    assert all(env.adapter.silent), "every progress line must be silent"
