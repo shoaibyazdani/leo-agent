@@ -23,6 +23,7 @@ from typing import Any, Mapping
 
 from ..contracts import RiskLevel, ToolSpec
 from ..integrations.gateway import GatewayError
+from ..integrations.messaging import MessagingError
 from .registry import ToolRegistry
 
 _CHANNEL_SERVICE_KEYS = ("channels", "channel_registry", "channel_adapters", "registry")
@@ -232,9 +233,14 @@ async def _channel_send(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, 
 
     try:
         result = await gateway.send(
-            channel, target, text, subject=args.get("subject")
+            channel, target, text, subject=args.get("subject"),
+            media=args.get("media"), caption=args.get("caption"),
         )
     except GatewayError as exc:
+        return await _blocked(ctx, channel, target, f"gateway refused send: {exc}")
+    except MessagingError as exc:
+        # Path outside the outbound whitelist, missing/oversized file, or a
+        # channel with no attachment support. Not "sent", so report blocked.
         return await _blocked(ctx, channel, target, f"gateway refused send: {exc}")
     if not isinstance(result, Mapping):
         return await _blocked(
@@ -338,6 +344,22 @@ _SPECS: tuple[tuple[ToolSpec, Any], ...] = (
                     "target": {"type": "string", "minLength": 1},
                     "text": {"type": "string", "minLength": 1},
                     "subject": {"type": "string", "minLength": 1},
+                    "media": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Optional local attachment. Must resolve inside the outbound "
+                            "media directory (.leo/media/outbound); anything else is "
+                            "refused. 50 MB max."
+                        ),
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": (
+                            "Optional attachment caption. Defaults to `text`; Telegram "
+                            "truncates at 1024 characters."
+                        ),
+                    },
                 },
                 "required": ["channel", "target", "text"],
                 "additionalProperties": False,

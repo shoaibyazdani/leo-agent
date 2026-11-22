@@ -17,6 +17,7 @@ import json
 import time
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, NamedTuple
 
 from .. import db
@@ -26,11 +27,13 @@ from ..events import Event, EventBus
 from ..security.permissions import PermissionManagerImpl, arguments_digest
 from .admission import ChannelAdmission
 from .messaging import (
+    OUTBOUND_MEDIA_DIRNAME,
     MessagingError,
     MessagingAdapter,
     NormalizedMessage,
     implements_polling,
     implements_webhook,
+    resolve_outbound_media,
 )
 from .transport_state import TransportState
 
@@ -133,6 +136,7 @@ class Gateway:
         actor: str = "gateway",
         admission: ChannelAdmission | None = None,
         webhook_replay_window: float | None = WEBHOOK_REPLAY_WINDOW_SECONDS,
+        outbound_media_root: str | Path | None = None,
     ) -> None:
         self.adapters: dict[str, MessagingAdapter] = dict(adapters or {})
         self.attachment_sink: Callable[[str, dict[str, Any]], Awaitable[str | None]] | None = None
@@ -144,6 +148,10 @@ class Gateway:
         self.admission = admission or ChannelAdmission()
         # None/0 disables dedupe (useful for explicit replay-style integrations).
         self.webhook_replay_window = webhook_replay_window
+        # Whitelist root for outbound attachments, fixed for this gateway's
+        # lifetime. Every per-send argument is confined to it, so no caller can
+        # widen the whitelist by naming a different root.
+        self.outbound_media_root = outbound_media_root
         # Optional app-level hook used by drain_outbox(). Set from the
         # composition root after the agent engine exists.
         self._reply_handler: OutboxHandler | None = None
@@ -773,6 +781,8 @@ class Gateway:
         subject: str | None = None,
         approval_id: str | None = None,
         idempotency_key: str | None = None,
+        media: str | Path | None = None,
+        caption: str | None = None,
     ) -> dict[str, Any]:
         """Send one outbound message through the channel's adapter.
 
@@ -780,16 +790,36 @@ class Gateway:
         ``arguments_digest``; replaying an approval with changed arguments is
         rejected by the permission manager. ``idempotency_key`` (the outbox id
         in the delivery path) makes an accepted external send replay-safe.
+
+        ``media`` adds one local attachment. The resolved path is part of the
+        digested arguments, so an approved text send cannot be turned into an
+        approved *file* send (or one file swapped for another) by replaying the
+        approval id.
         """
         adapter = self._adapter(channel)
         subject = subject or str(target)
         target_str = str(target)
+        media_path: Path | None = None
+        if media is not None and str(media).strip() != "":
+            # Confine and canonicalize before authorizing: the digest must cover
+            # the file that will actually be read, not the string that was typed.
+            media_path = resolve_outbound_media(media, self.outbound_media_root)
+            if not callable(getattr(adapter, "send_media", None)):
+                raise MessagingError(f"{channel} does not support outbound media")
         # The resource is the immutable destination, never a caller-chosen
         # subject: changing only the subject must not forge a new resource.
         resource = f"{channel}:{target_str}"
         send_arguments = {
             "channel": channel, "target": target_str, "text": str(text), "subject": subject,
         }
+        if media_path is not None:
+            # Keys are added only when media is actually attached so existing
+            # text-only digests stay byte-identical (no spurious approval churn).
+            send_arguments["media"] = str(media_path)
+            send_arguments["media_bytes"] = media_path.stat().st_size
+            send_arguments["caption"] = (
+                str(caption) if caption is not None else str(text)
+            )
         digest = arguments_digest(send_arguments)
         # Authorize before any state change: a denied send must not leave an
         # empty conversation behind (receive() follows the same ordering).
@@ -815,7 +845,15 @@ class Gateway:
                     return {**prior, "duplicate": True, "idempotency_key": str(idempotency_key)}
         conversation_id = await self._conversation(channel, subject)
         try:
-            result = await adapter.send(target, text)
+            if media_path is not None:
+                result = await adapter.send_media(
+                    target,
+                    media_path,
+                    caption=str(caption) if caption is not None else str(text),
+                    root=self.outbound_media_root,
+                )
+            else:
+                result = await adapter.send(target, text)
             if not isinstance(result, Mapping):
                 raise MessagingError(f"{channel} adapter returned an invalid send result")
         except Exception as exc:
@@ -833,6 +871,11 @@ class Gateway:
             "provider_message_id": result.get("message_id"),
             "idempotency_key": idempotency_key,
         }
+        if media_path is not None:
+            # Name and size only: the absolute local path is not stored in the
+            # conversation row or replayed in the ``gateway.sent`` event.
+            metadata["media"] = media_path.name
+            metadata["media_bytes"] = result.get("media_bytes", media_path.stat().st_size)
         response = {
             **result, "conversation_id": conversation_id, "subject": subject,
             "duplicate": False, "idempotency_key": idempotency_key,
