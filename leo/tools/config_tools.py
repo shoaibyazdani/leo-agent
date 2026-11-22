@@ -157,6 +157,14 @@ def _config_roots(ctx: Mapping[str, Any]) -> list[Path]:
         settings.paths.logs, settings.paths.exports,
     ):
         roots.append(settings.resolve(path).resolve())
+    # The operator's own config file is readable even when it lives outside the
+    # workspace - inspecting LEO's configuration is what these tools are for, and
+    # ~/.config/leo/leo.yaml is the normal install location. Only the path the
+    # *operator* declared via LEO_CONFIG is added; a caller-supplied config_path
+    # is still validated against the roots, so a model cannot widen its own reach.
+    declared = os.getenv("LEO_CONFIG")
+    if declared:
+        roots.append(Path(declared).expanduser().resolve())
     return roots
 
 

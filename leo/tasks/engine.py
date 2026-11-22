@@ -756,7 +756,28 @@ class DurableTaskEngine:
         evidence: list[dict[str, Any]],
         note: str | None = None,
     ) -> TaskRecord:
-        """Mark a task COMPLETED. Evidence is mandatory and cannot be asserted by a model."""
+        """Mark a task COMPLETED. Evidence is mandatory and cannot be asserted by a model.
+
+        Completion is not cancellable once it starts. A worker that calls
+        ``complete()`` and then stalls can hit the task deadline mid-write; if the
+        cancellation aborted the write, a finished task would be recorded FAILED.
+        The evidence-backed write is allowed to land first, then the cancellation
+        is re-raised so shutdown semantics are unchanged.
+        """
+        pending = asyncio.ensure_future(self._complete_impl(task_id, result, evidence, note))
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            await pending            # land the completion, then unwind
+            raise
+
+    async def _complete_impl(
+        self,
+        task_id: str,
+        result: Any,
+        evidence: list[dict[str, Any]],
+        note: str | None = None,
+    ) -> TaskRecord:
         evidence = _validate_evidence(evidence)
         task = await self._load(task_id)
         self._ensure_mutable(task, "complete")

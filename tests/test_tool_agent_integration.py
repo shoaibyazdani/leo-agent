@@ -7,6 +7,8 @@ executor's service context is never monkeypatched.
 
 from __future__ import annotations
 
+import sys
+
 import asyncio
 import json
 from pathlib import Path
@@ -74,8 +76,15 @@ async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     assert len(registrars) == 24, sorted(registrars)
     assert {"preview_tools", "http_tools", "conversation_tools"} <= set(registrars)
     assert sum(len(value) for value in registrars.values()) == 79
-    assert len(app.tool_roster["operator_tools"]) == 9
-    assert len(names) == 97
+    # The operator registrar declares 9 specs, but four of them drive the macOS
+    # desktop through osascript/screencapture/pbcopy and are only registered on
+    # darwin - on any other platform they would be advertised and then fail at
+    # call time. So the roster is platform-correct, not truncated by accident:
+    # assert the 5 browser tools everywhere, and the full 9 only where the
+    # computer tools can actually run.
+    operator_specs = 9 if sys.platform == "darwin" else 5
+    assert len(app.tool_roster["operator_tools"]) == operator_specs
+    assert len(names) == 88 + operator_specs
     assert "json_query" not in names  # operator/offline only, never model-callable
     assert all(app.tool_roster.values())
     for roster_names in app.tool_roster.values():

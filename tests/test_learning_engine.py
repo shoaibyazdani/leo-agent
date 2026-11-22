@@ -880,14 +880,28 @@ async def test_stale_pending_proposals_expire_as_state_changes_only(env):
 
 
 async def test_pending_ttl_expires_by_elapsed_time(env):
+    # A sub-second TTL races the test's own I/O: the writes around a proposal can
+    # take longer than the TTL on a slow disk, so "not expired yet" became a
+    # timing lottery. Give the proposal a TTL no local write can outrun, then move
+    # its durable expiry into the past - elapsed time is simulated, the engine's
+    # decision is still its own.
     engine = LearningEngine(
-        env.store, env.bus, env.permissions, env.settings, pending_ttl_seconds=0.2,
+        env.store, env.bus, env.permissions, env.settings, pending_ttl_seconds=60,
     )
     proposal = await engine.propose(NoteDraft(
         content="LEO durable fact quick is stable", source_kind="user",
     ))
     assert await engine.expire_stale_proposals() == []
-    await asyncio.sleep(0.3)
+
+    row = await db.fetchone(
+        "SELECT key, value FROM kv WHERE key LIKE ?", (f"%proposal:{proposal['id']}",)
+    )
+    assert row is not None, "proposal row not found in kv"
+    payload = json.loads(row["value"])
+    payload["expires_at"] = "2000-01-01T00:00:00+00:00"
+    await db.execute(
+        "UPDATE kv SET value=? WHERE key=?", (json.dumps(payload), row["key"])
+    )
     expired = await engine.expire_stale_proposals()
     assert [item["id"] for item in expired] == [proposal["id"]]
     assert (await engine.proposal(proposal["id"]))["status"] == "expired"
