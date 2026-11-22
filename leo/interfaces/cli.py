@@ -217,6 +217,111 @@ def gateway_run(
     run_gateway(host=host, port=port)
 
 
+@gateway_app.command("attach")
+def gateway_attach(
+    url: str = typer.Option("http://127.0.0.1:8766", help="gateway base URL"),
+    ttl: int = typer.Option(300, help="ticket lifetime in seconds"),
+) -> None:
+    """Mint a single-use attach ticket for a worker (needs the master token)."""
+    import asyncio
+
+    import httpx
+
+    async def _mint() -> dict:
+        from ..gateway.worker import GatewayClientError, resolve_token
+
+        try:
+            bearer = resolve_token()
+        except GatewayClientError as exc:
+            fail(str(exc), code=2)
+            raise SystemExit(2)
+        async with httpx.AsyncClient(base_url=url.rstrip("/"),
+                                     headers={"Authorization": f"Bearer {bearer}"},
+                                     timeout=httpx.Timeout(20.0, connect=5.0)) as http:
+            response = await http.post("/v1/attach", params={"ttl_seconds": ttl})
+        if response.status_code != 200:
+            raise RuntimeError(f"attach failed: HTTP {response.status_code}")
+        return response.json()
+
+    try:
+        minted = asyncio.run(_mint())
+    except RuntimeError as exc:
+        fail(str(exc), code=1)
+        return
+    typer.echo(f"ticket:  {minted['ticket']}")
+    typer.echo(f"expires: {minted['expires_at']}")
+    typer.echo("")
+    typer.echo("Give it to one worker, then it is spent:")
+    typer.echo(f"  LEO_GATEWAY_TICKET={minted['ticket']} leo serve --worker --gateway-url {url}")
+
+
+@gateway_app.command("install")
+def gateway_install(
+    dry_run: bool = typer.Option(False, "--dry-run", help="print the unit, write nothing"),
+) -> None:
+    """Write the gateway's systemd unit from the shipped template."""
+    import shutil
+    from pathlib import Path
+
+    template = Path(__file__).resolve().parents[2] / "deploy" / "leo-gateway@.service"
+    if not template.exists():
+        fail(f"unit template missing: {template}", code=2)
+        return
+    unit_text = template.read_text()
+    target = Path("/etc/systemd/system/leo-gateway@.service")
+    if dry_run:
+        typer.echo(unit_text)
+        return
+    if not os.access("/etc/systemd/system", os.W_OK):
+        fail("writing the unit needs root: re-run with sudo", code=2)
+        return
+    shutil.copyfile(template, target)
+    typer.echo(f"wrote {target}")
+    typer.echo("then: systemctl daemon-reload && systemctl enable --now "
+               f"leo-gateway@{os.getenv('USER') or 'root'}.service")
+
+
+@gateway_app.command("list")
+def gateway_list() -> None:
+    """Show this home's gateway, whether it is up, and any live sessions."""
+    import asyncio
+    import json as _json
+
+    import httpx
+
+    from .. import db as _db
+    from ..gateway.store import GatewayStore
+
+    home = os.getenv("LEO_HOME") or os.path.expanduser("~/.config/leo")
+    url = os.getenv("LEO_GATEWAY_URL") or "http://127.0.0.1:8766"
+    typer.echo(f"home:    {home}")
+    typer.echo(f"gateway: {url}")
+
+    async def _health() -> dict | None:
+        from ..gateway.worker import GatewayClientError, resolve_token
+
+        try:
+            bearer = resolve_token()
+        except GatewayClientError:
+            return None
+        async with httpx.AsyncClient(base_url=url, headers={"Authorization": f"Bearer {bearer}"},
+                                     timeout=httpx.Timeout(10.0, connect=3.0)) as http:
+            response = await http.get("/health")
+        return response.json() if response.status_code == 200 else None
+
+    try:
+        health = asyncio.run(_health())
+    except Exception:
+        health = None
+    if health is None:
+        typer.echo("state:   unreachable (or no token)")
+        return
+    typer.echo(f"state:   up · pid {health.get('pid')}")
+    typer.echo(f"queue:   {health.get('queue')}")
+    typer.echo(f"cursor:  {health.get('cursors')}")
+    typer.echo(f"sessions:{_json.dumps(health.get('sessions') or {}, sort_keys=True)}")
+
+
 @gateway_app.command("status")
 def gateway_status(as_json: bool = typer.Option(False, "--json")) -> None:
     """Show queue depth, channel cursors and heartbeats without a server."""

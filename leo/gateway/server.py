@@ -26,6 +26,7 @@ from ..integrations.channels import default_adapters, polling_channels
 from ..integrations.messaging import implements_polling
 from ..integrations.secrets import credential
 from ..integrations.transport_state import TransportState
+from .sessions import SessionStore
 from .store import GatewayStore
 
 _LOG = logging.getLogger(__name__)
@@ -57,11 +58,13 @@ class FailRequest(BaseModel):
     retry: bool = True
 
 
-def _bearer(authorization: str | None, token: str) -> None:
+def _presented(authorization: str | None) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
-    if authorization.removeprefix("Bearer ").strip() != token:
-        raise HTTPException(status_code=401, detail="bad token")
+    value = authorization.removeprefix("Bearer ").strip()
+    if not value:
+        raise HTTPException(status_code=401, detail="empty bearer token")
+    return value
 
 
 def create_api(
@@ -74,19 +77,29 @@ def create_api(
     api = FastAPI(title="LEO gateway", version="1")
     channels = adapters if adapters is not None else default_adapters()
 
-    def auth(authorization: str | None = Header(default=None)) -> None:
-        _bearer(authorization, token)
+    sessions = SessionStore()
+
+    async def auth(authorization: str | None = Header(default=None)) -> None:
+        """A worker's session token is valid for the turn routes; the master
+        token stays with the operator and is the only thing that can mint one."""
+        presented = _presented(authorization)
+        if presented == token:
+            return
+        if await sessions.session_valid(presented):
+            return
+        raise HTTPException(status_code=401, detail="bad token")
 
     @api.get("/health")
     async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        auth(authorization)
+        await auth(authorization)
         stats = await store.stats()
-        return {"ok": True, "pid": os.getpid(), "channels": sorted(channels), **stats}
+        return {"ok": True, "pid": os.getpid(), "channels": sorted(channels),
+                "sessions": await sessions.stats(), **stats}
 
     @api.post("/v1/claim")
     async def claim(request: ClaimRequest,
                     authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        auth(authorization)
+        await auth(authorization)
         deadline = asyncio.get_running_loop().time() + request.wait_seconds
         while True:
             admission = await store.claim(request.worker, request.lease_seconds)
@@ -103,14 +116,14 @@ def create_api(
     @api.post("/v1/renew")
     async def renew(request: RenewRequest,
                     authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        auth(authorization)
+        await auth(authorization)
         held = await store.renew(request.admission_id, request.worker, request.lease_seconds)
         return {"renewed": held}
 
     @api.post("/v1/complete")
     async def complete(request: CompleteRequest,
                        authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        auth(authorization)
+        await auth(authorization)
         admission = await store.admission(request.admission_id)
         if admission is None:
             raise HTTPException(status_code=404, detail="unknown admission")
@@ -135,24 +148,44 @@ def create_api(
     @api.post("/v1/fail")
     async def fail(request: FailRequest,
                    authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        auth(authorization)
+        await auth(authorization)
         status = await store.fail(request.admission_id, request.error, retry=request.retry)
         return {"status": status}
 
     @api.get("/v1/admission/{admission_id}")
     async def admission_route(admission_id: str,
                               authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        auth(authorization)
+        await auth(authorization)
         admission = await store.admission(admission_id)
         if admission is None:
             raise HTTPException(status_code=404, detail="unknown admission")
         return admission
 
+    @api.post("/v1/attach")
+    async def attach(ttl_seconds: int = 300,
+                     authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        """Mint a single-use attach ticket (master token only)."""
+        presented = _presented(authorization)
+        if presented != token:
+            raise HTTPException(status_code=401, detail="attach requires the master token")
+        ticket, expires_at = await sessions.issue_ticket(ttl_seconds)
+        return {"ticket": ticket, "expires_at": expires_at}
+
+    @api.post("/v1/session")
+    async def session(payload: dict[str, Any]) -> dict[str, Any]:
+        """Exchange an attach ticket for a session token. A ticket works once."""
+        ticket = str(payload.get("ticket") or "")
+        ttl = int(payload.get("ttl_seconds") or 86400)
+        session_token = await sessions.redeem_ticket(ticket, ttl)
+        if session_token is None:
+            raise HTTPException(status_code=401, detail="ticket is invalid, used or expired")
+        return {"session_token": session_token}
+
     @api.post("/v1/admit")
     async def admit(payload: dict[str, Any],
                     authorization: str | None = Header(default=None)) -> dict[str, Any]:
         """Explicit ingress for pushes the gateway did not poll itself."""
-        auth(authorization)
+        await auth(authorization)
         admission_id, created = await store.admit(
             channel=str(payload.get("channel") or "unknown"),
             subject=str(payload.get("subject") or ""),

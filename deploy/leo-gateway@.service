@@ -1,0 +1,31 @@
+[Unit]
+Description=LEO gateway (channel adapters, durable queue, local API)
+Documentation=https://github.com/shoaibyazdani/leo-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# One gateway per operator account; the brain runs separately as a worker.
+User=%i
+WorkingDirectory=/opt/leo-agent
+EnvironmentFile=-/home/%i/.config/leo/env
+Environment=LEO_HOME=/home/%i/.config/leo
+Environment=LEO_CONFIG=/home/%i/.config/leo/leo.yaml
+Environment=LEO_SERVICE_UNIT=leo-agent@%i.service
+ExecStart=/opt/leo-agent/.venv/bin/leo gateway run --host 127.0.0.1 --port 8766
+Restart=on-failure
+RestartSec=3
+# The queue is durable, so a stop never loses a message: claims expire back into
+# the queue and the next worker picks them up.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/%i/.config/leo /home/%i/.leo /home/%i/.local/share/leo
+
+[Install]
+WantedBy=multi-user.target

@@ -40,9 +40,11 @@ class GatewayClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers={"Authorization": f"Bearer {self.token}"},
                 timeout=httpx.Timeout(60.0, connect=5.0),
             )
+        # Set per call, not at construction: a worker's token changes from the
+        # placeholder it boots with to the session token it exchanges for.
+        self._client.headers["Authorization"] = f"Bearer {self.token}"
         return self._client
 
     async def health(self) -> dict[str, Any]:
@@ -72,6 +74,18 @@ class GatewayClient:
         if response.status_code != 200:
             raise GatewayClientError(f"complete failed: HTTP {response.status_code}")
         return response.json()
+
+    async def redeem_ticket(self, ticket: str) -> str:
+        """Exchange a single-use attach ticket for a session token."""
+        response = await self._http().post("/v1/session", json={"ticket": ticket})
+        if response.status_code != 200:
+            raise GatewayClientError(
+                f"attach ticket rejected: HTTP {response.status_code}"
+            )
+        token = response.json().get("session_token")
+        if not token:
+            raise GatewayClientError("attach ticket produced no session token")
+        return str(token)
 
     async def renew(self, admission_id: str, worker: str,
                     lease_seconds: int = 30) -> bool:
@@ -155,7 +169,14 @@ async def run_worker(
         if explicit:
             db.set_db_path(explicit)
 
-    client = GatewayClient(base_url, resolve_token(token))
+    # A worker should never hold the master token: if a ticket is provided it is
+    # exchanged for a session token, and that is all this process ever carries.
+    ticket = os.getenv("LEO_GATEWAY_TICKET")
+    client = GatewayClient(base_url, token or "unauthenticated")
+    if ticket:
+        client.token = await client.redeem_ticket(ticket)
+    elif not token:
+        client.token = resolve_token(None)
     app = brain or LeoApp()
     await app.initialize()
     me = worker_id()
