@@ -263,6 +263,11 @@ class ChannelsConfig(BaseModel):
     internal: list[str] = Field(default_factory=lambda: ["cli", "api", "dashboard", "local"])
     default_mode: Literal["open", "allowlist", "deny"] = "allowlist"
     policies: dict[str, ChannelPolicyConfig] = Field(default_factory=dict)
+    # Emoji reaction placed on every inbound message the moment the gateway
+    # admits it, so the operator sees an acknowledgement before the model has
+    # even started thinking. Empty string disables it. Best effort: a channel
+    # that cannot react (or a provider rejection) is logged, never fatal.
+    ack_reaction: str = ""
 
 
 class ProgressConfig(BaseModel):

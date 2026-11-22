@@ -79,9 +79,24 @@ async def handle_tap(
     message_id = str(descriptor.get("message_id") or "")
     sender_id = str(descriptor.get("sender_id") or "")
 
+    answered = False
+
     async def reply(note: str) -> None:
-        if callback_id and hasattr(adapter, "answer_callback_query"):
-            await adapter.answer_callback_query(callback_id, note)
+        """Answer the tap at most once: a second answer is always rejected."""
+        nonlocal answered
+        if answered or not callback_id:
+            return
+        if not hasattr(adapter, "answer_callback_query"):
+            return
+        answered = True
+        await adapter.answer_callback_query(callback_id, note)
+
+    async def show(text: str) -> None:
+        """Replace the approval message, so the outcome outlives the toast."""
+        if chat_id and message_id and hasattr(adapter, "edit_message_text"):
+            await adapter.edit_message_text(
+                chat_id, message_id, text, {"inline_keyboard": []}
+            )
 
     if not is_authorized(sender_id, list(allowed) if allowed is not None
                          else approval_senders(settings, channel)):
@@ -102,13 +117,20 @@ async def handle_tap(
 
     decision = str(parsed.get("decision") or "")
     actor = f"{channel}-button:{sender_id}"
+    # Telegram expires a callback query ~15s after the tap. The resolve below can
+    # take minutes (it goes through the privileged tool path), so the spinner is
+    # stopped NOW and the outcome is written into the message instead of the
+    # toast - otherwise every slow tap ends as "query is too old" on the phone
+    # even though the approval really was resolved.
+    await reply("")
     granted = ""
     if decision == "session":
         row = await db.fetchone(
             "SELECT action, resource FROM approvals WHERE id=?", (approval_id,)
         )
         if row is None:
-            await reply("Unknown approval")
+            await show("\n".join(["🔐 Approval", f"id: {approval_id}",
+                                  "⚠️ could not resolve", "reason: unknown approval"]))
             return {"ok": False, "reason": "unknown approval"}
         granted = await permissions.grant_session(
             str(row["action"]), row["resource"], SESSION_GRANT_SECONDS, actor,
@@ -125,9 +147,11 @@ async def handle_tap(
             )
             result = {"success": bool(decision_obj.allowed), "error": decision_obj.reason}
     except Exception as exc:  # noqa: BLE001 - a tap must never crash the poller
-        await reply(f"Could not resolve: {type(exc).__name__}")
         _LOG.warning("approval tap failed", extra={
             "channel": channel, "approval_id": approval_id, "error": type(exc).__name__})
+        await show("\n".join(["🔐 Approval", f"id: {approval_id}",
+                              "⚠️ could not resolve",
+                              f"reason: {type(exc).__name__}"]))
         return {"ok": False, "reason": type(exc).__name__}
 
     ok = bool(result.get("success"))
@@ -135,20 +159,20 @@ async def handle_tap(
     note = f"{verdict}: {approval_id}"
     if granted:
         note += f" · always for {SESSION_GRANT_SECONDS // 3600}h"
-    await reply(note if ok else f"Failed: {result.get('error') or 'unknown error'}")
+    _LOG.info("approval tap resolved", extra={
+        "channel": channel, "approval_id": approval_id, "decision": verdict,
+        "grant_id": granted or None, "sender_id": sender_id, "ok": ok})
 
     # The message keeps the record; the buttons go away so a resolved approval
-    # cannot be tapped twice.
+    # cannot be tapped twice. This is the surface the operator actually reads,
+    # because the toast is gone by now.
     text = "\n".join(filter(None, [
         "🔐 Approval", f"id: {approval_id}",
         ("✅ " + verdict) if ok else "⚠️ could not resolve",
         note if not ok else "",
+        "" if ok else f"reason: {result.get('error') or 'unknown error'}",
     ]))
-    if chat_id and message_id and hasattr(adapter, "edit_message_text"):
-        await adapter.edit_message_text(chat_id, message_id, text, {"inline_keyboard": []})
-    _LOG.info("approval tap resolved", extra={
-        "channel": channel, "approval_id": approval_id, "decision": verdict,
-        "grant_id": granted or None, "sender_id": sender_id})
+    await show(text)
     return {"ok": ok, "decision": verdict, "approval_id": approval_id,
             "grant_id": granted or None}
 

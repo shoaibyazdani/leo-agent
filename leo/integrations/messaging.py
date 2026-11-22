@@ -703,9 +703,24 @@ class TelegramAdapter(MessagingAdapter):
             payload["text"] = str(text)[:200]
         try:
             response = await self._http().post(url, json=payload, timeout=self.timeout)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            _LOG.warning("callback answer failed", extra={
+                "channel": self.channel, "error": type(exc).__name__})
             return False
-        return response.status_code < 400
+        if response.status_code >= 400:
+            # Telegram's own words matter: "query is too old" means the tap had
+            # already expired, which is a different fault from a bad token and
+            # must not look identical (or invisible) in the log.
+            description = ""
+            try:
+                description = str((response.json() or {}).get("description") or "")
+            except ValueError:
+                description = ""
+            _LOG.warning("callback answer rejected", extra={
+                "channel": self.channel, "status": response.status_code,
+                "description": description[:200]})
+            return False
+        return True
 
     async def edit_message_text(
         self, target: str, message_id: str, text: str,

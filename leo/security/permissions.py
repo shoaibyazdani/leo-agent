@@ -228,6 +228,26 @@ class PermissionManagerImpl:
         ):
             allowed, reason, grant_applied = True, "session grant", True
 
+        # The agent loop has no channel for handing a resolved approval id back
+        # to the tool call that requested it (ToolCall carries no approval_id and
+        # execute() is called without one). Without this, an operator's approval
+        # is silently discarded: the retried call mints a fresh pending approval
+        # and the tap appears to do nothing. Adopt the newest already-approved,
+        # unconsumed row for this exact binding, which is just as strict as the
+        # supplied-id path: same actor/action/resource/risk, digest-bound to
+        # these exact arguments, and inside the approval window. Adoption is
+        # idempotent until the operation consumes the row, so retries are free.
+        if (
+            allowed and not violation and risk is RiskLevel.HIGH and not verified_approval
+            and self.settings.security.high_risk_requires_approval
+        ):
+            adopted = await self._adoptable_approval(
+                actor, action, resource, risk, current_digest
+            )
+            if adopted:
+                allowed, reason, approval_id = True, "prior approval verified", adopted
+                verified_approval = True
+
         # A grant already answered this request; asking again would queue a
         # second approval for an action the operator just allowed.
         if (
@@ -262,6 +282,33 @@ class PermissionManagerImpl:
             audit_metadata["approval_id"] = approval_id
         await self._audit(actor, action, resource, risk, decision, audit_metadata)
         return decision
+
+    async def _adoptable_approval(
+        self,
+        actor: str,
+        action: str,
+        resource: str | None,
+        risk: RiskLevel,
+        digest: str | None,
+    ) -> str | None:
+        """Newest approved-but-unconsumed approval bound to this exact call.
+
+        Used by callers that cannot carry an approval id back to the retried
+        tool call. Returns None unless a row matches every binding the
+        supplied-id path requires, including the argument digest and the
+        expiry window, so a stale or unrelated approval is never adopted.
+        """
+        rows = await db.fetchall(
+            "SELECT * FROM approvals WHERE status='approved' AND actor=? AND action=? "
+            "AND risk=? ORDER BY created_at DESC LIMIT 10",
+            (actor, action, risk.value),
+        )
+        for row in rows:
+            if row["resource"] != resource:
+                continue
+            if self._approval_is_valid(row, actor, action, resource, risk, digest):
+                return str(row["id"])
+        return None
 
     async def consume_approval(self, approval_id: str) -> bool:
         """Atomically move an approved row to consumed; one caller wins.

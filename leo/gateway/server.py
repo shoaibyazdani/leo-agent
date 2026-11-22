@@ -241,8 +241,15 @@ def create_api(
 
 
 async def poll_loop(store: GatewayStore, adapters: dict[str, Any],
-                    interval: float = 2.0) -> None:
-    """Pull from every credentialed poll channel and queue what arrives."""
+                    interval: float = 2.0, ack_reaction: str = "") -> None:
+    """Pull from every credentialed poll channel and queue what arrives.
+
+    ``ack_reaction`` places one emoji reaction on each newly admitted inbound
+    message, before the brain has claimed it, so the operator sees that the
+    message landed instead of staring at silence. Only fresh admissions are
+    acked (a redelivery must not re-react), and a channel that cannot react is
+    skipped quietly: this is a courtesy, never a delivery guarantee.
+    """
     while True:
         for channel in polling_channels():
             adapter = adapters.get(channel)
@@ -261,7 +268,7 @@ async def poll_loop(store: GatewayStore, adapters: dict[str, Any],
                 continue
             await state.beat(note=f"{len(messages)} inbound")
             for message in messages:
-                await store.admit(
+                _admission, created = await store.admit(
                     channel=message.channel,
                     subject=message.conversation_ref or message.sender_id,
                     principal=message.sender_id,
@@ -275,6 +282,15 @@ async def poll_loop(store: GatewayStore, adapters: dict[str, Any],
                     },
                     request_id=message.message_id,
                 )
+                if created and ack_reaction and message.message_id:
+                    target = message.conversation_ref or message.sender_id
+                    try:
+                        await adapter.react(target, message.message_id, ack_reaction)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - ack is best effort
+                        _LOG.warning("gateway ack reaction failed", extra={
+                            "channel": message.channel, "error": str(exc)})
         await asyncio.sleep(interval)
 
 
@@ -286,6 +302,7 @@ def run_gateway(host: str = "127.0.0.1", port: int = 8766) -> None:
     """
     import uvicorn
 
+    ack_reaction = ""
     token = _ensure_token()
     db_path = os.getenv("LEO_DB_PATH")
     if db_path:
@@ -302,6 +319,7 @@ def run_gateway(host: str = "127.0.0.1", port: int = 8766) -> None:
         from .callbacks import install as install_callbacks
 
         _settings = Settings.load()
+        ack_reaction = (_settings.channels.ack_reaction or "").strip()
         _permissions = PermissionManagerImpl(_settings)
         install_callbacks(_settings, _permissions, adapters)
     except Exception as exc:  # noqa: BLE001 - a gateway must start even if taps cannot
@@ -313,7 +331,8 @@ def run_gateway(host: str = "127.0.0.1", port: int = 8766) -> None:
 
     async def _serve() -> None:
         await db.initialize()
-        loop_task = asyncio.create_task(poll_loop(store, adapters), name="gateway-poll")
+        loop_task = asyncio.create_task(
+            poll_loop(store, adapters, ack_reaction=ack_reaction), name="gateway-poll")
         try:
             await server.serve()
         finally:
