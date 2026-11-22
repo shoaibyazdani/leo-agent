@@ -78,6 +78,37 @@ def create_api(
     channels = adapters if adapters is not None else default_adapters()
 
     sessions = SessionStore()
+    typing_tasks: dict[str, asyncio.Task[Any]] = {}
+
+    async def _typing_until(adapter: Any, subject: str, interval: float = 4.0) -> None:
+        """Repeat the channel's typing action until the turn finishes.
+
+        In the split the brain answers over the API, so nothing in the reply path
+        ever touches an adapter - which is why the indicator disappeared when the
+        processes were separated. Transport hints belong to the transport.
+        """
+        while True:
+            try:
+                await adapter.typing(subject)
+            except Exception:  # cosmetic only: never fail a turn for a typing hint
+                pass
+            await asyncio.sleep(interval)
+
+    def _start_typing(admission_id: str, channel: str, subject: str) -> None:
+        adapter = channels.get(channel)
+        if adapter is None or not hasattr(adapter, "typing"):
+            return
+        previous = typing_tasks.pop(admission_id, None)
+        if previous is not None:
+            previous.cancel()
+        typing_tasks[admission_id] = asyncio.create_task(
+            _typing_until(adapter, subject), name=f"typing-{admission_id}"
+        )
+
+    def _stop_typing(admission_id: str) -> None:
+        task = typing_tasks.pop(admission_id, None)
+        if task is not None:
+            task.cancel()
 
     async def auth(authorization: str | None = Header(default=None)) -> None:
         """A worker's session token is valid for the turn routes; the master
@@ -107,6 +138,8 @@ def create_api(
                 admission["conversation_id"] = await store.route(
                     admission["channel"], admission["subject"]
                 )
+                _start_typing(admission["admission_id"], admission["channel"],
+                              admission["subject"])
                 return {"admission": admission}
             if asyncio.get_running_loop().time() >= deadline:
                 return {"admission": None}
@@ -142,6 +175,7 @@ def create_api(
         if request.conversation_id:
             await store.save_route(admission["channel"], admission["subject"],
                                    request.conversation_id)
+        _stop_typing(request.admission_id)
         await store.complete(request.admission_id)
         return {"delivered": delivered, "error": error}
 
@@ -149,6 +183,7 @@ def create_api(
     async def fail(request: FailRequest,
                    authorization: str | None = Header(default=None)) -> dict[str, Any]:
         await auth(authorization)
+        _stop_typing(request.admission_id)
         status = await store.fail(request.admission_id, request.error, retry=request.retry)
         return {"status": status}
 
