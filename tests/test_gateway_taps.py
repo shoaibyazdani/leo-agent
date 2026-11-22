@@ -147,3 +147,27 @@ async def test_the_app_supplied_resolver_is_used_when_present(env) -> None:
 
     assert result["ok"] is True and result["decision"] == "rejected"
     assert seen == [(env.approval_id, False, f"telegram-button:{OWNER}")]
+
+
+# "message is not modified" is success, not failure — pinned at the transport layer,
+# because the progress reporter's whole stability depends on it.
+def test_edit_message_text_accepts_not_modified(monkeypatch) -> None:
+    from leo.integrations.messaging import TelegramAdapter
+
+    class _Resp:
+        status_code = 400
+
+        def json(self):
+            return {"ok": False, "description": "Bad Request: message is not modified"}
+
+    class _Client:
+        async def post(self, url, json=None, timeout=None):
+            return _Resp()
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    adapter = TelegramAdapter(client=_Client())
+
+    import asyncio
+
+    assert asyncio.get_event_loop_policy() is not None
+    assert asyncio.run(adapter.edit_message_text("1", "2", "same text")) is True
