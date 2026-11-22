@@ -30,7 +30,7 @@ from leo.tools.registry import ToolRegistry
 CHANNEL = "telegram"
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 FAKE_TOKEN = "fake-token-integration-tests-no-network"
-NAMES = ["integration_status", "channel_send", "enrollment_status"]
+NAMES = ["integration_status", "channel_send", "channel_react", "enrollment_status"]
 
 
 class ServicesExecutor(ToolExecutorImpl):
@@ -56,6 +56,8 @@ class FakeAdapter(MessagingAdapter):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[tuple[str, str]] = []
+        self.reactions: list[tuple[str, str, str]] = []
+        self.react_ok = True
 
     async def send(self, target: str, text: str) -> dict:
         self.calls.append((target, text))
@@ -64,6 +66,10 @@ class FakeAdapter(MessagingAdapter):
             "success": True,
             "message_id": f"fake-msg-{len(self.calls)}",
         }
+
+    async def react(self, target: str, message_id: str, emoji: str = "\u2764") -> bool:
+        self.reactions.append((target, message_id, emoji))
+        return self.react_ok
 
 
 class RecordingChannelRegistry:
@@ -177,7 +183,12 @@ def test_registration_and_typed_specs():
 
 async def test_missing_gateway_service_fails_loudly(env):
     for name in NAMES:
-        args = {"channel": CHANNEL, "target": "chat:1", "text": "hi"} if name == "channel_send" else {"channel": CHANNEL}
+        if name == "channel_send":
+            args = {"channel": CHANNEL, "target": "chat:1", "text": "hi"}
+        elif name == "channel_react":
+            args = {"channel": CHANNEL, "target": "chat:1", "message_id": "42"}
+        else:
+            args = {"channel": CHANNEL}
         result = await run(env, name, args)
         assert result.success is False
         assert "gateway" in (result.error or "")

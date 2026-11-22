@@ -470,6 +470,14 @@ class MessagingAdapter:
         """Best-effort 'is typing' indicator. Channels without one do nothing."""
         return None
 
+    async def react(self, target: str, message_id: str, emoji: str = "\u2764") -> bool:
+        """Add one emoji reaction to a message. Channels without one do nothing.
+
+        Returns True only when the provider accepted the reaction. A channel that
+        cannot react returns False rather than pretending it did.
+        """
+        return False
+
     async def send(
         self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -517,6 +525,40 @@ class MessagingAdapter:
         if response.status_code >= 400:
             raise MessagingError(f"telegram typing failed: HTTP {response.status_code}")
         return None
+
+    async def react(self, target: str, message_id: str, emoji: str = "\U0001F44D") -> bool:
+        """setMessageReaction on one message. Best effort, never raises.
+
+        Telegram scopes message ids per chat *per bot*: an id that a different
+        bot saw in the same chat does not exist for this one, and the API
+        answers "message to react not found". That is a real failure to report,
+        not a success.
+        """
+        token = credential("TELEGRAM_BOT_TOKEN")
+        if not token or not message_id:
+            return False
+        url = f"{self.API_BASE}/bot{token}/setMessageReaction"
+        payload: dict[str, Any] = {
+            "chat_id": str(target),
+            "message_id": int(message_id),
+            "reaction": [{"type": "emoji", "emoji": str(emoji)}],
+        }
+        try:
+            response = await self._http().post(url, json=payload, timeout=self.timeout)
+        except (httpx.HTTPError, ValueError):
+            return False
+        if response.status_code < 400:
+            return True
+        # The token appears in the URL: log only the status and description.
+        description = ""
+        try:
+            description = str((response.json() or {}).get("description") or "")
+        except ValueError:
+            description = ""
+        _LOG.warning("telegram reaction failed", extra={
+            "channel": self.channel, "status": response.status_code,
+            "description": description[:120]})
+        return False
 
     async def handle_webhook(
         self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None

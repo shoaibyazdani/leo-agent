@@ -39,6 +39,7 @@ from .transport_state import TransportState
 
 GATEWAY_MESSAGE_TOPIC = "gateway.message"
 GATEWAY_SENT_TOPIC = "gateway.sent"
+GATEWAY_REACTED_TOPIC = "gateway.reacted"
 GATEWAY_OUTBOX_TOPIC = "gateway.outbox"
 GATEWAY_OUTBOX_TABLE = "gateway_outbox"
 _MESSAGE_DEDUPE_PREFIX = "gateway:message:"
@@ -926,6 +927,69 @@ class Gateway:
         )
         return response
 
+    async def react(
+        self,
+        channel: str,
+        target: str,
+        message_id: str,
+        emoji: str = "\u2764",
+        *,
+        approval_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Put one emoji reaction on a message the adapter can address.
+
+        LOW risk and non-destructive: a reaction writes nothing to the
+        conversation, so it does not need the HIGH-risk digest that ``send``
+        uses. It still goes through the permission manager, and the result is
+        honest — ``success`` is only True when the provider accepted it.
+        """
+        adapter = self._adapter(channel)
+        target_str = str(target)
+        message_str = str(message_id)
+        emoji_str = str(emoji)
+        await self._authorize(
+            "gateway.react",
+            RiskLevel.LOW,
+            resource=f"{channel}:{target_str}:{message_str}",
+            approval_id=approval_id,
+            channel=channel,
+            target=target_str,
+            message_id=message_str,
+            emoji=emoji_str,
+        )
+        try:
+            reacted = bool(await adapter.react(target_str, message_str, emoji_str))
+        except Exception as exc:
+            return {
+                "channel": channel,
+                "target": target_str,
+                "message_id": message_str,
+                "emoji": emoji_str,
+                "success": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        response = {
+            "channel": channel,
+            "target": target_str,
+            "message_id": message_str,
+            "emoji": emoji_str,
+            "success": reacted,
+        }
+        if not reacted:
+            response["error"] = (
+                "provider rejected the reaction; on Telegram this usually means "
+                "the message id belongs to another bot in the same chat"
+            )
+        await self.events.emit(
+            GATEWAY_REACTED_TOPIC,
+            channel=channel,
+            target=target_str,
+            message_id=message_str,
+            emoji=emoji_str,
+            success=reacted,
+        )
+        return response
+
     async def fanout(
         self, targets: Mapping[str, str], text: str, *, approval_id: str | None = None
     ) -> dict[str, dict[str, Any]]:
@@ -1002,6 +1066,7 @@ class Gateway:
 __all__ = [
     "GATEWAY_MESSAGE_TOPIC",
     "GATEWAY_SENT_TOPIC",
+    "GATEWAY_REACTED_TOPIC",
     "GATEWAY_OUTBOX_TOPIC",
     "GATEWAY_OUTBOX_TABLE",
     "WEBHOOK_REPLAY_WINDOW_SECONDS",
