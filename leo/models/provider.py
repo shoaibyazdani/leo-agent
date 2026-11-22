@@ -720,7 +720,12 @@ class AnthropicProvider(BaseHTTPProvider):
         system, messages = self._messages(request)
         body: dict[str, Any] = {
             "model": request.model or self.model,
-            "max_tokens": request.max_tokens or 4096,
+            # A reasoning model spends output tokens on thinking before it writes
+            # a single character. 4096 was enough to leave nothing behind: the turn
+            # came back with stop_reason=max_tokens, no text and no tool call, which
+            # the router correctly refuses as an empty response. Providers may pin
+            # their own ceiling; otherwise leave real room for the answer.
+            "max_tokens": request.max_tokens or getattr(self, "max_tokens", None) or 32_000,
             "messages": messages,
         }
         if system:
@@ -902,8 +907,9 @@ class OpenAIProvider(BaseHTTPProvider):
             "model": request.model or self.model,
             "messages": self._messages(request),
         }
-        if request.max_tokens is not None:
-            body["max_tokens"] = request.max_tokens
+        # Same reasoning as the Anthropic path: a ceiling that vanishes when the
+        # caller says nothing lets a gateway pick a tiny default.
+        body["max_tokens"] = request.max_tokens or getattr(self, "max_tokens", None) or 32_000
         if request.temperature is not None:
             body["temperature"] = request.temperature
         if request.tools:
@@ -1031,9 +1037,13 @@ def build_provider(name: str, config: ModelProviderConfig, **kwargs: Any) -> Bas
     """Create a configured provider adapter by ``config.kind``."""
     kind = (config.kind or "anthropic-compatible").lower()
     if kind == "anthropic-compatible":
-        return AnthropicProvider(config, name=name, **kwargs)
+        provider = AnthropicProvider(config, name=name, **kwargs)
+        provider.max_tokens = int(getattr(config, "max_tokens", 32_000) or 32_000)
+        return provider
     if kind == "openai-compatible":
-        return OpenAIProvider(config, name=name, **kwargs)
+        provider = OpenAIProvider(config, name=name, **kwargs)
+        provider.max_tokens = int(getattr(config, "max_tokens", 32_000) or 32_000)
+        return provider
     raise ModelError(f"provider {name!r}: unsupported kind {config.kind!r}")
 
 
