@@ -33,7 +33,7 @@ from ..logging import get_logger
 _LOG = get_logger("integrations.progress")
 
 DEFAULT_INTERVAL_SECONDS = 4.0
-DEFAULT_IDLE_SECONDS = 45.0
+DEFAULT_IDLE_SECONDS = 20.0
 DEFAULT_MAX_STEPS = 3
 ARGUMENT_PREVIEW_CHARS = 52
 
@@ -99,14 +99,22 @@ class ProgressReporter:
         self._message_id = ""
         self._last_flush = 0.0
         self._last_step = 0.0
+        self._last_text = ""
         self._active = False
         self._ticker: asyncio.Task[Any] | None = None
         self.sent = 0
         self.failed = 0
 
     # -- lifecycle ---------------------------------------------------------
-    def begin(self, channel: str, target: str, budget: int = 0) -> bool:
-        """Start reporting for one turn. Returns False when nothing will be sent."""
+    async def begin(self, channel: str, target: str, budget: int = 0) -> bool:
+        """Start reporting for one turn. Returns False when nothing will be sent.
+
+        A previous report is closed first: two open "⏳ Working" messages in one
+        chat is how a log looks broken — the older one freezes at its last step
+        while the new turn starts another.
+        """
+        if self._active:
+            await self.end("done")
         if not self.enabled or not channel or not target:
             return False
         # Built-in surfaces have no outbound adapter: a CLI turn has no chat to
@@ -122,6 +130,7 @@ class ProgressReporter:
         self._iteration = 0
         self._started = time.monotonic()
         self._message_id = ""
+        self._last_text = ""
         self._steps.clear()
         self._active = True
         self._last_flush = 0.0
@@ -209,12 +218,18 @@ class ProgressReporter:
             return
         self._last_flush = now
         text = self.render()
+        if text == self._last_text and not force:
+            # Nothing new to say. Re-editing identical text is what Telegram
+            # answers with "message is not modified", and the retry storm that
+            # followed opened a fresh message every few seconds.
+            return
         try:
             adapter = self.gateway._adapter(self._channel)  # noqa: SLF001 - same package
             if not self._message_id:
-                result = await adapter.send(self._target, text)
+                result = await adapter.send(self._target, text, silent=True)
                 if isinstance(result, dict):
                     self._message_id = str(result.get("message_id") or "")
+                self._last_text = text
                 self.sent += 1
                 _LOG.info("progress message opened", extra={
                     "channel": self._channel, "message_id": self._message_id})
@@ -222,10 +237,11 @@ class ProgressReporter:
                 edited = await adapter.edit_message_text(  # type: ignore[attr-defined]
                     self._target, self._message_id, text, {"inline_keyboard": []}
                 )
+                self._last_text = text
                 if not edited:
                     # A message can be edited only for 48h and only if it still
                     # exists; when that fails, start a fresh one for the rest.
-                    result = await adapter.send(self._target, text)
+                    result = await adapter.send(self._target, text, silent=True)
                     if isinstance(result, dict):
                         self._message_id = str(result.get("message_id") or "")
                     self.sent += 1

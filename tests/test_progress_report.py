@@ -20,10 +20,12 @@ class FakeAdapter:
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.silent: list[bool] = []
         self.edits: list[tuple[str, str, str]] = []
         self.fail_send = False
 
-    async def send(self, target: str, text: str, *, reply_markup=None):
+    async def send(self, target: str, text: str, *, reply_markup=None, silent=False):
+        self.silent.append(bool(silent))
         if self.fail_send:
             raise RuntimeError("network down")
         self.sent.append((str(target), text))
@@ -55,22 +57,22 @@ def env():
                            settings=settings, gateway=gateway)
 
 
-def test_disabled_reports_nothing(env) -> None:
+async def test_disabled_reports_nothing(env) -> None:
     env.settings.progress.enabled = False
     reporter = ProgressReporter(env.gateway, env.settings)
 
-    assert reporter.begin("telegram", "100000001") is False
+    assert await reporter.begin("telegram", "100000001") is False
     reporter.note("shell", {"command": "ls"})
     assert env.adapter.sent == []
 
 
-def test_a_channel_without_an_adapter_is_not_reported(env) -> None:
-    assert env.reporter.begin("cli", "local") is False
+async def test_a_channel_without_an_adapter_is_not_reported(env) -> None:
+    assert await env.reporter.begin("cli", "local") is False
 
 
 async def test_the_first_step_sends_one_message_and_later_steps_edit_it(env) -> None:
     reporter = env.reporter
-    assert reporter.begin("telegram", "100000001", budget=250) is True
+    assert await reporter.begin("telegram", "100000001", budget=250) is True
 
     reporter.note("shell", {"command": "cd /root && pytest -q"})
     await reporter._flush(force=True)
@@ -89,7 +91,7 @@ async def test_the_first_step_sends_one_message_and_later_steps_edit_it(env) -> 
 async def test_a_burst_of_steps_is_throttled_into_the_latest_state(env) -> None:
     reporter = env.reporter
     env.settings.progress.min_interval_seconds = 30.0
-    reporter.begin("telegram", "100000001")
+    await reporter.begin("telegram", "100000001")
 
     for index in range(5):
         reporter.note("shell", {"command": f"step {index}"})
@@ -106,7 +108,7 @@ async def test_a_burst_of_steps_is_throttled_into_the_latest_state(env) -> None:
 
 async def test_commands_are_redacted_and_truncated(env) -> None:
     reporter = env.reporter
-    reporter.begin("telegram", "100000001")
+    await reporter.begin("telegram", "100000001")
 
     # Built at runtime so the fixture exercises the redaction path without ever
     # existing as a literal credential in the repo (a scanner cannot tell a fake
@@ -127,7 +129,7 @@ async def test_commands_are_redacted_and_truncated(env) -> None:
 
 async def test_end_leaves_a_verdict_in_the_same_message(env) -> None:
     reporter = env.reporter
-    reporter.begin("telegram", "100000001")
+    await reporter.begin("telegram", "100000001")
     reporter.note("shell", {"command": "ls"})
     await reporter._flush(force=True)
 
@@ -141,7 +143,7 @@ async def test_end_leaves_a_verdict_in_the_same_message(env) -> None:
 async def test_a_failed_send_never_raises(env) -> None:
     env.adapter.fail_send = True
     reporter = env.reporter
-    reporter.begin("telegram", "100000001")
+    await reporter.begin("telegram", "100000001")
     reporter.note("shell", {"command": "ls"})
 
     await reporter._flush(force=True)   # must not raise
@@ -154,7 +156,7 @@ async def test_the_idle_ticker_finishes_an_abandoned_turn(env) -> None:
     reporter = env.reporter
     reporter.interval = 0.01
     reporter.idle_seconds = 5.0
-    reporter.begin("telegram", "100000001")
+    await reporter.begin("telegram", "100000001")
     reporter.note("shell", {"command": "ls"})
     reporter._last_step = reporter._started - 10  # pretend the turn died ten seconds ago
     reporter._started -= 10
@@ -164,3 +166,65 @@ async def test_the_idle_ticker_finishes_an_abandoned_turn(env) -> None:
     assert reporter.stats()["active"] is False
     closing = [text for _t, text in env.adapter.sent] + [edit[2] for edit in env.adapter.edits]
     assert any("✅" in text for text in closing), closing
+
+
+async def test_an_unchanged_report_is_not_re_edited(env) -> None:
+    """Re-editing identical text is what Telegram rejects as "not modified".
+
+    The retry that followed used to open a brand-new message every few seconds,
+    which is exactly how a long turn's log fell apart.
+    """
+    reporter = env.reporter
+    reporter.interval = 0.0
+    await reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "ls"})
+
+    await reporter._flush(force=True)
+    edits_after_first = len(env.adapter.edits)
+    await reporter._flush()          # same content, no force
+
+    assert len(env.adapter.edits) == edits_after_first, "identical text must not be re-edited"
+    assert len(env.adapter.sent) == 1
+
+
+async def test_a_failed_edit_reopens_the_message_only_once(env) -> None:
+    class Refusing(FakeAdapter):
+        async def edit_message_text(self, *args, **kwargs):
+            return False
+
+    adapter = Refusing()
+    reporter = ProgressReporter(FakeGateway({"telegram": adapter}), env.settings)
+    await reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "ls"})
+    await reporter._flush(force=True)
+    reporter.note("shell", {"command": "pwd"})
+    await reporter._flush(force=True)
+
+    assert len(adapter.sent) == 2, "a genuinely failed edit falls back to a new message"
+
+
+async def test_a_new_turn_closes_the_previous_report(env) -> None:
+    """Two open "Working" messages in one chat is what a broken log looks like."""
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "ls"})
+    await reporter._flush(force=True)
+
+    await reporter.begin("telegram", "100000001")     # the next turn starts
+
+    closing = [edit[2] for edit in env.adapter.edits]
+    assert any("✅" in text for text in closing), "the previous report must be closed"
+    assert reporter.stats()["active"] is True
+    await reporter.end("done")
+
+
+async def test_every_progress_line_is_silent(env) -> None:
+    """The reporter must never ring the phone — the answer itself still notifies."""
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "ls"})
+    await reporter._flush(force=True)
+    await reporter.end("done")
+
+    assert env.adapter.silent, "the reporter sent nothing"
+    assert all(env.adapter.silent), "every progress line must be silent"

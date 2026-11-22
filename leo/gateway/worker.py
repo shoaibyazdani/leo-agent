@@ -210,6 +210,16 @@ async def _claim_loop(
                 conversation_id=admission.get("conversation_id") or None,
             )
             answer = str(result.get("content") or "")
+            if str(result.get("status") or "") == "cancelled":
+                # A stopped turn is terminal. Bury the admission BEFORE delivery so
+                # that a failed send cannot fall through to the retry path and
+                # re-run the work the operator just cancelled — which is what made
+                # a stopped turn start typing again.
+                try:
+                    await client.fail(admission_id, "cancelled at operator request",
+                                      retry=False)
+                except (httpx.HTTPError, GatewayClientError):
+                    pass
             await client.complete(admission_id, answer,
                                   str(result.get("conversation_id") or ""))
             answered += 1

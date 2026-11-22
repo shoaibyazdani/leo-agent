@@ -479,9 +479,13 @@ class MessagingAdapter:
         return False
 
     async def send(
-        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None
+        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None,
+        silent: bool = False,
     ) -> dict[str, Any]:
         """Send one text message.
+
+        ``silent`` asks the channel not to notify the human — a live progress line
+        is an update, not an interruption.
 
         ``reply_markup`` is an optional keyboard. A channel that cannot render one
         ignores it rather than failing the send: the text still carries the
@@ -710,7 +714,8 @@ class TelegramAdapter(MessagingAdapter):
         return _signature_matches(signature, _hmac_hex(secret, _body_bytes(payload, raw_body)))
 
     async def send(
-        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None
+        self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None,
+        silent: bool = False,
     ) -> dict[str, Any]:
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -723,7 +728,7 @@ class TelegramAdapter(MessagingAdapter):
             # The keyboard belongs to the message the human reads last, not to a
             # continuation that may arrive before it.
             keyboard = reply_markup if index + 1 == len(chunks) else None
-            last = await self._send_one(token, target, chunk, reply_markup=keyboard)
+            last = await self._send_one(token, target, chunk, reply_markup=keyboard, silent=silent)
             if index + 1 < len(chunks):
                 _LOG.info("telegram long message split", extra={
                     "chunks": len(chunks), "part": index + 1})
@@ -762,11 +767,27 @@ class TelegramAdapter(MessagingAdapter):
             response = await self._http().post(url, json=payload, timeout=self.timeout)
         except httpx.HTTPError:
             return False
-        return response.status_code < 400
+        if response.status_code < 400:
+            return True
+        # "message is not modified" means the text is already there. That is the
+        # outcome the caller wanted, not a failure: reporting it as one made the
+        # progress reporter open a NEW message every few seconds.
+        description = ""
+        try:
+            description = str((response.json() or {}).get("description") or "")
+        except ValueError:
+            description = ""
+        if "not modified" in description.lower():
+            return True
+        _LOG.debug("edit failed", extra={
+            "channel": self.channel, "status": response.status_code,
+            "description": description[:120]})
+        return False
 
     async def _send_one(
         self, token: str, target: str, text: str,
         reply_markup: dict[str, Any] | None = None,
+        silent: bool = False,
     ) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
@@ -774,6 +795,9 @@ class TelegramAdapter(MessagingAdapter):
                                    "parse_mode": TELEGRAM_PARSE_MODE}
         if reply_markup:
             payload["reply_markup"] = reply_markup
+        if silent:
+            # A live progress line is an update, not an interruption.
+            payload["disable_notification"] = True
         try:
             response = await self._http().post(url, json=payload, timeout=self.timeout)
         except httpx.HTTPError as exc:
@@ -829,6 +853,20 @@ class TelegramAdapter(MessagingAdapter):
             if not isinstance(message, dict):
                 continue
             sender_data = message.get("from") if isinstance(message.get("from"), dict) else {}
+            # A bot's own traffic is not a human turn. Telegram hands an agent back
+            # its own messages in some topologies, and the approval notifier writes
+            # a notice into the same chat: ingesting either makes the agent answer
+            # itself, which reads to the operator as the agent "mixing things up".
+            if sender_data.get("is_bot"):
+                _LOG.info("inbound from a bot ignored", extra={
+                    "channel": self.channel, "sender_id": _ref(sender_data.get("id"))})
+                continue
+            _body = str(message.get("text") or message.get("caption") or "").lstrip()
+            if _body.startswith("🔐 Approval needed"):
+                # The approval itself is already a durable row with buttons; its
+                # notification text is not something the operator said.
+                _LOG.info("approval notice echoed back ignored", extra={"channel": self.channel})
+                continue
             reply = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
             chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
             # The numeric id is the admission identity and the chat id is the

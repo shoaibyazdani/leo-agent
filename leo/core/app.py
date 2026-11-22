@@ -284,6 +284,41 @@ class LeoApp:
             return False
         return str(row["requested_at"]) >= str(since)
 
+    async def _await_with_stop(self, awaitable: Any, conversation_id: str, since: str) -> Any:
+        """Await a long call while watching for a stop request.
+
+        A model call can run for minutes and the router retries it across
+        providers. Observing the stop only *between* rounds meant several /stop
+        messages could arrive while the turn kept working, which reads as the stop
+        being ignored. This polls the same durable flag while the call is in
+        flight, cancels it, and raises the same TurnStopped the caller handles.
+        """
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=0.75)
+                if done:
+                    return task.result()
+                if await self._turn_stop_requested(conversation_id, since):
+                    _LOG.info("stop observed while waiting", extra={
+                        "conversation_id": str(conversation_id)[:24],
+                        "cancelled": True,
+                    })
+                    task.cancel()
+                    try:
+                        # Bounded: a handler that ignores cancellation (a blocked
+                        # subprocess wait does) must not keep the turn alive. Waiting
+                        # on it forever was the last reason /stop appeared to do
+                        # nothing while the agent kept working.
+                        await asyncio.wait_for(task, timeout=2.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):  # noqa: BLE001
+                        pass
+                    await self._clear_turn_stop(conversation_id)
+                    raise TurnStopped(conversation_id)
+        finally:
+            if not task.done():
+                task.cancel()
+
     async def _clear_turn_stop(self, conversation_id: str) -> None:
         try:
             await db.execute("DELETE FROM turn_cancels WHERE conversation_id=?",
@@ -1372,6 +1407,10 @@ class LeoApp:
         return status
 
     CONVERSATION_HISTORY_LIMIT = 50
+    # A message count alone is not a bound: fifty rows of shell output can be tens
+    # of megabytes, and the model then answers from a flooded prompt (or not at
+    # all). The character budget is the real ceiling.
+    CONVERSATION_HISTORY_MAX_CHARS = 120_000
 
     def _compaction_config(self) -> compaction.CompactionConfig:
         """Translate ``settings.compaction`` into the engine's own config type.
@@ -1677,7 +1716,35 @@ class LeoApp:
                 # An assistant/user/system row (or the oldest stored row)
                 # closes the group: no more history needs to be fetched.
                 break
-        return selected
+        return self._budget_history(selected)
+
+    def _budget_history(self, selected: list[Any]) -> list[Any]:
+        """Keep the newest rows that fit the character budget.
+
+        Tool results dominate a long session; counting messages lets one
+        `du -sh /root/*` flood the whole prompt. Trimming from the oldest end keeps
+        the recent exchange intact. Orphaned tool rows are not removed here —
+        `_rows_to_messages` demotes them to data text instead.
+        """
+        budget = max(4_000, int(getattr(self, "CONVERSATION_HISTORY_MAX_CHARS", 120_000)))
+        kept: list[Any] = []
+        total = 0
+        for row in reversed(selected):
+            length = len(str(row["content"] or ""))
+            if kept and total + length > budget:
+                break
+            kept.append(row)
+            total += length
+        kept.reverse()
+        # Leading tool rows are left in place on purpose: _rows_to_messages demotes
+        # a result whose opener fell outside the window into data text, so dropping
+        # it here would discard the very evidence that path exists to preserve.
+        if len(kept) != len(selected):
+            _LOG.info("conversation history trimmed to budget", extra={
+                "rows_before": len(selected), "rows_after": len(kept),
+                "chars": total, "budget": budget,
+            })
+        return kept
 
     def _rows_to_messages(self, selected: list[Any]) -> list[ChatMessage]:
         history: list[ChatMessage] = []
@@ -1952,7 +2019,7 @@ class LeoApp:
         conversation_id = conversation_id or new_id("conv")
         # Live progress only where a human is watching; a CLI turn has no adapter
         # and begin() declines quietly.
-        self.progress.begin(channel, str(subject or ""), self.round_budget)
+        await self.progress.begin(channel, str(subject or ""), self.round_budget)
         # A stop only counts if it arrives during THIS turn: clear any leftover
         # request first, then remember when the turn started.
         await self._clear_turn_stop(conversation_id)
@@ -2088,7 +2155,9 @@ class LeoApp:
                 final_call = force_final or iteration == self.round_budget
                 if final_call:
                     self._append_final_answer_instruction(request)
-                response = await self.router.complete(request)
+                response = await self._await_with_stop(
+                    self.router.complete(request), conversation_id, turn_started
+                )
                 # Match ask_stream: model output is redacted before it reaches
                 # durable storage, the provider payload or the caller.
                 content = self._redact(response.content)
@@ -2146,7 +2215,9 @@ class LeoApp:
                         try:
                             if await self._turn_stop_requested(conversation_id, turn_started):
                                 raise TurnStopped(conversation_id)
-                            result = await self.executor.execute(call)
+                            result = await self._await_with_stop(
+                                self.executor.execute(call), conversation_id, turn_started
+                            )
                             self.progress.note(name, arguments, getattr(result, "success", None))
                             result_content = json.dumps(result.model_dump(mode="json"), default=str)
                         except ApprovalRequired as exc:
@@ -2275,7 +2346,7 @@ class LeoApp:
         text = self._redact(text)
         run_id = new_id("run")
         conversation_id = conversation_id or new_id("conv")
-        self.progress.begin(channel, str(subject or ""), self.round_budget)
+        await self.progress.begin(channel, str(subject or ""), self.round_budget)
         # A stop only counts if it arrives during THIS turn: clear any leftover
         # request first, then remember when the turn started.
         await self._clear_turn_stop(conversation_id)
@@ -2444,6 +2515,14 @@ class LeoApp:
             # one reserved model call for the final answer.
             typed_stream = getattr(self.router, "stream_events", None)
 
+            async def _guarded_chunks(source: AsyncIterator[StreamChunk]) -> AsyncIterator[StreamChunk]:
+                """Pass stream events through, ending the turn when a stop arrives."""
+                async for chunk in source:
+                    if await self._turn_stop_requested(conversation_id, turn_started):
+                        await self._clear_turn_stop(conversation_id)
+                        raise TurnStopped(conversation_id)
+                    yield chunk
+
             async def _text_only_chunks(model_request: Any) -> AsyncIterator[StreamChunk]:
                 """Compatibility path for routers/fakes with only ``stream()``.
 
@@ -2464,7 +2543,9 @@ class LeoApp:
                 tail = ""
                 reason_tail = ""
                 round_reasoning_seen = False
-                chunks = typed_stream(request) if callable(typed_stream) else _text_only_chunks(request)
+                chunks = _guarded_chunks(
+                    typed_stream(request) if callable(typed_stream) else _text_only_chunks(request)
+                )
                 async for chunk in chunks:
                     cancellation_guard()  # (a) inside the async chunk loop
                     delta = str(getattr(chunk, "text", "") or "")
@@ -2586,7 +2667,9 @@ class LeoApp:
                         try:
                             if await self._turn_stop_requested(conversation_id, turn_started):
                                 raise TurnStopped(conversation_id)
-                            result = await self.executor.execute(call)
+                            result = await self._await_with_stop(
+                                self.executor.execute(call), conversation_id, turn_started
+                            )
                             self.progress.note(name, arguments, getattr(result, "success", None))
                             result_content = json.dumps(result.model_dump(mode="json"), default=str)
                         except ApprovalRequired as exc:

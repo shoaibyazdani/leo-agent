@@ -23,6 +23,8 @@ tokenizer counts.
 
 from __future__ import annotations
 
+import asyncio
+
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -675,10 +677,18 @@ class CompactionEngine:
             try:
                 response = await provider.complete(request)
             except Exception as exc:  # noqa: BLE001 - summarized below
-                log.warning("compaction summarization failed", extra={"error": str(exc)[:200]})
+                # A provider that returns nothing (ModelEmptyOutputError) is usually
+                # transient. Breaking here left the session uncompacted forever:
+                # every later turn re-tried, failed again, and answered from a
+                # flooded prompt. Retry, then let the deterministic boundary below
+                # take over, so the conversation keeps moving.
+                log.warning("compaction summarization failed", extra={
+                    "error": str(exc)[:200], "attempt": attempts})
                 reason = f"summarizer error: {type(exc).__name__}"
                 summary = ""
-                break
+                if attempts < max_attempts:
+                    await asyncio.sleep(min(2.0, 0.4 * attempts))
+                continue
             summary = str(getattr(response, "content", "") or "").strip()
             if not summary:
                 reason = "summarizer returned no text"
