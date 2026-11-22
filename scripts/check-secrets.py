@@ -101,7 +101,7 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "tests/channels/test_teams.py": {"32": "test fixture"},
     "tests/test_agents_automation_operator.py": {"33": "test fixture"},
     "tests/test_agents_reviewer.py": {"143": "test fixture"},
-    "tests/test_commands.py": {"498": "test fixture"},
+    "tests/test_commands.py": {"499": "test fixture"},
     "tests/test_tools_http.py": {
         "108": "synthetic fixture", "123": "synthetic fixture",
         "643": "synthetic fixture", "660": "synthetic fixture",

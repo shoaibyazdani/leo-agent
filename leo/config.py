@@ -174,6 +174,33 @@ class ModelConfig(BaseModel):
     allow_mock_fallback: bool = False
 
 
+class CompactionConfig(BaseModel):
+    """Durable conversation compaction policy.
+
+    Only names and numbers live here; the summarizer is whichever model the
+    router already routes to unless ``model`` pins one.
+    """
+
+    enabled: bool = True
+    # Fraction of the context budget that triggers automatic compaction.
+    threshold: float = 0.9
+    # Estimated tokens kept verbatim after the compacted boundary.
+    keep_recent_tokens: int = 20_000
+    # Character cap for the summarizer input, so one huge session cannot
+    # build an unbounded prompt.
+    summary_input_chars: int = 160_000
+    # Corrective attempts after a failed quality audit.
+    corrective_attempts: int = 2
+    # ``strict`` requires opaque identifiers to survive the summary.
+    identifier_policy: str = "strict"
+    # Persist durable facts from the span leaving model context.
+    memory_flush: bool = True
+    # Automatic behaviour when summarization times out or returns nothing.
+    on_timeout: str = "deterministic"
+    # Optional summarizer override; empty means the active session model.
+    model: str = ""
+
+
 class AutomationConfig(BaseModel):
     tick_seconds: float = 1.0
     recovery_on_startup: bool = True
@@ -226,6 +253,7 @@ class Settings(BaseModel):
     paths: PathConfig = Field(default_factory=PathConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     models: ModelConfig = Field(default_factory=ModelConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     computer: ComputerConfig = Field(default_factory=ComputerConfig)
@@ -367,6 +395,10 @@ class Settings(BaseModel):
                 "max_tool_calls_per_task", "max_tool_calls_ceiling",
             ],
             "automation": ["max_concurrent_tasks", "default_task_timeout_seconds"],
+            "compaction": [
+                "enabled", "threshold", "keep_recent_tokens",
+                "summary_input_chars", "corrective_attempts",
+            ],
         }.items():
             target = getattr(settings, group)
             for field in fields:
@@ -381,6 +413,11 @@ class Settings(BaseModel):
                             value = int(value)
                         except (TypeError, ValueError) as exc:
                             raise ValueError(f"{env_name} must be an integer; got {value!r}") from exc
+                    elif isinstance(current, float):
+                        try:
+                            value = float(value)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(f"{env_name} must be a number; got {value!r}") from exc
                     elif isinstance(current, Path):
                         value = Path(value)
                     setattr(target, field, value)

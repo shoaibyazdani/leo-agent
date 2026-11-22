@@ -9,8 +9,13 @@ narrative changelog.
   the terminal (`leo chat`), durable tasks, layered memory, specialist agents,
   native tools and skills, approvals with audit, integrations adapters.
 - Measured from the live `LeoApp.initialize()` composition root: 94
-  registered tools, 37 available slash commands (126 registered slash
+  registered tools, 38 available slash commands (126 registered slash
   commands in total) and 24 specialist agents.
+- Durable conversation compaction: older turns are summarized once, the summary
+  is stored in the `compactions` table, and later turns replay the summary plus
+  a verbatim recent tail. `/compact [focus] [--preview|--clear]` runs it
+  manually; automatic compaction triggers at a configurable share of the
+  context budget. The transcript is never rewritten.
 - Vision: image attachments route to providers that declare the `vision`
   capability and reach the model as image content blocks.
 - Local-first security model: loopback bind by default, `LEO_API_TOKEN`

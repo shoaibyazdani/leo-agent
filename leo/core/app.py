@@ -21,6 +21,7 @@ from ..contracts import (
 from ..events import Event, EventBus
 from ..integrations.attachments import AttachmentStore
 from ..logging import configure_logging, get_logger
+from ..models import compaction
 from ..models.provider import ModelEmptyOutputError, ModelError
 from ..models.router import FINAL_ANSWER_ONLY_INSTRUCTION
 from ..security import ApprovalRequired, PermissionManagerImpl
@@ -117,6 +118,34 @@ class _RunCancelled(Exception):
     Raised by the shared guard in ``ask_stream`` and handled once so every
     checkpoint emits the same terminal events without persisting an answer.
     """
+
+
+class _PinnedModelProvider:
+    """Route summarization to one configured provider or model.
+
+    Only the compaction path uses this, so a cheap summarizer can be selected
+    without changing which model answers the conversation. The pinned value may
+    be either a provider key (preferred: routed by name, keeping its own model
+    id) or a bare model id (sent as-is on whichever provider routes).
+    """
+
+    def __init__(self, router: Any, pinned: str, providers: dict[str, Any] | None = None) -> None:
+        self._router = router
+        self._pinned = pinned
+        self._providers = providers or {}
+
+    async def complete(self, request: ModelRequest) -> Any:
+        pinned = request.model_copy(deep=True)
+        if self._pinned in self._providers:
+            # Provider key: prefer it by name so its configured model id and
+            # endpoint stay authoritative.
+            metadata = dict(getattr(pinned, "metadata", None) or {})
+            metadata["preferred_providers"] = [self._pinned]
+            pinned.metadata = metadata
+            pinned.model = None
+        else:
+            pinned.model = self._pinned
+        return await self._router.complete(pinned)
 
 
 class LeoApp:
@@ -248,6 +277,8 @@ class LeoApp:
             await db.initialize()
         else:
             await db.initialize(self.settings.db_path)
+        # Durable compaction needs its own table before any chat turn runs.
+        await compaction.init_schema()
         # Named, restart-safe subscribers are reattached as soon as durable
         # storage exists, before any engine emits events.
         await self._attach_durable_events()
@@ -274,6 +305,9 @@ class LeoApp:
         from ..integrations.gateway import Gateway
 
         self.context = ContextOptimizer()
+        self.compaction = compaction.CompactionEngine(
+            self._compaction_config(), memory=None
+        )
         self.evaluation = Evaluation()
         self.router = ModelRouter(self.settings)
         self.registry = ToolRegistry()
@@ -327,6 +361,9 @@ class LeoApp:
 
         self.memory = MemoryStore(self.events)
         self.search = MemorySearch(self.memory)
+        # The compaction engine flushes durable facts before summarizing, so it
+        # needs the memory store and is attached once that exists.
+        self.compaction.memory = self.memory
         self.tasks = DurableTaskEngine(self.settings, self.events)
         self.scheduler = Scheduler(self.tasks, self.settings, self.events)
         self.agent_registry = AgentRegistry()
@@ -1239,6 +1276,138 @@ class LeoApp:
 
     CONVERSATION_HISTORY_LIMIT = 50
 
+    def _compaction_config(self) -> compaction.CompactionConfig:
+        """Translate ``settings.compaction`` into the engine's own config type.
+
+        Kept as an explicit translation so the engine never reads Settings and
+        can be unit-tested with a bare ``CompactionConfig``.
+        """
+        raw = getattr(self.settings, "compaction", None)
+        if raw is None:
+            return compaction.CompactionConfig()
+        return compaction.CompactionConfig(
+            enabled=bool(getattr(raw, "enabled", True)),
+            threshold=float(getattr(raw, "threshold", 0.9)),
+            keep_recent_tokens=int(getattr(raw, "keep_recent_tokens", 20_000)),
+            summary_input_chars=int(getattr(raw, "summary_input_chars", 160_000)),
+            corrective_attempts=int(getattr(raw, "corrective_attempts", 2)),
+            identifier_policy=str(getattr(raw, "identifier_policy", "strict")),
+            memory_flush=bool(getattr(raw, "memory_flush", True)),
+            on_timeout=str(getattr(raw, "on_timeout", "deterministic")),
+        )
+
+    def _compaction_provider(self) -> Any:
+        """Router (or a pinned summarizer) used for summarization requests."""
+        pinned = str(getattr(self.settings.compaction, "model", "") or "").strip()
+        if not pinned:
+            return self.router
+        return _PinnedModelProvider(self.router, pinned, self.settings.models.providers)
+
+    async def compact_conversation(
+        self,
+        conversation_id: str,
+        *,
+        focus: str = "",
+        preview: bool = False,
+    ) -> dict[str, Any]:
+        """Summarize older turns once and persist the boundary.
+
+        The transcript is never rewritten; only what the model sees changes.
+        A failed manual compaction keeps the original history and reports why.
+        """
+        rows = await db.fetchall(
+            "SELECT id, role, content, metadata FROM messages "
+            "WHERE conversation_id=? ORDER BY id ASC",
+            (conversation_id,),
+        )
+        if not rows:
+            return {
+                "ok": False,
+                "reason": "this conversation has no messages to compact",
+            }
+        messages = self._rows_to_messages(list(rows))
+        boundary = await compaction.latest(conversation_id)
+        if boundary is not None:
+            # Replay view for the engine is post-boundary history only; the
+            # summary is carried forward as context, not re-summarized.
+            messages = [m for m in messages if m.name != compaction.SUMMARY_NAME]
+        message_ids = [int(row["id"]) for row in rows]
+        result = await self.compaction.compact(
+            conversation_id,
+            messages,
+            provider=self._compaction_provider(),
+            budget=self._context_budget(),
+            focus=focus,
+            preview=preview,
+            previous=boundary,
+            message_ids=message_ids,
+        )
+        payload = result.payload()
+        payload["command"] = "compact"
+        payload["conversation_id"] = conversation_id
+        payload["preview"] = preview
+        if result.summary and preview:
+            payload["summary"] = result.summary
+        return payload
+
+    async def _maybe_auto_compact(
+        self,
+        conversation_id: str,
+        messages: list[ChatMessage],
+        budget: int,
+    ) -> list[ChatMessage]:
+        """Compact before a turn when occupancy crosses the configured threshold.
+
+        Returns the messages to send. A compaction failure never blocks the
+        turn: the existing per-turn optimizer still bounds the request.
+        """
+        config = self.compaction.config
+        if not compaction.CompactionEngine.should_compact(messages, budget, config):
+            return messages
+        rows = await self._conversation_rows(conversation_id)
+        if not rows:
+            return messages
+        message_ids = [int(row["id"]) for row in rows]
+        try:
+            result = await self.compaction.compact(
+                conversation_id,
+                messages,
+                provider=self._compaction_provider(),
+                budget=budget,
+                previous=await compaction.latest(conversation_id),
+                message_ids=message_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - maintenance must not break chat
+            _LOG.warning("auto-compaction failed", extra={"error": str(exc)[:200]})
+            return messages
+        if not result.ok:
+            _LOG.debug(
+                "auto-compaction skipped", extra={"reason": result.reason or "unknown"}
+            )
+            return messages
+        boundary = await compaction.latest(conversation_id)
+        if boundary is None:
+            return messages
+        # Rebuild the replay view: summary + post-boundary history, then the
+        # current turn's user message (which is not durable history yet).
+        replay = await self._conversation_history(conversation_id)
+        latest_user = next(
+            (m for m in reversed(messages) if m.role == "user"), None
+        )
+        if latest_user is not None and not any(
+            m.role == "user" and m.content == latest_user.content for m in replay
+        ):
+            replay = [*replay, latest_user]
+        _LOG.info(
+            "auto-compaction committed",
+            extra={
+                "conversation_id": conversation_id,
+                "summarized": result.messages_summarized,
+                "degraded": result.degraded,
+            },
+        )
+        return replay
+
     def _context_budget(self, provider: str | None = None) -> int:
         """Estimated-token budget from the configured provider context window."""
         models = getattr(self.settings, "models", None)
@@ -1371,18 +1540,33 @@ class LeoApp:
         hard cap of ``limit`` plus a tool-round budget is reached. Results
         whose opener is beyond that cap are demoted to text instead of being
         silently discarded.
+
+        A durable compaction boundary, when present, is applied as a row floor
+        and its summary is prepended as a system message. The transcript itself
+        is never modified.
         """
+        rows = await self._conversation_rows(conversation_id)
+        history = self._rows_to_messages(rows)
+        boundary = await compaction.latest(conversation_id)
+        if boundary is not None:
+            return [compaction.CompactionEngine.summary_message(boundary), *history]
+        return history
+
+    async def _conversation_rows(self, conversation_id: str) -> list[Any]:
+        """Select durable rows for replay, honoring the compacted boundary."""
         limit = max(1, int(self.CONVERSATION_HISTORY_LIMIT))
         page_size = max(limit, 8)
         tool_round_budget = self.round_budget * limit
         hard_cap = max(limit * 4, limit + tool_round_budget)
+        boundary = await compaction.latest(conversation_id)
+        floor_id = boundary.upto_message_id if boundary is not None else 0
         rows: list[Any] = []
         selected: list[Any] = []
         while len(rows) < hard_cap:
             batch = await db.fetchall(
-                "SELECT role, content, metadata FROM messages WHERE conversation_id=? "
-                "ORDER BY id DESC LIMIT ? OFFSET ?",
-                (conversation_id, min(page_size, hard_cap - len(rows)), len(rows)),
+                "SELECT id, role, content, metadata FROM messages "
+                "WHERE conversation_id=? AND id>? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (conversation_id, floor_id, min(page_size, hard_cap - len(rows)), len(rows)),
             )
             if not batch:
                 break
@@ -1396,7 +1580,9 @@ class LeoApp:
                 # An assistant/user/system row (or the oldest stored row)
                 # closes the group: no more history needs to be fetched.
                 break
+        return selected
 
+    def _rows_to_messages(self, selected: list[Any]) -> list[ChatMessage]:
         history: list[ChatMessage] = []
         expected_ids: list[str] = []
         seen_ids: set[str] = set()
@@ -1776,6 +1962,11 @@ class LeoApp:
             tools=tool_specs,
             task_id=conversation_id,
         )
+        # Durable compaction runs before the per-turn optimizer so the summary
+        # replaces history instead of being re-derived on every request.
+        request.messages = await self._maybe_auto_compact(
+            conversation_id, request.messages, budget
+        )
         request.messages = self.context.optimize(request.messages, budget=budget, memories=memories, provider=self.router)
         tool_results: list[dict[str, Any]] = []
         pending_calls: list[dict[str, Any]] = []
@@ -2085,6 +2276,10 @@ class LeoApp:
                     ChatMessage(role="user", content=prompt, images=images),
                 ],
                 task_category="conversation", tools=tool_specs, task_id=conversation_id,
+            )
+            # Durable compaction runs once, before the per-turn optimizer.
+            request.messages = await self._maybe_auto_compact(
+                conversation_id, request.messages, budget
             )
             request.messages = self.context.optimize(request.messages, budget=budget, memories=memories, provider=self.router)
             tool_results: list[dict[str, Any]] = []

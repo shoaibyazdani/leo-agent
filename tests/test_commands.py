@@ -125,7 +125,8 @@ async def test_help_lists_implemented_and_explicitly_unavailable_commands(regist
         assert name in text
     assert "[UNAVAILABLE:" in text
     assert "/compact" in text and "/compress" in text  # alias discoverability
-    assert "UNAVAILABLE: LEO only optimizes context per turn" in text
+    # /compact is now implemented; it must not be advertised as unavailable.
+    assert "UNAVAILABLE: LEO only optimizes context per turn" not in text
     assert result.data["total"] == len(registry.all())
     for entry in result.data["commands"]:
         assert entry["help"] and entry["category"]
@@ -205,7 +206,7 @@ async def test_medium_risk_policy_denial_is_truthful(registry, app):
 
 
 async def test_unavailable_commands_report_a_reason_instead_of_executing(registry, app):
-    for text in ("/compact", "/voice", "/retry", "/plugins", "/steer hi"):
+    for text in ("/resume", "/voice", "/retry", "/plugins", "/steer hi"):
         result = await call(registry, app, text)
         assert result.status is CommandStatus.UNSUPPORTED, text
         assert result.code == "unsupported"
@@ -247,7 +248,7 @@ async def test_model_usage_context_and_config_are_read_only(registry, app):
     assert usage.status is CommandStatus.OK and usage.data["calls"] == 0
     context = await call(registry, app, "/context")
     assert context.status is CommandStatus.OK
-    assert context.data["compaction"].startswith("per-turn optimization")
+    assert context.data["compaction"].startswith("durable:")
     config = await call(registry, app, "/config get default_provider")
     assert config.data["value"] == "mock"
     unknown = await call(registry, app, "/config get api_key")
