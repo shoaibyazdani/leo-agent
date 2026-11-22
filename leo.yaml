@@ -272,6 +272,14 @@ models:
       cost_per_million_input: 1.5
       cost_per_million_output: 4.5
       capabilities: [text, streaming, tools, structured, usage, vision]
+
+paths:
+  # Whitelist root for outbound attachments (channel_send / message send media).
+  # Config-owned on purpose: it is read once at startup and given to the Gateway
+  # at construction, so no tool-call argument can widen it. Relative paths are
+  # resolved against the config root. Files outside this tree are refused.
+  outbound_media: .leo/media/outbound
+
 security:
   # Smart shell policy. smart auto-runs read-only/test commands, asks
   # for risky or unknown ones, and always denies the hardline blocklist.
