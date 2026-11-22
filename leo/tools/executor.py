@@ -24,7 +24,16 @@ from .shell_policy import preflight as shell_preflight, risk as shell_risk
 
 _LOG = get_logger("tools")
 
-DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+# Fallback deadline for a tool that declares nothing and has no configured
+# value. Tool-specific and operator-configured timeouts always win over it.
+DEFAULT_TOOL_TIMEOUT_SECONDS = 180.0
+# Tools whose deadline comes from security.shell_timeout_seconds. Before this
+# mapping existed the shell tool declared no timeout, so this 30s fallback
+# capped every command no matter what the operator configured.
+_CONFIGURED_TIMEOUTS: dict[str, str] = {
+    "shell": "shell_timeout_seconds",
+    "terminal": "shell_timeout_seconds",
+}
 _RESOURCE_KEYS = ("path", "cwd", "resource", "file", "directory", "root", "target")
 
 # No-progress guard, tool side: after this many failures of the SAME class in
@@ -364,9 +373,21 @@ class ToolExecutorImpl:
             return max(1, min(explicit, self._ceiling()))
         return self._limit_for_hint()
 
+    def _configured_timeout(self, registration: Any) -> float | None:
+        """The operator's own deadline for this tool, when it has one."""
+        name = str(getattr(getattr(registration, "spec", None), "name", "") or "")
+        field = _CONFIGURED_TIMEOUTS.get(name)
+        if not field:
+            return None
+        value = getattr(self.settings.security, field, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+        return None
+
     def _timeout_for(self, registration: Any, call: ToolCall) -> float:
         for source in (getattr(call, "timeout_seconds", None), getattr(registration.spec, "timeout_seconds", None),
-                       getattr(registration.spec, "timeout", None), self.timeout_seconds):
+                       getattr(registration.spec, "timeout", None),
+                       self._configured_timeout(registration), self.timeout_seconds):
             if isinstance(source, (int, float)) and not isinstance(source, bool) and source > 0:
                 return float(source)
         return DEFAULT_TOOL_TIMEOUT_SECONDS

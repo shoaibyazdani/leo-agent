@@ -429,7 +429,7 @@ async def test_served_requests_are_audited_without_file_content(env) -> None:
 
     # The same metadata is emitted on the in-process event bus for live views.
     await asyncio.sleep(0.1)
-    events = await env.events.history("preview.serve", limit=20)
+    events = await env.events.history("preview.serve", limit=500)  # shared bus: window must outlast other modules
     served_events = [event for event in events if event.payload.get("token_id") == audit_id]
     assert len(served_events) == 2
     assert all(token not in json.dumps(event.payload) for event in served_events)

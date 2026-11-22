@@ -1746,7 +1746,7 @@ async def test_app_wires_finalized_slash_registry() -> None:
         available = {spec.name: spec for spec in app.commands.all() if spec.available}
         # /export (and its aliases) is the latest shipped slash command: it must
         # be live in the composed catalog with a callable handler and chat surface.
-        assert len(available) == 35
+        assert len(available) == 37
         export = available["export"]
         assert callable(export.handler)
         assert "chat" in export.surfaces

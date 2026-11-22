@@ -42,7 +42,9 @@ DURABLE_SUBSCRIPTIONS: tuple[tuple[str, str], ...] = (
 # the model can consume the last round's results and produce a final answer.
 # The last allowed model call can therefore only answer; if it asks for more
 # tools those calls are left unexecuted and reported as pending.
-MAX_CHAT_TOOL_ROUNDS = 8
+# Default tool-executing rounds per chat turn. An operator can raise it with
+# settings.max_chat_tool_rounds; this constant is only the fallback.
+MAX_CHAT_TOOL_ROUNDS = 250
 
 _BUDGET_EXHAUSTED_TEXT = "Tool budget exhausted before a final answer"
 _NO_ANSWER_TEXT = "The model returned an empty answer; no response was produced."
@@ -123,6 +125,10 @@ class LeoApp:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or Settings.load()
         self.settings.ensure_dirs()
+        # One turn's tool budget. Read once at construction: a settings change
+        # needs a restart, exactly like every other budget in this app.
+        configured_rounds = getattr(self.settings, "max_chat_tool_rounds", None)
+        self.round_budget = int(configured_rounds or MAX_CHAT_TOOL_ROUNDS)
         self.events = EventBus()
         self.permissions = PermissionManagerImpl(self.settings, self.events)
         self.log = configure_logging(self.settings)
@@ -1365,7 +1371,7 @@ class LeoApp:
         """
         limit = max(1, int(self.CONVERSATION_HISTORY_LIMIT))
         page_size = max(limit, 8)
-        tool_round_budget = MAX_CHAT_TOOL_ROUNDS * limit
+        tool_round_budget = self.round_budget * limit
         hard_cap = max(limit * 4, limit + tool_round_budget)
         rows: list[Any] = []
         selected: list[Any] = []
@@ -1778,8 +1784,8 @@ class LeoApp:
             # MAX_CHAT_TOOL_ROUNDS executions + one reserved model call to
             # consume the final tool results (the N+1 invariant). A round whose
             # calls were all repeats also jumps straight to that reserved call.
-            for iteration in range(MAX_CHAT_TOOL_ROUNDS + 1):
-                final_call = force_final or iteration == MAX_CHAT_TOOL_ROUNDS
+            for iteration in range(self.round_budget + 1):
+                final_call = force_final or iteration == self.round_budget
                 if final_call:
                     self._append_final_answer_instruction(request)
                 response = await self.router.complete(request)
@@ -2105,9 +2111,9 @@ class LeoApp:
                 async for delta in self.router.stream(model_request):
                     yield StreamChunk(kind="text", text=delta)
 
-            for iteration in range(MAX_CHAT_TOOL_ROUNDS + 1):
+            for iteration in range(self.round_budget + 1):
                 cancellation_guard()
-                final_call = force_final or iteration == MAX_CHAT_TOOL_ROUNDS
+                final_call = force_final or iteration == self.round_budget
                 if final_call:
                     self._append_final_answer_instruction(request)
                 pieces: list[str] = []
