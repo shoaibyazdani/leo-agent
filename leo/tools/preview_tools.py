@@ -134,6 +134,12 @@ class _Preview:
     inode: int
     size: int
     content_type: str
+    # dev/ino alone is not identity: unlinking a file and creating another in its
+    # place often reuses the same inode number, and a hard link changing nlink
+    # moves ctime without touching the bytes. The digest of what the token was
+    # issued against is the only check that answers the real question - is this
+    # still the content a human agreed to expose.
+    digest: str = ""
 
 
 class _PreviewState:
@@ -152,6 +158,20 @@ class _PreviewState:
 
 
 _STATE = _PreviewState()
+
+
+def _content_digest(path: Path, size: int) -> str:
+    """Digest of the bytes a preview token is issued against.
+
+    Read the file once at creation and compare the same digest on every request:
+    an unlink+create that lands on the same inode, or a hard link that moves
+    ctime, cannot smuggle different bytes under an earlier token.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read(size + 1)).hexdigest()
+    except OSError:
+        return ""
 
 
 def _within_roots(candidate: Path, roots: tuple[Path, ...]) -> bool:
@@ -485,6 +505,9 @@ class _PreviewRequestHandler(BaseHTTPRequestHandler):
         if failure is not None:
             self._reject(403, failure)
             return
+        if preview.digest and hashlib.sha256(payload).hexdigest() != preview.digest:
+            self._reject(403, "preview file changed since creation")
+            return
         with state.lock:
             active = state.previews.get(token) is preview
         if not active:
@@ -585,6 +608,7 @@ async def preview_local_file(args: dict[str, Any], ctx: dict[str, Any]) -> dict[
                 inode=info.st_ino,
                 size=info.st_size,
                 content_type=content_type,
+                digest=_content_digest(path, info.st_size),
             )
             state.previews[token] = preview
     except OSError as exc:
