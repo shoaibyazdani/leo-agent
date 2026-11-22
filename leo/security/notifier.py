@@ -28,6 +28,7 @@ from typing import Any
 from ..config import Settings
 from ..events import Event, EventBus
 from ..logging import get_logger
+from datetime import datetime
 from .approval_buttons import build_keyboard
 
 _LOG = get_logger("security.notifier")
@@ -117,6 +118,33 @@ class ApprovalNotifier:
         return "\n".join(lines)
 
     # -- handler -----------------------------------------------------------
+    async def _still_actionable(self, approval_id: str) -> bool:
+        """True only while the approval is pending and inside its own timeout.
+
+        Announcements can be replayed (a retry, a re-emitted event, an operator
+        sweeping old rows). Pushing a decision the human can no longer make trains
+        them to ignore the ones they can.
+        """
+        from .. import db  # local import: the notifier is imported before db is initialised
+
+        try:
+            row = await db.fetchone(
+                "SELECT status, created_at FROM approvals WHERE id=?", (approval_id,)
+            )
+        except Exception:  # noqa: BLE001 - a lookup must not stop a real notification
+            return True
+        if row is None:
+            return False
+        if str(row["status"]) != "pending":
+            return False
+        timeout = float(getattr(self.settings.security, "approval_timeout_seconds", 900))
+        try:
+            created = datetime.fromisoformat(str(row["created_at"]))
+            age = (datetime.now(created.tzinfo) - created).total_seconds()
+        except (TypeError, ValueError):
+            return True
+        return age <= timeout
+
     async def _on_requested(self, event: Event) -> None:
         resolved = self._resolved()
         if resolved is None:
@@ -124,6 +152,11 @@ class ApprovalNotifier:
             return
         channel, target = resolved
         payload = event.payload if isinstance(event.payload, dict) else {}
+        if not await self._still_actionable(str(payload.get("approval_id") or "")):
+            self._skipped += 1
+            _LOG.info("approval notification skipped: no longer actionable", extra={
+                "channel": channel, "approval_id": payload.get("approval_id")})
+            return
         text = self._message(payload)
         try:
             adapter = self.gateway._adapter(channel)  # noqa: SLF001 - same package

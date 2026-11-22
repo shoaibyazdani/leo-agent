@@ -54,6 +54,19 @@ def _request(approval_id: str = "apr_test", action: str = "gateway.send") -> Eve
     )
 
 
+async def _pending_approval(approval_id: str, action: str = "gateway.send") -> None:
+    """A notification must correspond to a real, still-pending approval."""
+    from leo import db
+    from leo.contracts import utcnow
+
+    await db.execute(
+        "INSERT OR REPLACE INTO approvals(id,created_at,status,actor,action,resource,risk,"
+        "reason,requested_by,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (approval_id, utcnow(), "pending", "operator", action, None, "high",
+         "test", "operator", "{}"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_request_is_pushed_to_operator_channel() -> None:
     bus = EventBus(persist=False)
@@ -61,6 +74,7 @@ async def test_request_is_pushed_to_operator_channel() -> None:
     notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
     assert notifier.start() is True
 
+    await _pending_approval("apr_1")
     await bus.emit("approval.requested", approval_id="apr_1", action="gateway.send",
                    resource="telegram:525083981", risk="high")
 
@@ -79,6 +93,7 @@ async def test_disabled_does_not_subscribe() -> None:
     notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(enabled=False), events=bus)
 
     assert notifier.start() is False
+    await _pending_approval("apr_1")
     await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
     assert adapter.sent == []
 
@@ -102,6 +117,7 @@ async def test_send_failure_never_breaks_the_requesting_call() -> None:
     notifier.start()
 
     # publish() gathers handlers with return_exceptions=True, so this must not raise.
+    await _pending_approval("apr_1")
     await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
 
     assert adapter.sent == []
@@ -130,6 +146,7 @@ async def test_notifier_uses_adapter_directly_not_gateway_send() -> None:
     adapter = FakeAdapter()
     notifier = ApprovalNotifier(RecordingGateway(adapter, bus), _settings(), events=bus)
     notifier.start()
+    await _pending_approval("apr_1")
     await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
 
     assert calls == []

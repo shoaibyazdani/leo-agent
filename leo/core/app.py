@@ -389,6 +389,17 @@ class LeoApp:
         self.gateway.set_callback_sink(self.handle_channel_callback)
         # Only now is the adapter registry populated with enrolled channels.
         self.approval_notifier.start()
+        # A pending approval that outlived its timeout is a decision nobody can
+        # make any more. Nothing swept them, so they accumulated and any push
+        # would re-announce dead ones; expire them once per start.
+        try:
+            stale_hours = max(
+                0.05,
+                float(getattr(self.settings.security, "approval_timeout_seconds", 900)) / 3600.0,
+            )
+            await self.permissions.cleanup_approvals(older_than_hours=stale_hours, apply=True)
+        except Exception as exc:  # noqa: BLE001 - housekeeping must never block startup
+            self.log.warning("approval sweep failed", extra={"error": type(exc).__name__})
         await self.gateway.recover_stale_outbox()
 
         # Channel matrix → dashboard: statuses are honest (blocked until the
