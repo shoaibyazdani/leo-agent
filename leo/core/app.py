@@ -300,6 +300,10 @@ class LeoApp:
                 if done:
                     return task.result()
                 if await self._turn_stop_requested(conversation_id, since):
+                    _LOG.info("stop observed while waiting", extra={
+                        "conversation_id": str(conversation_id)[:24],
+                        "cancelled": True,
+                    })
                     task.cancel()
                     try:
                         await task
