@@ -144,7 +144,12 @@ def create_api(
             if asyncio.get_running_loop().time() >= deadline:
                 return {"admission": None}
             await asyncio.sleep(WORKER_IDLE_SLICE)
-            await store.reclaim_expired()
+            # A worker that died mid-turn never calls /v1/complete or /v1/fail,
+            # so its typing task would pulse on this channel forever. Reclaim
+            # reports the ids precisely so those pulses can be stopped here —
+            # the gesture that started them lives in this process.
+            for reclaimed in await store.reclaim_expired():
+                _stop_typing(reclaimed)
 
     @api.post("/v1/renew")
     async def renew(request: RenewRequest,

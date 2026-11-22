@@ -189,15 +189,37 @@ class GatewayStore:
         )
         return status
 
-    async def reclaim_expired(self) -> int:
-        """Return expired claims to the queue. Safe to call on a timer."""
+    async def reclaim_expired(self) -> list[str]:
+        """Return expired claims to the queue; report *which* ones moved.
+
+        Returns the admission ids, not a count: the caller owns an in-memory
+        typing task per admission, and a worker that died leaves that task
+        pulsing forever. Only the ids let the caller stop the right tasks — a
+        bare count would look like a successful reclaim while the channel kept
+        showing "typing" indefinitely.
+
+        Rows that ended in a non-retryable state while still holding an expired
+        claim are reported too, without being requeued: their typing task is
+        just as orphaned, and nothing else will ever stop it.
+        """
         now = _iso(_now())
-        cursor = await db.execute(
+        expired = await db.fetchall(
+            "SELECT admission_id, status FROM gateway_queue "
+            "WHERE claim_expires_at IS NOT NULL AND claim_expires_at < ?",
+            (now,),
+        )
+        stranded = [
+            str(row[0]) for row in expired
+            if str(row[1]) not in (ADMISSION_DONE, ADMISSION_QUEUED)
+        ]
+        if not stranded:
+            return []
+        await db.execute(
             "UPDATE gateway_queue SET status=?, claim_expires_at=NULL, claimed_by=NULL, "
             "updated_at=? WHERE status=? AND claim_expires_at IS NOT NULL AND claim_expires_at < ?",
             (ADMISSION_QUEUED, now, ADMISSION_CLAIMED, now),
         )
-        return int(getattr(cursor, "rowcount", 0) or 0)
+        return stranded
 
     async def stats(self) -> dict[str, Any]:
         queue = {

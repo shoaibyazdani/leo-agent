@@ -163,7 +163,8 @@ async def test_a_renewed_turn_expires_once_renewal_stops():
     reclaimed = await store.reclaim_expired()
     claimed_again = await store.claim("worker-b", lease_seconds=30)
 
-    assert reclaimed == 1
+    # The ids are the contract: the caller stops one typing task per id.
+    assert reclaimed == [admission_id]
     assert claimed_again is not None and claimed_again["admission_id"] == admission_id
 
 
