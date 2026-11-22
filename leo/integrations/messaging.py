@@ -30,6 +30,44 @@ from .transport_state import TransportState
 
 _LOG = logging.getLogger(__name__)
 
+# Telegram rejects a message body over 4096 characters outright. Leave room for the
+# part marker so a split never lands exactly on the limit.
+TELEGRAM_MAX_CHARS = 4000
+MAX_MESSAGE_CHUNKS = 20
+
+
+def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS,
+                  max_chunks: int = MAX_MESSAGE_CHUNKS) -> list[str]:
+    """Split text into transport-sized parts, preferring natural boundaries.
+
+    A single 400 is worth nothing to a user who asked a question: the answer either
+    arrives in readable parts or it does not arrive at all. Paragraphs first, then
+    lines, then words, and only as a last resort a hard cut.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    remaining = text
+    while remaining and len(parts) < max_chunks:
+        if len(remaining) <= limit:
+            parts.append(remaining)
+            remaining = ""      # consumed: a leftover here would add a false "truncated"
+            break
+        window = remaining[:limit]
+        cut = window.rfind("\n\n")
+        if cut < limit // 2:
+            cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        parts.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        parts.append(remaining[:limit].rstrip() + "\n\n… (truncated)")
+    return parts
+
 
 class MessagingError(RuntimeError):
     """Adapter could not send or process a message."""
@@ -431,11 +469,23 @@ class TelegramAdapter(MessagingAdapter):
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
             raise MessagingError("telegram send blocked: TELEGRAM_BOT_TOKEN is not set")
+        # Telegram caps one message at 4096 characters and rejects the whole send
+        # with 400 otherwise. A long answer must arrive in parts, not vanish.
+        chunks = split_message(str(text), TELEGRAM_MAX_CHARS)
+        last: dict[str, Any] = {}
+        for index, chunk in enumerate(chunks):
+            last = await self._send_one(token, target, chunk)
+            if index + 1 < len(chunks):
+                _LOG.info("telegram long message split", extra={
+                    "chunks": len(chunks), "part": index + 1})
+        return last
+
+    async def _send_one(self, token: str, target: str, text: str) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
         try:
             response = await self._http().post(
-                url, json={"chat_id": str(target), "text": str(text)}, timeout=self.timeout
+                url, json={"chat_id": str(target), "text": text}, timeout=self.timeout
             )
         except httpx.HTTPError as exc:
             raise MessagingError(f"telegram send failed: {type(exc).__name__}") from None
