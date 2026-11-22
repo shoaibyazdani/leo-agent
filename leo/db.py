@@ -149,6 +149,49 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 );
 CREATE INDEX IF NOT EXISTS idx_tool_calls_created ON tool_calls(created_at);
 
+CREATE TABLE IF NOT EXISTS transport_cursors (
+  channel TEXT NOT NULL, account TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY(channel, account)
+);
+
+CREATE TABLE IF NOT EXISTS transport_heartbeats (
+  channel TEXT NOT NULL, account TEXT NOT NULL DEFAULT '',
+  pid INTEGER, note TEXT NOT NULL DEFAULT '', beat_at TEXT NOT NULL,
+  PRIMARY KEY(channel, account)
+);
+
+CREATE TABLE IF NOT EXISTS gateway_admissions (
+  admission_id TEXT PRIMARY KEY, request_id TEXT, channel TEXT NOT NULL,
+  subject TEXT NOT NULL, principal TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL, payload_digest TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(channel, payload_digest)
+);
+
+CREATE TABLE IF NOT EXISTS gateway_queue (
+  admission_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'queued',
+  attempts INTEGER NOT NULL DEFAULT 0, claimed_by TEXT, claimed_at TEXT,
+  claim_expires_at TEXT, last_error TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_turn_leases (
+  conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL,
+  acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gateway_routes (
+  channel TEXT NOT NULL, subject TEXT NOT NULL, conversation_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL, PRIMARY KEY(channel, subject)
+);
+
+CREATE TABLE IF NOT EXISTS gateway_attach_tickets (
+  ticket TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL, used_at TEXT
+);
+
 -- Durable, actor-scoped tool-call quotas, one row per bucket/window. The
 -- executor increments it inside BEGIN IMMEDIATE so the check and charge are
 -- atomic across processes and survive restarts.

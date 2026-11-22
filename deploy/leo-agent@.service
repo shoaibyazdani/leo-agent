@@ -1,0 +1,32 @@
+[Unit]
+Description=LEO agent (serve: API + dashboard + channel adapters)
+Documentation=https://github.com/shoaibyazdani/leo-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the operator who owns the config, the database and the media store.
+User=%i
+WorkingDirectory=/opt/leo-agent
+# Secrets live in a 0600 env file, never in the unit and never in the repo.
+EnvironmentFile=-/home/%i/.config/leo/env
+Environment=LEO_HOME=/home/%i/.config/leo
+Environment=LEO_CONFIG=/home/%i/.config/leo/leo.yaml
+Environment=LEO_SERVICE_UNIT=leo-agent@%i.service
+ExecStart=/opt/leo-agent/.venv/bin/leo serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=3
+# The gateway drains its outbox on SIGTERM; give one turn time to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening: LEO reads and writes only what it is given.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/%i/.config/leo /home/%i/.leo /home/%i/.local/share/leo
+
+[Install]
+WantedBy=multi-user.target

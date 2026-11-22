@@ -14,6 +14,10 @@ returns an explicit ``unsupported`` result instead of pretending to work.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .. import db
@@ -400,6 +404,181 @@ async def new_command(ctx: CommandContext) -> CommandResult:
         ctx, "new",
         f"New conversation {conversation_id} created; this channel switches to it on your next message.",
         {"conversation_id": conversation_id, "subject": subject},
+    )
+
+
+async def _schedule_restart(ctx: CommandContext, command: str = "restart") -> bool:
+    """Spawn a detached child that restarts the service once this reply lands."""
+    unit = str(os.getenv("LEO_SERVICE_UNIT") or "leo-agent.service")
+    delay = max(1, int(os.getenv("LEO_RESTART_DELAY_SECONDS") or 3))
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user input
+            ["/bin/sh", "-c", f"sleep {delay}; systemctl restart {unit}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError:
+        return False
+    await _audit(ctx, f"slash.{command}.restart", unit, f"scheduled restart in {delay}s")
+    return True
+
+
+def _install_root() -> Path:
+    """The checkout LEO runs from: env override, else two levels above the package."""
+    override = os.getenv("LEO_INSTALL_ROOT")
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parents[2]
+
+
+def _git(*args: str, cwd: Path) -> tuple[int, str]:
+    done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=120, check=False
+    )
+    return done.returncode, (done.stdout or done.stderr or "").strip()
+
+
+async def update_command(ctx: CommandContext) -> CommandResult:
+    """Report available updates; install them only when explicitly asked.
+
+    A bare /update is read-only. Installing needs the word "apply", because an
+    update rewrites the checkout and restarts the process - never by surprise.
+    Every precondition fails closed: not a checkout, dirty tree, no remote, or a
+    diverged branch stops before anything is modified.
+    """
+    root = _install_root()
+    apply_now = any(arg.lower() in ("apply", "install", "yes") for arg in ctx.argv)
+    if not (root / ".git").exists():
+        return _summary(
+            ctx, "update",
+            f"Not a git checkout ({root}) — update with your package manager.",
+            {"root": str(root), "updated": False},
+        )
+
+    code, branch = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=root)
+    if code != 0 or not branch or branch == "HEAD":
+        return _summary(ctx, "update", f"Cannot determine the checked-out branch in {root}.",
+                        {"root": str(root), "updated": False})
+
+    code, dirty = _git("status", "--porcelain", cwd=root)
+    if code != 0:
+        return _summary(ctx, "update", f"Cannot read the working tree: {dirty[:160]}",
+                        {"root": str(root), "branch": branch, "updated": False})
+    if dirty:
+        return _summary(
+            ctx, "update",
+            f"{len(dirty.splitlines())} uncommitted change(s) in {root}. Commit or stash them "
+            "first — an update must never overwrite local work.",
+            {"root": str(root), "branch": branch, "dirty_files": len(dirty.splitlines()),
+             "updated": False},
+        )
+
+    code, out = _git("fetch", "--quiet", "origin", branch, cwd=root)
+    if code != 0:
+        return _summary(ctx, "update", f"Cannot reach the remote: {out[:160]}",
+                        {"root": str(root), "branch": branch, "updated": False})
+
+    code, behind = _git("rev-list", "--count", f"HEAD..origin/{branch}", cwd=root)
+    if code != 0:
+        return _summary(ctx, "update", f"Cannot compare with origin/{branch}: {behind[:160]}",
+                        {"root": str(root), "branch": branch, "updated": False})
+    count = int(behind or 0)
+    code, head = _git("rev-parse", "--short", "HEAD", cwd=root)
+    if count == 0:
+        return _summary(ctx, "update", f"Already up to date on {branch} ({head}).",
+                        {"root": str(root), "branch": branch, "behind": 0, "updated": False})
+
+    code, log = _git("log", "--oneline", "-n", "8", f"HEAD..origin/{branch}", cwd=root)
+    commits = [line for line in log.splitlines() if line.strip()]
+    if not apply_now:
+        await _audit(ctx, "slash.update.check", str(root), f"{count} commit(s) available")
+        return _summary(
+            ctx, "update",
+            f"{count} update(s) available on {branch}:\n"
+            + "\n".join(f"  • {line}" for line in commits[:8])
+            + ("\n  …" if count > len(commits) else "")
+            + "\n\nSend /update apply to install and restart.",
+            {"root": str(root), "branch": branch, "behind": count,
+             "commits": commits, "updated": False},
+        )
+
+    code, changed = _git("diff", "--name-only", f"HEAD..origin/{branch}", cwd=root)
+    deps_moved = any(
+        name in ("pyproject.toml", "uv.lock", "requirements.txt", "install.sh")
+        for name in changed.splitlines()
+    )
+    code, out = _git("merge", "--ff-only", f"origin/{branch}", cwd=root)
+    if code != 0:
+        first = out.splitlines()[0] if out else "history diverged"
+        return _summary(
+            ctx, "update",
+            f"Update stopped: {branch} cannot be fast-forwarded ({first}). Nothing was changed.",
+            {"root": str(root), "branch": branch, "updated": False},
+        )
+
+    deps_note = "dependencies unchanged"
+    deps_ok = True
+    if deps_moved:
+        try:
+            done = subprocess.run(  # noqa: S603 - fixed argv
+                ["uv", "pip", "install", "--python", str(root / ".venv/bin/python"), "-e", "."],
+                cwd=str(root), capture_output=True, text=True, timeout=900, check=False,
+            )
+            deps_ok = done.returncode == 0
+            deps_note = "dependencies reinstalled" if deps_ok else "dependency install FAILED"
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            deps_ok, deps_note = False, f"dependency install failed: {exc}"
+
+    code, head = _git("rev-parse", "--short", "HEAD", cwd=root)
+    await _audit(ctx, "slash.update.apply", str(root), f"{count} commit(s) → {head}; {deps_note}")
+    restarted = await _schedule_restart(ctx, "update")
+    return _summary(
+        ctx, "update",
+        f"Updated {branch} by {count} commit(s) → {head}. {deps_note}. "
+        + ("♻️ Restarting LEO — back in a few seconds. Anything you send meanwhile "
+           "arrives once I'm up." if restarted else "Send /restart to load the new code."),
+        {"root": str(root), "branch": branch, "commits": count, "head": head,
+         "deps_ok": deps_ok, "updated": True, "restarted": restarted},
+    )
+
+
+async def restart_command(ctx: CommandContext) -> CommandResult:
+    """Restart the LEO service from chat.
+
+    A process cannot restart itself in place: the reload has to happen after
+    this reply is delivered, and it must survive the process dying. So the
+    restart is an independent, detached child that sleeps first - the same
+    pattern the operator used before there was a command for it.
+    """
+    unit = str(os.getenv("LEO_SERVICE_UNIT") or "leo-agent.service")
+    delay = max(1, int(os.getenv("LEO_RESTART_DELAY_SECONDS") or 3))
+    if not shutil.which("systemctl"):
+        return _summary(
+            ctx, "restart",
+            "Cannot restart: systemctl is not available on this host. "
+            f"Restart the process that runs 'leo serve' manually (unit guess: {unit}).",
+            {"unit": unit, "scheduled": False},
+        )
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user input
+            ["/bin/sh", "-c", f"sleep {delay}; systemctl restart {unit}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return _summary(
+            ctx, "restart",
+            f"Cannot restart {unit}: {exc}",
+            {"unit": unit, "scheduled": False, "error": str(exc)},
+        )
+    await _audit(ctx, "slash.restart", unit, f"scheduled restart in {delay}s")
+    return _summary(
+        ctx, "restart",
+        "♻️ Restarting LEO — back in a few seconds. "
+        "Anything you send meanwhile arrives once I'm up.",
+        {"unit": unit, "scheduled": True, "delay_seconds": delay},
     )
 
 
@@ -1258,10 +1437,6 @@ UNAVAILABLE: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
      "LEO has no MCP server registry in this composition root."),
     ("reload-skills", ("reload_skills",), "", "Rescan skills on disk at runtime",
      "LEO skills are registered declaratively at startup; no runtime rescan exists."),
-    ("update", (), "", "Update the agent installation",
-     "LEO has no self-update handler."),
-    ("restart", (), "", "Restart the gateway after draining runs",
-     "Process/gateway restart is not a slash handler; use the service manager."),
     ("pause", (), "[reason|off]", "Globally pause new work",
      "LEO has no global work-pause switch."),
     ("start", (), "", "Acknowledge platform start pings",
@@ -1434,6 +1609,15 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
         "new", "Create a fresh durable conversation; the client switches to the returned id",
         new_command, aliases=("clear",), args_hint="[title]", category="session",
         risk=RiskLevel.MEDIUM,
+    ))
+    registry.register(_spec(
+        "restart", "Restart the LEO service (delivery-safe: restarts after this reply)",
+        restart_command, aliases=("reboot",), args_hint="", category="session",
+        risk=RiskLevel.MEDIUM,
+    ))
+    registry.register(_spec(
+        "update", "Check for updates; '/update apply' installs them and restarts",
+        update_command, args_hint="[apply]", category="session", risk=RiskLevel.HIGH,
     ))
     registry.register(_spec(
         "reset", "Clear this conversation's messages in place (destructive, approval-gated)",
