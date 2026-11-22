@@ -2207,7 +2207,9 @@ class LeoApp:
                         try:
                             if await self._turn_stop_requested(conversation_id, turn_started):
                                 raise TurnStopped(conversation_id)
-                            result = await self.executor.execute(call)
+                            result = await self._await_with_stop(
+                                self.executor.execute(call), conversation_id, turn_started
+                            )
                             self.progress.note(name, arguments, getattr(result, "success", None))
                             result_content = json.dumps(result.model_dump(mode="json"), default=str)
                         except ApprovalRequired as exc:
@@ -2657,7 +2659,9 @@ class LeoApp:
                         try:
                             if await self._turn_stop_requested(conversation_id, turn_started):
                                 raise TurnStopped(conversation_id)
-                            result = await self.executor.execute(call)
+                            result = await self._await_with_stop(
+                                self.executor.execute(call), conversation_id, turn_started
+                            )
                             self.progress.note(name, arguments, getattr(result, "success", None))
                             result_content = json.dumps(result.model_dump(mode="json"), default=str)
                         except ApprovalRequired as exc:
