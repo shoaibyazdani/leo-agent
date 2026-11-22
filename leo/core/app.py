@@ -622,106 +622,28 @@ class LeoApp:
 
     # -- approval buttons --------------------------------------------------
     def _approval_senders(self, channel: str) -> list[str]:
-        """Who may resolve an approval by tapping, for this channel.
+        """Allowlist of senders who may resolve an approval on this channel."""
+        from ..gateway.callbacks import approval_senders
 
-        The channel allowlist is the authority; the environment variable is only
-        a fallback for a deployment that has not written a policy yet.
-        """
-        policies = getattr(self.settings.channels, "policies", None) or {}
-        policy = policies.get(channel) if isinstance(policies, Mapping) else None
-        allow = list(getattr(policy, "allow", []) or [])
-        if allow:
-            return allow
-        raw = os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "") if channel == "telegram" else ""
-        return [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
-
-    async def _resolve_tap_id(self, parsed: dict[str, str]) -> str | None:
-        """Turn a button payload into a real approval id.
-
-        Exact ids pass through. A 43-character locator is a hash, so it is only
-        accepted when it reproduces for a pending approval we already own.
-        """
-        approval_id = str(parsed.get("approval_id") or "")
-        if parsed.get("is_ref") != "1":
-            return approval_id or None
-        from ..security.approval_buttons import resolve_locator
-
-        rows = await db.fetchall("SELECT id FROM approvals WHERE status='pending'")
-        candidates = [str(row["id"]) for row in rows or []]
-        return resolve_locator(str(parsed.get("approval_kind") or ""), approval_id, candidates)
+        return approval_senders(self.settings, channel)
 
     async def handle_channel_callback(self, channel: str, descriptor: dict[str, Any]) -> None:
-        """Handle one inline-keyboard tap from a chat channel."""
-        from ..security.approval_buttons import (
-            SESSION_GRANT_SECONDS, is_authorized, parse_callback_data,
+        """One inline-keyboard tap, resolved through the shared handler.
+
+        The single-process app and the split gateway must behave identically, so
+        the decision logic lives in ``leo.gateway.callbacks``; here we only supply
+        the privileged resolve path (the operator tool) the app owns.
+        """
+        from ..gateway.callbacks import handle_tap
+
+        async def _resolve(approval_id: str, approved: bool, actor: str) -> dict[str, Any]:
+            return await self.operator_resolve_approval(approval_id, approved, actor=actor)
+
+        await handle_tap(
+            channel, descriptor, settings=self.settings, permissions=self.permissions,
+            adapters=self.gateway.adapters, resolve=_resolve,
+            allowed=self._approval_senders(channel),
         )
-
-        adapter = self.gateway._adapter(channel)  # noqa: SLF001 - same package
-        callback_id = str(descriptor.get("callback_id") or "")
-        chat_id = str(descriptor.get("chat_id") or "")
-        message_id = str(descriptor.get("message_id") or "")
-        sender_id = str(descriptor.get("sender_id") or "")
-
-        async def reply(note: str) -> None:
-            if callback_id:
-                await adapter.answer_callback_query(callback_id, note)  # type: ignore[attr-defined]
-
-        if not is_authorized(sender_id, self._approval_senders(channel)):
-            await reply("You are not allowed to resolve approvals")
-            self.log.info("approval tap refused", extra={
-                "channel": channel, "sender_id": sender_id, "reason": "not authorized"})
-            return
-
-        parsed = parse_callback_data(descriptor.get("data"))
-        if not parsed:
-            await reply("Unrecognised button")
-            return
-        approval_id = await self._resolve_tap_id(parsed)
-        if not approval_id:
-            await reply("That approval is no longer available")
-            return
-
-        decision = str(parsed.get("decision") or "")
-        actor = f"{channel}-button:{sender_id}"
-        granted = ""
-        if decision == "session":
-            row = await db.fetchone("SELECT action, resource FROM approvals WHERE id=?", (approval_id,))
-            if row is None:
-                await reply("Unknown approval")
-                return
-            granted = await self.permissions.grant_session(
-                str(row["action"]), row["resource"], SESSION_GRANT_SECONDS, actor,
-            )
-            decision = "approve"
-
-        approved = decision == "approve"
-        try:
-            result = await self.operator_resolve_approval(approval_id, approved, actor=actor)
-        except Exception as exc:  # noqa: BLE001 - a tap must never crash the poller
-            await reply(f"Could not resolve: {type(exc).__name__}")
-            return
-
-        ok = bool(result.get("success"))
-        verdict = "approved" if approved else "rejected"
-        note = f"{verdict}: {approval_id}"
-        if granted:
-            note += f" · always for {SESSION_GRANT_SECONDS // 3600}h"
-        await reply(note if ok else f"Failed: {result.get('error') or 'unknown error'}")
-
-        # The message keeps the record; the buttons go away so a resolved
-        # approval cannot be tapped twice.
-        text = "\n".join(filter(None, [
-            "🔐 Approval", f"id: {approval_id}",
-            ("✅ " + verdict) if ok else "⚠️ could not resolve",
-            note if not ok else "",
-        ]))
-        if chat_id and message_id:
-            await adapter.edit_message_text(  # type: ignore[attr-defined]
-                chat_id, message_id, text, {"inline_keyboard": []},
-            )
-        self.log.info("approval tap resolved", extra={
-            "channel": channel, "approval_id": approval_id, "decision": verdict,
-            "grant_id": granted or None, "sender_id": sender_id})
 
     async def _store_channel_attachment(self, channel: str, descriptor: dict[str, Any]) -> str | None:
         """Download a channel's file and store it, returning the attachment id.

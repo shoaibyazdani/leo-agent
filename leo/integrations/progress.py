@@ -34,8 +34,8 @@ _LOG = get_logger("integrations.progress")
 
 DEFAULT_INTERVAL_SECONDS = 4.0
 DEFAULT_IDLE_SECONDS = 45.0
-DEFAULT_MAX_STEPS = 6
-ARGUMENT_PREVIEW_CHARS = 90
+DEFAULT_MAX_STEPS = 3
+ARGUMENT_PREVIEW_CHARS = 52
 
 # Tools whose effect is a file write read better with a marker than a bare name.
 _WRITE_TOOLS = frozenset({"write_file", "patch", "file_move", "file_copy"})
@@ -55,15 +55,24 @@ def _preview(value: Any) -> str:
     return text
 
 
+def _short_path(value: Any) -> str:
+    """Drop the leading workspace so a path reads as `leo/app.py`, not `/root/...`."""
+    text = str(value or "")
+    for marker in ("/leo-agent-import/", "/hermes-workspace/"):
+        if marker in text:
+            return text.split(marker, 1)[1]
+    return text
+
+
 def _step_line(tool: str, arguments: dict[str, Any] | None, ok: bool | None) -> str:
     args = arguments or {}
-    marker = "" if ok is not False else "  ⚠️"
+    marker = "" if ok is not False else " ⚠️"
     if tool in _WRITE_TOOLS:
-        target = args.get("path") or args.get("destination") or args.get("source") or ""
-        return f"✍️ Writing {_preview(target)}{marker}"
+        target = _short_path(args.get("path") or args.get("destination") or args.get("source") or "")
+        return f"✍️ {_preview(target)}{marker}"
     detail = args.get("command") or args.get("path") or args.get("query") or ""
     label = "shell" if tool in {"shell", "terminal"} else tool
-    return f"{label:<9} {_preview(detail)}{marker}".rstrip()
+    return f"{label} {_preview(_short_path(detail) if tool not in {'shell', 'terminal'} else detail)}{marker}"
 
 
 class ProgressReporter:
@@ -117,9 +126,11 @@ class ProgressReporter:
         self._active = True
         self._last_flush = 0.0
         try:
-            self._ticker = asyncio.create_task(self._tick())
+            loop = asyncio.get_running_loop()
         except RuntimeError:  # no running loop: report on the next explicit flush
             self._ticker = None
+        else:
+            self._ticker = loop.create_task(self._tick())
         return True
 
     async def end(self, verdict: str = "done") -> None:
@@ -159,13 +170,36 @@ class ProgressReporter:
             return f"{seconds}s"
         return f"{seconds // 60} min"
 
+    def _coalesced(self) -> list[str]:
+        """Collapse a run of the same tool into one line: `shell ×12 · last …`.
+
+        Twenty shell calls in a row are one fact, not twenty lines, and a reader
+        wants the shape of the work plus the current step.
+        """
+        lines: list[str] = []
+        for line in self._steps:
+            label = line.split(" ", 1)[0]
+            for index in range(len(lines) - 1, -1, -1):
+                prior = lines[index]
+                if prior.split(" ", 1)[0] == label and label.startswith(("shell", "terminal", "read_file", "search_files")):
+                    count = 2
+                    if "×" in prior:
+                        try:
+                            count = int(prior.split("×", 1)[1].split(" ", 1)[0]) + 1
+                        except (IndexError, ValueError):
+                            count = 2
+                    lines[index] = f"{label} ×{count} · {line.split(' ', 1)[1] if ' ' in line else ''}".rstrip()
+                    break
+            else:
+                lines.append(line)
+        return lines[-self.max_steps:]
+
     def render(self) -> str:
-        head = f"⏳ Working — {self._duration()}"
-        if self._budget:
-            head += f" — iteration {self._iteration}/{self._budget}"
-        elif self._iteration:
-            head += f" — {self._iteration} step(s)"
-        return "\n".join([head, *self._steps])
+        head = f"⏳ {self._duration()} · {self._iteration} steps" if self._iteration else f"⏳ {self._duration()}"
+        lines = self._coalesced()
+        if lines:
+            head += f" · {lines[-1].split(' ', 1)[-1][:24]}"
+        return "\n".join([head, *lines])
 
     async def _flush(self, *, force: bool = False) -> None:
         if not (self._active or force) or not self._target:

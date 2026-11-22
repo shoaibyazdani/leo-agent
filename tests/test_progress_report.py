@@ -81,9 +81,9 @@ async def test_the_first_step_sends_one_message_and_later_steps_edit_it(env) -> 
     assert len(env.adapter.edits) == 1
     target, _message_id, edited = env.adapter.edits[0]
     assert target == "100000001"
-    assert "Working" in edited
-    assert "✍️ Writing leo/app.py" in edited
-    assert "iteration 2/250" in edited
+    assert edited.startswith("⏳"), edited
+    assert "2 steps" in edited, edited
+    assert "✍️ leo/app.py" in edited, edited
 
 
 async def test_a_burst_of_steps_is_throttled_into_the_latest_state(env) -> None:
@@ -115,9 +115,14 @@ async def test_commands_are_redacted_and_truncated(env) -> None:
     reporter.note("shell", {"command": f"curl -H 'Authorization: Bearer {token}' x"})
     reporter.note("shell", {"command": "echo " + "x" * 400})
 
-    lines = reporter.render().splitlines()[1:]
-    assert any("[redacted]" in line for line in lines)
-    assert all(len(line) <= 120 for line in lines), "a step line stays one readable line"
+    # Redaction happens when the step is recorded; the renderer may then coalesce
+    # a run of the same tool down to its latest detail.
+    raw = list(reporter._steps)
+    assert any("[redacted]" in line for line in raw), raw
+    assert all("sk-" not in line for line in raw), raw
+    assert all(len(line) <= 80 for line in raw), raw
+    rendered = reporter.render()
+    assert len(rendered.splitlines()) <= reporter.max_steps + 1
 
 
 async def test_end_leaves_a_verdict_in_the_same_message(env) -> None:

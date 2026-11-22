@@ -292,6 +292,20 @@ def run_gateway(host: str = "127.0.0.1", port: int = 8766) -> None:
         db.set_db_path(db_path)
     store = GatewayStore()
     adapters = default_adapters()
+    # Approval buttons are tapped on the transport that polls Telegram, which is
+    # THIS process in a split deployment. The app sets a sink too, but it lives in
+    # the worker and never sees an update - so without this every tap answered
+    # "No handler for this button".
+    try:
+        from ..config import Settings
+        from ..security.permissions import PermissionManagerImpl
+        from .callbacks import install as install_callbacks
+
+        _settings = Settings.load()
+        _permissions = PermissionManagerImpl(_settings)
+        install_callbacks(_settings, _permissions, adapters)
+    except Exception as exc:  # noqa: BLE001 - a gateway must start even if taps cannot
+        _LOG.warning("callback handler not installed", extra={"error": type(exc).__name__})
     api = create_api(store, token=token, adapters=adapters)
 
     config = uvicorn.Config(api, host=host, port=port, log_level="info", lifespan="on")
