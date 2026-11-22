@@ -164,3 +164,38 @@ async def test_the_idle_ticker_finishes_an_abandoned_turn(env) -> None:
     assert reporter.stats()["active"] is False
     closing = [text for _t, text in env.adapter.sent] + [edit[2] for edit in env.adapter.edits]
     assert any("✅" in text for text in closing), closing
+
+
+async def test_an_unchanged_report_is_not_re_edited(env) -> None:
+    """Re-editing identical text is what Telegram rejects as "not modified".
+
+    The retry that followed used to open a brand-new message every few seconds,
+    which is exactly how a long turn's log fell apart.
+    """
+    reporter = env.reporter
+    reporter.interval = 0.0
+    reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "ls"})
+
+    await reporter._flush(force=True)
+    edits_after_first = len(env.adapter.edits)
+    await reporter._flush()          # same content, no force
+
+    assert len(env.adapter.edits) == edits_after_first, "identical text must not be re-edited"
+    assert len(env.adapter.sent) == 1
+
+
+async def test_a_failed_edit_reopens_the_message_only_once(env) -> None:
+    class Refusing(FakeAdapter):
+        async def edit_message_text(self, *args, **kwargs):
+            return False
+
+    adapter = Refusing()
+    reporter = ProgressReporter(FakeGateway({"telegram": adapter}), env.settings)
+    reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "ls"})
+    await reporter._flush(force=True)
+    reporter.note("shell", {"command": "pwd"})
+    await reporter._flush(force=True)
+
+    assert len(adapter.sent) == 2, "a genuinely failed edit falls back to a new message"

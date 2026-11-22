@@ -720,7 +720,22 @@ class TelegramAdapter(MessagingAdapter):
             response = await self._http().post(url, json=payload, timeout=self.timeout)
         except httpx.HTTPError:
             return False
-        return response.status_code < 400
+        if response.status_code < 400:
+            return True
+        # "message is not modified" means the text is already there. That is the
+        # outcome the caller wanted, not a failure: reporting it as one made the
+        # progress reporter open a NEW message every few seconds.
+        description = ""
+        try:
+            description = str((response.json() or {}).get("description") or "")
+        except ValueError:
+            description = ""
+        if "not modified" in description.lower():
+            return True
+        _LOG.debug("edit failed", extra={
+            "channel": self.channel, "status": response.status_code,
+            "description": description[:120]})
+        return False
 
     async def _send_one(
         self, token: str, target: str, text: str,

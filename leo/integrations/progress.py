@@ -99,6 +99,7 @@ class ProgressReporter:
         self._message_id = ""
         self._last_flush = 0.0
         self._last_step = 0.0
+        self._last_text = ""
         self._active = False
         self._ticker: asyncio.Task[Any] | None = None
         self.sent = 0
@@ -122,6 +123,7 @@ class ProgressReporter:
         self._iteration = 0
         self._started = time.monotonic()
         self._message_id = ""
+        self._last_text = ""
         self._steps.clear()
         self._active = True
         self._last_flush = 0.0
@@ -209,12 +211,18 @@ class ProgressReporter:
             return
         self._last_flush = now
         text = self.render()
+        if text == self._last_text and not force:
+            # Nothing new to say. Re-editing identical text is what Telegram
+            # answers with "message is not modified", and the retry storm that
+            # followed opened a fresh message every few seconds.
+            return
         try:
             adapter = self.gateway._adapter(self._channel)  # noqa: SLF001 - same package
             if not self._message_id:
                 result = await adapter.send(self._target, text)
                 if isinstance(result, dict):
                     self._message_id = str(result.get("message_id") or "")
+                self._last_text = text
                 self.sent += 1
                 _LOG.info("progress message opened", extra={
                     "channel": self._channel, "message_id": self._message_id})
@@ -222,6 +230,7 @@ class ProgressReporter:
                 edited = await adapter.edit_message_text(  # type: ignore[attr-defined]
                     self._target, self._message_id, text, {"inline_keyboard": []}
                 )
+                self._last_text = text
                 if not edited:
                     # A message can be edited only for 48h and only if it still
                     # exists; when that fails, start a fresh one for the rest.
