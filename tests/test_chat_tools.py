@@ -8,7 +8,12 @@ from leo.commands import CommandRegistry, create_registry
 from leo.config import ModelConfig, ModelProviderConfig, Settings
 from leo.contracts import ModelResponse, StreamChunk, Usage
 from leo.core import LeoApp
-from leo.core.app import MAX_CHAT_TOOL_ROUNDS
+
+# The turn budget is settings-driven now (settings.max_chat_tool_rounds).
+# These tests pin a small one so an exhaust-the-budget case costs seconds
+# instead of minutes; the shipped default is pinned in
+# tests/test_hermes_parity_limits.py.
+TEST_ROUNDS = 8
 
 
 class _ToolCallingRouter:
@@ -37,6 +42,7 @@ class _ToolCallingRouter:
 @pytest.mark.asyncio
 async def test_chat_executes_tool_then_answers() -> None:
     settings = Settings()
+    settings.max_chat_tool_rounds = TEST_ROUNDS
     settings.models = ModelConfig(default="mock", providers={"mock": ModelProviderConfig(kind="mock", model="mock-1")})
     app = LeoApp(settings)
     await app.initialize()
@@ -58,6 +64,7 @@ async def test_chat_stream_marks_real_tool_success_correctly() -> None:
     """A ToolResult serializes `error: null` on success; that must not be read
     as a failure in the `tool.finished` stream event."""
     settings = Settings()
+    settings.max_chat_tool_rounds = TEST_ROUNDS
     settings.models = ModelConfig(default="mock", providers={"mock": ModelProviderConfig(kind="mock", model="mock-1")})
     app = LeoApp(settings)
     await app.initialize()
@@ -90,7 +97,7 @@ async def test_chat_stream_marks_real_tool_success_correctly() -> None:
 
 # ---------------------------------------------------------------------- F-25
 class _EndlessToolsRouter:
-    """Always requests another tool; MAX_CHAT_TOOL_ROUNDS is exhausted."""
+    """Always requests another tool; TEST_ROUNDS is exhausted."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -135,13 +142,15 @@ async def test_chat_reports_unresolved_tool_turn_after_budget() -> None:
     from leo import db
 
     settings = Settings()
+
+    settings.max_chat_tool_rounds = TEST_ROUNDS
     settings.models = ModelConfig(default="mock", providers={"mock": ModelProviderConfig(kind="mock", model="mock-1")})
     app = LeoApp(settings)
     await app.initialize()
     router = _EndlessToolsRouter()
     app.router = router
     response = await app.ask("Keep calculating", channel="test")
-    assert router.calls == MAX_CHAT_TOOL_ROUNDS + 1  # N tool rounds + answer attempt
+    assert router.calls == TEST_ROUNDS + 1  # N tool rounds + answer attempt
     assert response["tool_calls_pending"] == ["calculator"]
     # Tool-turn narration ("still working") is never presented as an answer.
     assert "Tool budget exhausted" in response["content"]
@@ -159,13 +168,15 @@ async def test_chat_stream_reports_unresolved_tool_turn_after_budget() -> None:
     from leo import db
 
     settings = Settings()
+
+    settings.max_chat_tool_rounds = TEST_ROUNDS
     settings.models = ModelConfig(default="mock", providers={"mock": ModelProviderConfig(kind="mock", model="mock-1")})
     app = LeoApp(settings)
     await app.initialize()
     router = _EndlessStreamRouter()
     app.router = router
     events = [event async for event in app.ask_stream("Keep calculating")]
-    assert router.calls == MAX_CHAT_TOOL_ROUNDS + 1  # N tool rounds + answer attempt
+    assert router.calls == TEST_ROUNDS + 1  # N tool rounds + answer attempt
     finished = next(event for event in events if event["type"] == "message.finished")
     assert finished["tool_calls_pending"] == ["calculator"]
     assert "Tool budget exhausted" in finished["content"]
@@ -219,6 +230,8 @@ async def test_blank_final_tool_turn_is_incomplete_not_completed() -> None:
     from leo import db
 
     settings = Settings()
+
+    settings.max_chat_tool_rounds = TEST_ROUNDS
     settings.models = ModelConfig(default="mock", providers={"mock": ModelProviderConfig(kind="mock", model="mock-1")})
     app = LeoApp(settings)
     await app.initialize()
@@ -238,6 +251,8 @@ async def test_blank_final_stream_turn_is_incomplete_not_completed() -> None:
     from leo import db
 
     settings = Settings()
+
+    settings.max_chat_tool_rounds = TEST_ROUNDS
     settings.models = ModelConfig(default="mock", providers={"mock": ModelProviderConfig(kind="mock", model="mock-1")})
     app = LeoApp(settings)
     await app.initialize()
@@ -457,7 +472,9 @@ class _SequentialStreamRouter(_SequentialToolsRouter):
 
 def _settings() -> Settings:
     settings = Settings()
+    settings.max_chat_tool_rounds = TEST_ROUNDS
     settings.models = ModelConfig(default="mock", providers={"mock": ModelProviderConfig(kind="mock", model="mock-1")})
+    settings.max_chat_tool_rounds = TEST_ROUNDS
     return settings
 
 
@@ -540,8 +557,8 @@ async def test_chat_stream_four_tool_rounds_then_real_answer() -> None:
 
 
 @pytest.mark.parametrize("tool_rounds,completes", [
-    (MAX_CHAT_TOOL_ROUNDS, True),
-    (MAX_CHAT_TOOL_ROUNDS + 1, False),
+    (TEST_ROUNDS, True),
+    (TEST_ROUNDS + 1, False),
 ])
 async def test_chat_boundary_between_answer_and_exhaustion(tool_rounds: int, completes: bool) -> None:
     app = LeoApp(_settings())
@@ -549,21 +566,21 @@ async def test_chat_boundary_between_answer_and_exhaustion(tool_rounds: int, com
     router = _SequentialToolsRouter(tool_rounds)
     app.router = router
     response = await app.ask("Boundary", channel="test")
-    assert router.calls == MAX_CHAT_TOOL_ROUNDS + 1
+    assert router.calls == TEST_ROUNDS + 1
     assert response["status"] == ("completed" if completes else "incomplete")
     assert response["tool_calls_pending"] == ([] if completes else ["calculator"])
-    assert len(response["tool_results"]) == MAX_CHAT_TOOL_ROUNDS  # never a 9th execution
+    assert len(response["tool_results"]) == TEST_ROUNDS  # never a 9th execution
     pending_names = [] if completes else ["calculator"]
     final_meta = await _assert_tool_history(
-        [f"seq-{i}" for i in range(1, MAX_CHAT_TOOL_ROUNDS + 1)], pending_names
+        [f"seq-{i}" for i in range(1, TEST_ROUNDS + 1)], pending_names
     )
     assert final_meta.get("tool_calls_pending") == ([] if completes else ["calculator"])
     await app.shutdown()
 
 
 @pytest.mark.parametrize("tool_rounds,completes", [
-    (MAX_CHAT_TOOL_ROUNDS, True),
-    (MAX_CHAT_TOOL_ROUNDS + 1, False),
+    (TEST_ROUNDS, True),
+    (TEST_ROUNDS + 1, False),
 ])
 async def test_chat_stream_boundary_between_answer_and_exhaustion(tool_rounds: int, completes: bool) -> None:
     app = LeoApp(_settings())
@@ -571,16 +588,16 @@ async def test_chat_stream_boundary_between_answer_and_exhaustion(tool_rounds: i
     router = _SequentialStreamRouter(tool_rounds)
     app.router = router
     events = [event async for event in app.ask_stream("Boundary")]
-    assert router.calls == MAX_CHAT_TOOL_ROUNDS + 1
+    assert router.calls == TEST_ROUNDS + 1
     finished = next(event for event in events if event["type"] == "message.finished")
     assert finished["status"] == ("completed" if completes else "incomplete")
     assert finished["tool_calls_pending"] == ([] if completes else ["calculator"])
-    assert len(finished["tool_results"]) == MAX_CHAT_TOOL_ROUNDS
+    assert len(finished["tool_results"]) == TEST_ROUNDS
     assert events[-1]["type"] == "run.finished"
     assert events[-1]["status"] == finished["status"]
     pending_names = [] if completes else ["calculator"]
     final_meta = await _assert_tool_history(
-        [f"seq-{i}" for i in range(1, MAX_CHAT_TOOL_ROUNDS + 1)], pending_names
+        [f"seq-{i}" for i in range(1, TEST_ROUNDS + 1)], pending_names
     )
     assert final_meta.get("tool_calls_pending") == ([] if completes else ["calculator"])
     await app.shutdown()
@@ -618,7 +635,7 @@ class _EndlessThenValidateRouter:
         _assert_provider_pairing(request.messages)
         if self.calls == 1:
             return self._tool_response(0)
-        if self.calls <= MAX_CHAT_TOOL_ROUNDS + 1:
+        if self.calls <= TEST_ROUNDS + 1:
             return self._tool_response(self.calls)
         return ModelResponse(
             content="Validated follow-up answer.", model="fake", provider="fake",
@@ -668,7 +685,7 @@ async def test_second_turn_after_exhaustion_sends_valid_provider_payload() -> No
     assert first["status"] == "incomplete"
     second = await app.ask("Continue now", channel="test", conversation_id=conversation_id)
     assert second["content"] == "Validated follow-up answer."
-    assert router.calls == MAX_CHAT_TOOL_ROUNDS + 2
+    assert router.calls == TEST_ROUNDS + 2
     await app.shutdown()
 
 
@@ -683,7 +700,7 @@ async def test_second_stream_turn_after_exhaustion_sends_valid_provider_payload(
     second = [event async for event in app.ask_stream("Continue now", conversation_id=conversation_id)]
     finished = next(e for e in second if e["type"] == "message.finished")
     assert finished["content"] == "Validated follow-up answer."
-    assert router.calls == MAX_CHAT_TOOL_ROUNDS + 2
+    assert router.calls == TEST_ROUNDS + 2
     await app.shutdown()
 
 
