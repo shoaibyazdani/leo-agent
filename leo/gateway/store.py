@@ -198,9 +198,12 @@ class GatewayStore:
         bare count would look like a successful reclaim while the channel kept
         showing "typing" indefinitely.
 
-        Rows that ended in a non-retryable state while still holding an expired
-        claim are reported too, without being requeued: their typing task is
-        just as orphaned, and nothing else will ever stop it.
+        Rows that ended in a non-retryable state while still holding a claim are
+        reported too, without being requeued: their typing task is just as
+        orphaned, and nothing else will ever stop it. Their claim columns are
+        cleared so the same row is not reported again on every poll — a terminal
+        row has no claimant, and re-reporting it forever is a leak dressed as a
+        heartbeat.
         """
         now = _iso(_now())
         expired = await db.fetchall(
@@ -208,18 +211,28 @@ class GatewayStore:
             "WHERE claim_expires_at IS NOT NULL AND claim_expires_at < ?",
             (now,),
         )
-        stranded = [
+        if not expired:
+            return []
+        reported = [
             str(row[0]) for row in expired
             if str(row[1]) not in (ADMISSION_DONE, ADMISSION_QUEUED)
         ]
-        if not stranded:
-            return []
+        # Requeue first, unconditionally: handing expired work back must never
+        # depend on whether anything also needed reporting.
         await db.execute(
             "UPDATE gateway_queue SET status=?, claim_expires_at=NULL, claimed_by=NULL, "
             "updated_at=? WHERE status=? AND claim_expires_at IS NOT NULL AND claim_expires_at < ?",
             (ADMISSION_QUEUED, now, ADMISSION_CLAIMED, now),
         )
-        return stranded
+        # Then settle the terminal rows: status is left exactly as it was, only the
+        # claim bookkeeping that no longer belongs to anything is cleared.
+        await db.execute(
+            "UPDATE gateway_queue SET claim_expires_at=NULL, claimed_by=NULL, updated_at=? "
+            "WHERE status NOT IN (?, ?, ?) AND claim_expires_at IS NOT NULL "
+            "AND claim_expires_at < ?",
+            (now, ADMISSION_DONE, ADMISSION_QUEUED, ADMISSION_CLAIMED, now),
+        )
+        return reported
 
     async def stats(self) -> dict[str, Any]:
         queue = {

@@ -253,3 +253,37 @@ async def test_reclaim_reports_a_stranded_claim_so_its_typing_pulse_can_stop():
         "SELECT status FROM gateway_queue WHERE admission_id=?", (admission_id,)
     )
     assert row["status"] == "cancelled"
+
+
+async def test_a_settled_claim_is_reported_once_and_lets_go_of_its_claim() -> None:
+    """Clearing the pulse must also settle the row.
+
+    A terminal row that kept `claim_expires_at` matched the next poll again, so the
+    same dead id called `_stop_typing` about once a second for as long as the row
+    lived. Reporting once is the whole point: the task is stopped, then forgotten.
+    """
+    from leo import db as _db
+
+    store = GatewayStore()
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000002", payload=payload()
+    )
+    await store.claim("dead-worker", lease_seconds=1)
+    await _db.execute(
+        "UPDATE gateway_queue SET status='cancelled', claim_expires_at=? "
+        "WHERE admission_id=?",
+        ("2020-01-01T00:00:00+00:00", admission_id),
+    )
+
+    first = await store.reclaim_expired()
+    second = await store.reclaim_expired()
+
+    assert admission_id in first
+    assert admission_id not in second, "a settled claim must not be reported again"
+    row = await _db.fetchone(
+        "SELECT status, claim_expires_at, claimed_by FROM gateway_queue WHERE admission_id=?",
+        (admission_id,),
+    )
+    assert row["status"] == "cancelled", "terminal state must not be rewritten"
+    assert row["claim_expires_at"] is None
+    assert row["claimed_by"] is None
