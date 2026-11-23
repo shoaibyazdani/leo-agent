@@ -248,8 +248,14 @@ async def test_a_page_tap_asks_the_brain_for_that_page(tmp_path) -> None:
     async def admit(text: str, channel: str, subject: str) -> None:
         admitted.append((text, channel, subject))
 
+    from leo.config import ModelProviderConfig
+
     settings = Settings()
     settings.channels = ChannelsConfig(policies={"telegram": {"allow": [OWNER], "mode": "allowlist"}})
+    # Enough providers that page 2 (index 2 -> "page 3") actually exists.
+    settings.models.providers = {
+        f"m{i:02d}": ModelProviderConfig(model=f"model-{i}") for i in range(20)
+    }
     result = await handle_tap(
         "telegram",
         {"callback_id": "cb3", "chat_id": OWNER, "message_id": "44",
@@ -259,12 +265,17 @@ async def test_a_page_tap_asks_the_brain_for_that_page(tmp_path) -> None:
     )
 
     assert result == {"ok": True, "page": 2}
-    assert admitted == [("/model list 2", "telegram", OWNER)]
+    # Pagination is a pure re-render: it edits the SAME message in place and
+    # never queues a command, so no stale text is left behind and no second
+    # picker is posted below it.
+    assert admitted == []
     assert "page 3" in adapter.edits[-1][2]
+    # The new page keeps its navigation buttons (not stripped away).
+    assert adapter.edits[-1][3]["inline_keyboard"] != []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("data", ["mdl:beam-free", "mdl:pg:1"])
+@pytest.mark.parametrize("data", ["mdl:beam-free"])
 async def test_no_admission_path_is_reported_not_crashed(tmp_path, data: str) -> None:
     """Both branches need an admission path; calling None must never be reached.
 

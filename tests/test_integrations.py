@@ -623,14 +623,19 @@ async def test_gateway_outbound_fanout_and_high_risk_approval(integration_db, mo
     outbound = [item for item in await gateway.history() if item["role"] == "assistant"]
     assert len(outbound) == 2 and all(item["content"] == "broadcast" for item in outbound)
     assert (await gateway.history(channel="telegram"))[0]["role"] == "assistant"
-    await client.aclose()
 
+    # Outbound sends are MEDIUM (audited, no tap). With the default policy
+    # they go through without creating an approval. Reuse the mock client so
+    # the send can actually complete.
     strict = PermissionManagerImpl(Settings())
-    blocked = Gateway({"telegram": TelegramAdapter()}, events=EventBus(persist=False), permissions=strict)
-    with pytest.raises(GatewayPermissionError) as exc:
-        await blocked.send("telegram", "123", "needs approval")
-    assert exc.value.approval_id
-    assert len(await strict.pending_approvals()) == 1
+    plain = Gateway(
+        {"telegram": TelegramAdapter(client=client)},
+        events=EventBus(persist=False), permissions=strict,
+    )
+    result = await plain.send("telegram", "999", "no approval needed")
+    assert result["success"] is True
+    assert len(await strict.pending_approvals()) == 0
+    await client.aclose()
 
 
 async def test_gateway_webhook_replay_is_deduplicated(integration_db, monkeypatch):

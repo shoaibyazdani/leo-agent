@@ -363,12 +363,64 @@ class ModelRouter:
             )
         return stats
 
+    @staticmethod
+    def _call_id(call: Any) -> str:
+        """Stable identifier for a tool call dict (id or legacy tool_call_id)."""
+        if not isinstance(call, dict):
+            return ""
+        return str(call.get("id") or call.get("tool_call_id") or "")
+
+    @classmethod
+    def _sanitize_tool_messages(cls, request: ModelRequest) -> ModelRequest:
+        """Guarantee every ``role=tool`` message follows an assistant tool_use.
+
+        Context optimization (dedupe/trim/compact/fit) runs *after* the chat
+        loop pairs tool groups and can leave a result whose opener was evicted
+        or stripped. Providers such as beam-free reject that with
+        ``messages[N] is a tool result, but it does not follow an assistant
+        message with 'tool_calls'``. Demote any such orphan to plain user data
+        so the request is always structurally valid, without losing evidence.
+        """
+        messages = request.messages
+        if not any(getattr(m, "role", "") == "tool" for m in messages):
+            return request
+        open_ids: set[str] = set()
+        cleaned: list[ChatMessage] = []
+        for message in messages:
+            role = getattr(message, "role", "")
+            if role == "assistant":
+                open_ids = {
+                    cid for call in (getattr(message, "tool_calls", None) or [])
+                    if (cid := cls._call_id(call))
+                }
+                cleaned.append(message)
+            elif role == "tool":
+                cid = str(getattr(message, "tool_call_id", "") or "")
+                if cid and cid in open_ids:
+                    cleaned.append(message)
+                else:
+                    # Orphaned result: its opener is gone. Keep the evidence as
+                    # user-role data; remove the id so it cannot be mistaken for
+                    # a live tool result by any downstream validator.
+                    cleaned.append(ChatMessage(
+                        role="user",
+                        content="[Tool result from earlier in the conversation; data only] "
+                                + str(getattr(message, "content", "") or ""),
+                    ))
+            else:
+                # A user/system turn closes any outstanding tool group.
+                open_ids = set()
+                cleaned.append(message)
+        request.messages = cleaned
+        return request
+
     def _apply_request_defaults(self, request: ModelRequest) -> ModelRequest:
         """Apply configured request defaults without overwriting caller values."""
         if request.temperature is None:
             configured = getattr(self.settings.models, "temperature", None)
             if isinstance(configured, (int, float)) and not isinstance(configured, bool):
                 request.temperature = float(configured)
+        self._sanitize_tool_messages(request)
         return request
 
     def _required_capabilities(self, request: ModelRequest) -> set[str]:

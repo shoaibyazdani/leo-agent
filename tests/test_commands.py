@@ -244,7 +244,12 @@ async def test_model_usage_context_and_config_are_read_only(
     monkeypatch.setenv("LEO_CONFIG", str(scratch))
 
     model = await call(registry, app, "/model")
-    assert model.status is CommandStatus.OK and model.data["status"] == "simulated"
+    assert model.status is CommandStatus.OK
+    # Bare /model now opens the picker directly (no separate /model list needed).
+    assert "Current:" in model.message
+    assert "reply_markup" in model.data
+    status = await call(registry, app, "/model status")
+    assert status.status is CommandStatus.OK and status.data["status"] == "simulated"
     listed = await call(registry, app, "/model list")
     assert "mock" in listed.message
     assert "Current:" in listed.message

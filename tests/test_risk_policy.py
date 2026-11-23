@@ -57,9 +57,9 @@ def _settings() -> Settings:
         ("patch", {"path": "deploy/prod.pem"}, RiskLevel.HIGH),
         ("patch", {"path": ".git/config"}, RiskLevel.HIGH),
         ("write_file", {"path": "leo.yaml"}, RiskLevel.HIGH),
-        # outbound: a reply is free, a stranger is not
+        # outbound: a reply is free; any send is audited but needs no tap
         ("channel_send", {"target": "525083981", "subject": "525083981", "text": "hi"}, RiskLevel.LOW),
-        ("channel_send", {"target": "999000111", "subject": "525083981", "text": "hi"}, RiskLevel.HIGH),
+        ("channel_send", {"target": "999000111", "subject": "525083981", "text": "hi"}, RiskLevel.MEDIUM),
         # memory: adding is bounded, deleting is not (no undelete on the surface)
         ("memory_add", {"text": "x"}, RiskLevel.MEDIUM),
         ("memory_forget", {"id": "mem_1"}, RiskLevel.HIGH),

@@ -276,7 +276,7 @@ async def test_gateway_digest_binds_the_resolved_media_path(outbox: Path):
     assert adapter.media_calls == [("chat-1", str(path.resolve()), "caption text")]
 
     authorized = permission.calls[-1]
-    assert authorized["risk"] is RiskLevel.HIGH
+    assert authorized["risk"] is RiskLevel.MEDIUM
     # The digest must cover the file, not just the text that was typed.
     assert authorized["arguments"]["media"] == str(path.resolve())
     assert authorized["arguments"]["media_bytes"] == 6
