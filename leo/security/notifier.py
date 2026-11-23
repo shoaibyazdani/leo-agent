@@ -67,7 +67,41 @@ class ApprovalNotifier:
         target = str(getattr(cfg, "target", "") or "").strip()
         if not channel or not target:
             return None
+        foreign = self._foreign_database()
+        if foreign is not None:
+            _LOG.info(f"approval notifications suppressed: {foreign}")
+            return None
         return channel, target
+
+    def _foreign_database(self) -> str | None:
+        """Why this process must not announce, or None when it may.
+
+        The notify target is the operator's own address, configured once; the
+        database belongs to one process. A CLI run, a test suite or a second
+        checkout inherits the operator's config, so it would announce an approval
+        that only exists in its own scratch database — the operator taps the
+        button and the gateway, reading the real one, answers "That approval no
+        longer exists". Announcements are therefore bound to the database the
+        operator's gateway actually reads.
+        """
+        import os
+        from pathlib import Path
+
+        from .. import db  # local import: db is initialised after this module loads
+
+        if str(os.environ.get("LEO_NO_NOTIFY") or "").strip().lower() in {"1", "true", "yes", "on"}:
+            return "LEO_NO_NOTIFY is set"
+        expected = str(os.environ.get("LEO_DB_PATH") or "").strip()
+        if not expected:
+            return None
+        try:
+            current = db.get_db_path()
+            claimed = Path(expected).expanduser().resolve()
+        except (RuntimeError, OSError, ValueError):
+            return None
+        if current == claimed:
+            return None
+        return f"this process writes {current}, the notify target's database is {claimed}"
 
     def start(self) -> bool:
         """Attach the subscription once. Returns True when notifications are on."""

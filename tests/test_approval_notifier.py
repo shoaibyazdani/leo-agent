@@ -109,6 +109,53 @@ async def test_partial_config_is_not_enough() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_foreign_database_never_announces(monkeypatch, tmp_path) -> None:
+    """A scratch database must not push buttons the real gateway cannot resolve.
+
+    Real symptom: an approval from a test/CLI process arrives on Telegram, the
+    operator taps Approve, and the gateway answers "That approval no longer
+    exists" because the row lives in a database it does not read.
+    """
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    monkeypatch.setenv("LEO_DB_PATH", str(tmp_path / "elsewhere.db"))
+
+    assert notifier.start() is False
+    await _pending_approval("apr_1")
+    await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_owning_database_announces(monkeypatch) -> None:
+    from leo import db
+
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    monkeypatch.setenv("LEO_DB_PATH", str(db.get_db_path()))
+
+    assert notifier.start() is True
+    await _pending_approval("apr_1")
+    await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_disables_notifications(monkeypatch) -> None:
+    monkeypatch.setenv("LEO_NO_NOTIFY", "1")
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+
+    assert notifier.start() is False
+    await _pending_approval("apr_1")
+    await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
 async def test_send_failure_never_breaks_the_requesting_call() -> None:
     bus = EventBus(persist=False)
     adapter = FakeAdapter()
