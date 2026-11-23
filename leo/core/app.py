@@ -506,6 +506,9 @@ class LeoApp:
         # Scheduled objectives and channel deliveries run through the durable
         # task engine's live worker/delivery registry.
         self.tasks.register_default_worker(self._default_task_worker)
+        # A reminder carries its own message: delivering it is the whole job, so
+        # it never enters the agent loop where it spent tool rounds and failed.
+        self.tasks.register_worker("reminder", self._reminder_worker)
         self.tasks.register_delivery("channel", self._channel_delivery)
         self.tasks.register_delivery("gateway", self._channel_delivery)
         self.tasks.register_default_delivery(self._channel_delivery)
@@ -721,16 +724,73 @@ class LeoApp:
             await engine.fail(getattr(task, "id"), f"{type(exc).__name__}: {exc}")
             raise
 
+    async def _reminder_worker(self, task: Any, engine: Any, context: dict[str, Any]) -> Any:
+        """Complete a reminder task without a model: the payload is the message.
+
+        Delivery happens on the engine's terminal-delivery path, so this worker
+        only has to record the durable completion with evidence that names the
+        declared message. No provider call, no tool rounds, nothing to fail.
+        """
+        payload = context.get("schedule_payload") or {}
+        text = ""
+        if isinstance(payload, dict):
+            for key in ("text", "message", "reminder"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value.strip()
+                    break
+        if not text:
+            raise ValueError("reminder task has no message to deliver")
+        evidence = [{
+            "source": "schedule_payload", "kind": "reminder",
+            "claim": text, "task_id": getattr(task, "id", None),
+        }]
+        await engine.complete(
+            getattr(task, "id"), {"reminder": text}, evidence, note="reminder queued for delivery",
+        )
+        return {"reminder": text}
+
     async def _channel_delivery(self, task: Any, channel: str, target: Any, context: dict[str, Any]) -> Any:
         """Deliver a terminal task result to a channel target via the gateway."""
         status = str(context.get("status") or getattr(task, "status", "") or "")
         # Close the live progress report first, so the finished line does not
         # linger under the answer it was describing.
         await self.task_reporting.on_terminal(task, status)
-        return await self.gateway.send(
-            str(channel), str(target), self._task_summary(task, status),
+        # A delivery target must be a real address. Sending to the string "None"
+        # reaches nobody and the gateway reports the adapter failure as a dict,
+        # so refusing here keeps a bogus claim of "sent" out of the receipt.
+        address = str(target).strip() if target is not None else ""
+        if address in ("", "None", "null"):
+            raise ValueError(f"no delivery address for {channel}; refusing to send")
+        text = self._delivery_text(task, status, context)
+        response = await self.gateway.send(
+            str(channel), address, text,
             subject=f"task:{getattr(task, 'id', '')}",
         )
+        if isinstance(response, dict) and response.get("success") is False:
+            # The adapter swallows its own errors into this dict; surfacing it
+            # turns a silent no-send into a failed delivery with a reason.
+            raise RuntimeError(f"{channel} send failed: {response.get('error')}")
+        message_id = response.get("message_id") if isinstance(response, dict) else None
+        # Return proof, not a dict: the engine persists a scalar detail on the
+        # receipt, so "sent" always carries the provider's message id.
+        return f"{channel}:{message_id}" if message_id is not None else f"{channel}:sent"
+
+    @staticmethod
+    def _delivery_text(task: Any, status: str, context: dict[str, Any]) -> str:
+        """The message a schedule declared, or a readable completion report.
+
+        A reminder is not work that "finished": the operator asked for a fixed
+        sentence at a fixed time, so sending a task summary instead of that
+        sentence would be worse than useless.
+        """
+        payload = context.get("schedule_payload")
+        if isinstance(payload, dict):
+            for key in ("text", "message", "reminder"):
+                declared = payload.get(key)
+                if isinstance(declared, str) and declared.strip():
+                    return declared.strip()
+        return LeoApp._task_summary(task, status)
 
     @staticmethod
     def _task_summary(task: Any, status: str) -> str:

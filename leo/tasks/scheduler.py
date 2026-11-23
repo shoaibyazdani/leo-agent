@@ -353,11 +353,36 @@ class Scheduler:
         """Extract the objective and engine-create kwargs from a schedule row."""
         payload = _load(row["payload"])
         objective = payload.pop("objective", row["name"])
+        # A payload that carries its own message is a reminder, not an
+        # objective to delegate: sending it needs no model, and routing it to
+        # the agent loop spent tool rounds and then failed the task. Naming the
+        # reminder worker here pins the choice in durable data, so a restart
+        # cannot silently fall back to the delegation path.
+        if any(isinstance(payload.get(key), str) and payload[key].strip()
+               for key in ("text", "message", "reminder")):
+            payload.setdefault("worker", "reminder")
         create_kwargs: dict[str, Any] = {}
         for key in ("plan", "dependencies", "owner_agent", "resource_limits"):
             if key in payload:
                 create_kwargs[key] = payload.pop(key)
         return objective, payload, create_kwargs
+
+    @staticmethod
+    def _wants_one_shot(payload: Mapping[str, Any]) -> bool:
+        """Whether this schedule should retire after a single occurrence."""
+        flag = payload.get("one_shot")
+        if isinstance(flag, bool):
+            return flag
+        if isinstance(flag, str):
+            return flag.strip().lower() in ("1", "true", "yes", "on")
+        return False
+
+    async def _retire(self, row: Mapping[str, Any], reason: str) -> None:
+        """Delete a schedule that must not fire again, and record why."""
+        await db.execute("DELETE FROM schedules WHERE id=?", (row["id"],))
+        await self.events.emit(
+            "schedule.completed", name=row["name"], schedule_id=row["id"], reason=reason,
+        )
 
     async def tick(self, now: datetime | str | None = None) -> list[TaskRecord]:
         """Create tasks for every enabled schedule due at ``now`` and persist next_run_at.
@@ -384,6 +409,8 @@ class Scheduler:
                     reason="max_concurrent_tasks reached",
                 )
                 continue  # leave next_run_at in place; retry on the next tick
+            payload = _load(row["payload"])
+            one_shot = self._wants_one_shot(payload)
             objective, payload, create_kwargs = self._occurrence_payload(row)
 
             # Catch up bounded missed occurrences; each one keeps its own
@@ -393,7 +420,11 @@ class Scheduler:
             skipped = 0
             first_task: TaskRecord | None = None
             start_index = len(due)
-            for _ in range(_MAX_CATCHUP):
+            # A one-shot schedule has exactly one occurrence to create; running
+            # the recurring catch-up over it minted a burst of duplicate tasks
+            # (and duplicate messages) that the retirement could never undo.
+            occurrences = 1 if one_shot else _MAX_CATCHUP
+            for _ in range(occurrences):
                 if cursor > moment:
                     break
                 if limit and backlog >= limit:
@@ -423,7 +454,7 @@ class Scheduler:
             if cursor is None:
                 # Deferred: keep next_run_at so the occurrence is retried.
                 continue
-            if cursor <= moment:
+            if not one_shot and cursor <= moment:
                 # More occurrences were missed than the cap: skip the rest
                 # and record the truncation instead of replaying history.
                 cursor, skipped = _advance_past_due(
@@ -456,6 +487,10 @@ class Scheduler:
                 "UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?",
                 (moment.isoformat(), cursor.isoformat(), row["id"]),
             )
+            if one_shot:
+                # A one-shot schedule exists to fire once. Leaving it enabled
+                # made a delivered reminder repeat on the next due slot.
+                await self._retire(row, reason="one-shot occurrence created")
         return due
 
     async def trigger(
@@ -520,6 +555,10 @@ class Scheduler:
             "UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?",
             (moment.isoformat(), cursor.isoformat(), row["id"]),
         )
+        if self._wants_one_shot(payload):
+            # A manual trigger of a one-shot consumes it, exactly like a
+            # scheduled occurrence would.
+            await self._retire(row, reason="one-shot triggered manually")
         return [task]
 
     # ------------------------------------------------------------------
