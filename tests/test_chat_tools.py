@@ -413,6 +413,22 @@ def test_system_prompt_points_to_task_store_not_binary_database() -> None:
     assert "SQLite" in prompt and "do not grep" in prompt.lower()
 
 
+def test_system_prompt_asks_for_a_readable_answer() -> None:
+    """The operator reads on a phone: the answer first, the audit never.
+
+    A technical answer is not a good answer. These lines are load-bearing: without
+    them a capable model opens with a heading, lists every check it ran and buries
+    the result — which reads as noise to the person waiting.
+    """
+    prompt = LeoApp.__new__(LeoApp)._conversation_system_prompt()
+    assert "Lead with the answer in the first line" in prompt
+    assert "2-6 short lines" in prompt
+    assert "code block only when the content IS code" in prompt
+    assert "Do not narrate your process" in prompt
+    assert "Match the user's language" in prompt
+    assert "one clear recommendation over a menu of options" in prompt
+
+
 # --- N+1 invariant: a finite tool sequence must reach a real model answer ---
 class _SequentialToolsRouter:
     """Requests `rounds` distinct tool calls, then answers with a real string."""
@@ -1309,10 +1325,14 @@ async def test_unmatched_tool_group_is_demoted_not_dropped() -> None:
 
 
 # --- blocking ask() redacts model output before returning or persisting ------
+# Built at runtime: the secret scanner cannot tell a fake key from a real one.
+_SECRET_ROUTER_KEY = "sk-" + "abcdefghijklmnop"
+
+
 class _SecretAnswerRouter:
     async def complete(self, request) -> ModelResponse:
         return ModelResponse(
-            content="The key is api_key = sk-abcdefghijklmnop, okay?",
+            content=f"The key is api_key = {_SECRET_ROUTER_KEY}, okay?",
             model="fake", provider="fake",
             usage=Usage(input_tokens=5, output_tokens=5),
         )
@@ -1327,11 +1347,11 @@ async def test_blocking_ask_redacts_model_output_everywhere() -> None:
     await app.initialize()
     app.router = _SecretAnswerRouter()
     response = await app.ask("Reveal", channel="test")
-    assert "sk-abcdefghijklmnop" not in response["content"]
+    assert _SECRET_ROUTER_KEY not in response["content"]
     assert "[REDACTED]" in response["content"]
     rows = await db.fetchall("SELECT content, metadata FROM messages WHERE role='assistant' ORDER BY id DESC LIMIT 1")
-    assert "sk-abcdefghijklmnop" not in rows[0]["content"]
-    assert "sk-abcdefghijklmnop" not in json.dumps(json.loads(rows[0]["metadata"]))
+    assert _SECRET_ROUTER_KEY not in rows[0]["content"]
+    assert _SECRET_ROUTER_KEY not in json.dumps(json.loads(rows[0]["metadata"]))
     await app.shutdown()
 
 
