@@ -7,7 +7,9 @@ entirely on LEO primitives:
   ``task.failed``, ...). Observation is idempotent by event id.
 * Failure signatures are clustered into bounded incidents with explicit retry
   and lifetime attempt ceilings. Transient classes may be retried with
-  exponential backoff; schema/permission failures are never auto-retried.
+  exponential backoff; schema/permission failures are never auto-retried, and
+  a permission denial is never proposed as a remediation at all — a refused
+  gate is the security model working, not damage to repair.
 * Every remediation is inert until a HIGH-risk approval, bound by canonical
   argument digest and resolved by a trusted *non-chat, non-self* human, is
   consumed one-shot. A disabled approval gate does not grant self-repair.
@@ -55,6 +57,13 @@ KIND_TIMEOUT = "timeout"
 KIND_PROVIDER = "provider_error"
 KIND_UNKNOWN = "unknown"
 RETRYABLE_KINDS = frozenset({KIND_TIMEOUT, KIND_PROVIDER})
+
+# Kinds that are recorded but never turned into a remediation. A permission
+# denial is the security model working: a path-policy refusal, a denied or
+# spent approval, an out-of-scope tool. Proposing a "repair" for it asks a
+# human to approve undoing the gate that just protected the box, and it is the
+# largest single source of approval noise (denials dominate real incident data).
+NO_PROPOSAL_KINDS: frozenset[str] = frozenset({KIND_PERMISSION})
 
 WATCHED_TOPICS = (
     "tool.failed",
@@ -475,7 +484,11 @@ class SelfHealingEngine:
             except Exception as exc:  # noqa: BLE001 - metrics must not break observation
                 _LOG.warning("selfheal metric write failed", extra={"error": str(exc)})
 
-        if incident.occurrences >= self.min_occurrences and not incident.proposal_id:
+        if (
+            incident.occurrences >= self.min_occurrences
+            and not incident.proposal_id
+            and kind not in NO_PROPOSAL_KINDS
+        ):
             await self.propose(incident_id)
         return incident
 
@@ -582,6 +595,10 @@ class SelfHealingEngine:
         """Create an inert, approval-bound remediation for a recurring incident."""
         incident = await self._load(f"incident:{incident_id}", FailureIncident)
         if incident is None:
+            return None
+        if incident.kind in NO_PROPOSAL_KINDS:
+            # observe() already recorded and audited this failure. A denied
+            # gate is not damage, so no remediation and no approval request.
             return None
         if incident.proposal_id:
             existing = await self._load(f"proposal:{incident.proposal_id}", Remediation)
