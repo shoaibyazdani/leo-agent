@@ -44,6 +44,21 @@ scoping would require a schema/identity migration and is not implemented.
 
 ## Approval workflow
 
+Every tool call is assessed **per call**, not per tool, and the reason is
+recorded on the audit row (`metadata.risk_reason`):
+
+| tier | meaning |
+|---|---|
+| LOW | runs; read-only inspection (a `SELECT`, a `systemctl status`, a reply into the originating conversation) |
+| MEDIUM | runs and is audited; bounded reversible writes (an in-workspace edit, `git commit`, `mkdir`, `systemctl restart`, a sqlite write) |
+| HIGH | needs an approval; destructive, unreversible, arbitrary-code, credential/config writes, self-modification, outbound to a third party |
+| — | the hardline blocklist is a **denial**, not a tier, and is checked before any of this |
+
+An operator who wants the old strict floor sets `security.allow_medium_risk:
+false`: MEDIUM then fails closed instead of running. `security.shell_mode` still
+overrides the shell tier (`manual` = every command asks, `off` = nothing asks,
+though the hardline floor still denies).
+
 1. A tool call classified HIGH returns `ApprovalRequired` with an approval ID.
 2. The ID appears in `leo approval list` and the dashboard's Approvals panel.
 3. `leo approval approve/deny <id>` records the human decision (durable).
