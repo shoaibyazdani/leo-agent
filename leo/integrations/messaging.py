@@ -943,6 +943,29 @@ class TelegramAdapter(MessagingAdapter):
                 "name": str(document.get("file_name") or "document"),
                 "size": int(document.get("file_size") or 0),
             })
+        # Telegram voice notes and audio files carry no text. Expose them as
+        # descriptors so the gateway can transcribe them into the turn's text;
+        # without this a voice note arrives as an empty message.
+        voice = message.get("voice")
+        if isinstance(voice, dict) and voice.get("file_id"):
+            out.append({
+                "kind": "voice",
+                "file_id": str(voice["file_id"]),
+                "mime": str(voice.get("mime_type") or "audio/ogg"),
+                "name": "voice.ogg",
+                "size": int(voice.get("file_size") or 0),
+                "duration": int(voice.get("duration") or 0),
+            })
+        audio = message.get("audio")
+        if isinstance(audio, dict) and audio.get("file_id"):
+            out.append({
+                "kind": "voice",
+                "file_id": str(audio["file_id"]),
+                "mime": str(audio.get("mime_type") or "audio/mpeg"),
+                "name": str(audio.get("file_name") or "audio.mp3"),
+                "size": int(audio.get("file_size") or 0),
+                "duration": int(audio.get("duration") or 0),
+            })
         return out
 
     async def download(self, descriptor: dict[str, Any]) -> tuple[bytes, str, str]:

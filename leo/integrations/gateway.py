@@ -24,6 +24,7 @@ from .. import db
 from ..config import Settings
 from ..contracts import IntegrationRecord, PermissionManager, RiskLevel, new_id, utcnow
 from ..events import Event, EventBus
+from ..logging import get_logger
 from ..security.permissions import PermissionManagerImpl, arguments_digest
 from .admission import ChannelAdmission
 from .messaging import (
@@ -36,6 +37,8 @@ from .messaging import (
     resolve_outbound_media,
 )
 from .transport_state import TransportState
+
+_LOG = get_logger("integrations.gateway")
 
 GATEWAY_MESSAGE_TOPIC = "gateway.message"
 GATEWAY_SENT_TOPIC = "gateway.sent"
@@ -316,6 +319,24 @@ class Gateway:
                         stored = None
                     if stored:
                         attachment_ids.append(str(stored))
+            # A voice note carries no text of its own. Transcribe it here, in the
+            # one choke point every poll batch passes through, or the turn is
+            # admitted empty and the brain has nothing to answer.
+            if not message.text.strip() and message.attachments:
+                spoken = await self._transcribe_voice(message.channel, message.attachments)
+                if spoken:
+                    message = message.model_copy(update={"text": spoken})
+                elif any(
+                    str(d.get("kind")) in {"voice", "audio"}
+                    for d in message.attachments
+                    if isinstance(d, dict)
+                ):
+                    # A voice note with no words would otherwise become a blank
+                    # turn: the brain is asked to answer nothing. Say what
+                    # happened so the operator gets a reply instead of silence.
+                    message = message.model_copy(
+                        update={"text": "[voice note received but could not be transcribed]"}
+                    )
             prepared.append(
                 _Prepared(
                     message=message,
@@ -327,6 +348,34 @@ class Gateway:
                 )
             )
         return prepared
+
+    async def _transcribe_voice(
+        self, channel: str, descriptors: list[dict[str, Any]]
+    ) -> str | None:
+        """Text for the voice/audio descriptors in a message, if any.
+
+        Voice notes are the one inbound shape with no text, so transcription
+        belongs in admission where both the poll path and the app's own inbound
+        loop pass through. A failed clip yields ``None``: the message is still
+        admitted, just without words, rather than being dropped.
+        """
+        clips = [
+            descriptor for descriptor in descriptors or []
+            if isinstance(descriptor, dict) and descriptor.get("kind") in {"voice", "audio"}
+        ]
+        if not clips:
+            return None
+        from .transcription import transcribe_channel_voice
+
+        chunks: list[str] = []
+        for descriptor in clips:
+            try:
+                text = await transcribe_channel_voice(channel, descriptor, self.adapters)
+            except Exception:  # transcription must never block admission
+                text = None
+            if text:
+                chunks.append(text)
+        return "\n".join(chunks) or None
 
     async def _persist_prepared(self, prepared: list[_Prepared]) -> list[dict[str, Any]]:
         """Atomically write a whole batch (messages + outbox + dedupe keys)."""
@@ -543,7 +592,38 @@ class Gateway:
         )
         await state.beat(note=f"{len(messages)} inbound")
         # Same route pinning and durable message-id dedupe as the webhook path.
-        return await self.receive_batch(messages, route_channel=channel)
+        try:
+            return await self.receive_batch(messages, route_channel=channel)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if len(messages) <= 1:
+                raise
+            # The adapter has already advanced its durable cursor past this
+            # batch, so a batch-wide abort silently loses every message in it —
+            # a voice note that fails admission would take the surrounding text
+            # messages with it. Retry one by one so one poison message cannot
+            # swallow the rest, and log the ids that really were dropped.
+            _LOG.warning(
+                "poll batch failed, retrying per message",
+                extra={"channel": channel, "error": str(exc)},
+            )
+            admitted: list[dict[str, Any]] = []
+            for single in messages:
+                try:
+                    admitted.extend(await self.receive_batch([single], route_channel=channel))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as one_exc:
+                    _LOG.warning(
+                        "inbound message dropped",
+                        extra={
+                            "channel": channel,
+                            "error": str(one_exc),
+                            "correlation_id": getattr(single, "message_id", None),
+                        },
+                    )
+            return admitted
 
     # ---- durable outbox ----------------------------------------------------
 
