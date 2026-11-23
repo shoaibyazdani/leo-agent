@@ -185,8 +185,14 @@ class ModelRouter:
         )
 
     def _is_blocked(self) -> bool:
-        """A broken live configuration blocks calls unless mock is opted into."""
-        return not self.providers or (bool(self._build_errors) and not self._mock_fallback_allowed)
+        """Blocked only when NOTHING could be built.
+
+        One unbuildable entry is a degraded configuration, not an outage: the
+        broken provider is reported in ``build_errors`` and the healthy ones keep
+        answering. Previously any build error blocked every model, so a single
+        stale or half-configured entry took the whole agent offline.
+        """
+        return not self.providers
 
     def _blocked_reason(self) -> str:
         """Scrubbed, operator-facing explanation of a blocked model state."""

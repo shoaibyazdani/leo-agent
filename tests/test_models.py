@@ -1522,3 +1522,64 @@ async def test_router_fails_after_one_empty_output_retry(model_db) -> None:
         await router.complete(_request())
     assert excinfo.value.code == "model_empty_output"
     assert len(provider.requests) == 2  # exactly one retry, never a loop
+
+
+# --- one unbuildable provider must not black out the catalogue ---------------
+def _settings_with(providers: dict[str, ModelProviderConfig], default: str) -> Settings:
+    settings = Settings()
+    settings.models.providers = providers
+    settings.models.default = default
+    settings.models.fallback = default
+    return settings
+
+
+def test_one_unbuildable_provider_does_not_block_the_rest(monkeypatch) -> None:
+    """Live outage: one stale entry with no base_url blocked every other model.
+
+    The router reported ``blocked`` for the whole catalogue, so a healthy
+    deepseek route answered "The model could not produce an answer" — the
+    operator reads that as the agent being broken, not one entry being wrong.
+    """
+    monkeypatch.setenv("LEO_TEST_OPENAI_KEY", "test-key")
+    settings = _settings_with(
+        {
+            "good": _openai_config(),
+            "ghost": ModelProviderConfig(kind="openai-compatible", model="ghost"),
+        },
+        "good",
+    )
+    router = ModelRouter(settings=settings)
+
+    assert sorted(router.providers) == ["good"]
+    status = router.status()
+    assert status["status"] == "degraded"
+    assert [item["provider"] for item in status["build_errors"]] == ["ghost"]
+    assert status["routable_live_providers"] == ["good"]
+
+
+def test_a_catalogue_that_builds_nothing_is_still_blocked() -> None:
+    settings = _settings_with(
+        {"ghost": ModelProviderConfig(kind="openai-compatible", model="ghost")}, "ghost"
+    )
+    router = ModelRouter(settings=settings)
+
+    assert router.status()["status"] == "blocked"
+    assert "missing base_url" in router.status()["reason"]
+
+
+def test_env_token_injects_a_buildable_opencode_go(tmp_path, monkeypatch) -> None:
+    """The env shim needs a real gateway URL, not None.
+
+    It was built from ``ANTHROPIC_BASE_URL`` alone, so a box with only the token
+    exported produced a provider that could never be built — and that single
+    failure blocked every model.
+    """
+    cfg = tmp_path / "leo.yaml"
+    cfg.write_text("models:\n  providers: {}\n", encoding="utf-8")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-value")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+    settings = Settings.load(cfg)
+    injected = settings.models.providers["opencode-go"]
+    assert injected.base_url == "https://opencode.ai/zen/go"
+    assert injected.api_key_env == "ANTHROPIC_AUTH_TOKEN"
