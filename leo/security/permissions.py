@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,15 @@ class PermissionManagerImpl:
         for p in settings.security.allowed_roots:
             self._roots.append(settings.resolve(p).resolve())
         self._roots.append(settings.resolve(settings.paths.workspaces).resolve())
+        self._reviewer: Callable[..., Awaitable[tuple[str, str]]] | None = None
+        # (action, command, workspace) -> (expires_at, verdict, note)
+        self._review_cache: dict[tuple[str, str, str], tuple[float, str, str]] = {}
+
+    def set_reviewer(
+        self, reviewer: Callable[..., Awaitable[tuple[str, str]]] | None
+    ) -> None:
+        """Install the smart-mode auto-reviewer (or clear it with None)."""
+        self._reviewer = reviewer
 
     def _path_violation(self, resource: str | None) -> str | None:
         if not self.settings.security.workspace_only or not resource:
@@ -222,6 +232,9 @@ class PermissionManagerImpl:
             current_digest = arguments_digest(context.get("arguments"))
         risk_reason = str(context.get("risk_reason") or "")
         command_preview = str(context.get("command_preview") or "")
+        # The reviewer needs the real command, but it must not be persisted in
+        # the approval metadata: pop it before that mapping is built.
+        review_command = str(context.pop("review_command", "") or "")
         verified_approval = False
         if supplied_approval:
             row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (supplied_approval,))
@@ -264,10 +277,36 @@ class PermissionManagerImpl:
         ):
             allowed, reason, grant_applied = True, "approval grant", True
 
+        # Smart mode asks a cheap model to review an otherwise-uncovered HIGH
+        # shell call before a human is bothered. A destructive/credential/
+        # arbitrary-code reason never reaches the reviewer.
+        review_answered = False
+        if (
+            allowed and not grant_applied and risk is RiskLevel.HIGH
+            and self.settings.security.high_risk_requires_approval and not verified_approval
+            and self.settings.security.approval_mode == "smart"
+            and self.settings.security.reviewer_enabled
+            and self._reviewer is not None
+            and action in {"tool:shell", "tool:terminal"}
+            and reason_is_trustable(risk_reason)
+            and review_command.strip()
+        ):
+            verdict, note = await self._review(
+                action, review_command, resource, risk_reason
+            )
+            if verdict == "allow":
+                allowed, reason, grant_applied = (
+                    True, f"auto-reviewed: {note or 'allowed'}", True,
+                )
+                review_answered = True
+            elif verdict == "deny":
+                allowed, reason = False, f"auto-review denied: {note or 'denied'}"
+                review_answered = True
+
         # A grant already answered this request; asking again would queue a
         # second approval for an action the operator just allowed.
         if (
-            allowed and not grant_applied and risk is RiskLevel.HIGH
+            allowed and not grant_applied and not review_answered and risk is RiskLevel.HIGH
             and self.settings.security.high_risk_requires_approval and not verified_approval
             and self.settings.security.approval_mode != "off"
         ):
@@ -331,6 +370,42 @@ class PermissionManagerImpl:
             (utcnow(), approval_id),
         )
         return cursor.rowcount == 1
+
+    async def _review(
+        self,
+        action: str,
+        command: str,
+        resource: str | None,
+        risk_reason: str,
+    ) -> tuple[str, str]:
+        """Run the smart-mode reviewer with a timeout and a short verdict cache."""
+        key = (action, str(command or ""), str(resource or ""))
+        loop = asyncio.get_running_loop()
+        cached = self._review_cache.get(key)
+        if cached is not None and loop.time() < cached[0]:
+            return cached[1], cached[2]
+        timeout = float(
+            getattr(self.settings.security, "reviewer_timeout_seconds", 20) or 20
+        )
+        try:
+            verdict, note = await asyncio.wait_for(
+                self._reviewer(  # type: ignore[misc]
+                    command=command,
+                    resource=resource,
+                    risk_reason=risk_reason,
+                    action=action,
+                ),
+                timeout=max(1.0, timeout),
+            )
+        except Exception:  # noqa: BLE001 - a dead reviewer falls back to a human
+            return "ask", "reviewer unavailable"
+        verdict = str(verdict or "").strip().lower()
+        note = str(note or "")[:300]
+        if verdict not in {"allow", "deny", "ask"}:
+            return "ask", "reviewer gave no verdict"
+        if verdict in {"allow", "deny"}:
+            self._review_cache[key] = (loop.time() + 600.0, verdict, note)
+        return verdict, note
 
     def _workspace_contains(self, workspace: str, resource: str | None) -> bool:
         """True when the call's cwd (or the default root) is inside the grant."""

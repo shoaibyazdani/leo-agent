@@ -703,6 +703,10 @@ class ToolExecutorImpl:
                         arguments_digest=current_digest,
                         risk_reason=risk_reason,
                         command_preview=command_preview,
+                        review_command=(
+                            str(call.arguments.get("command") or "")
+                            if call.name in {"shell", "terminal"} else ""
+                        ),
                     )
                     # Hold the turn while a human decides. Without this the turn
                     # ended at ApprovalRequired, so an approval tapped seconds

@@ -378,3 +378,75 @@ async def test_wait_for_approval_times_out_without_killing_the_turn(env):
     assert result.decision == "denied"
     assert "timed out" in (result.error or "")
     assert not env.executed
+
+
+async def _shell_decision(env, reviewer, reason: str = "unclassified command (rsvg-convert)"):
+    env.permissions.set_reviewer(reviewer)
+    return await env.permissions.authorize(
+        "operator", "tool:shell", str(env.settings.root.resolve()), RiskLevel.HIGH,
+        risk_reason=reason,
+        review_command="rsvg-convert -z 2 -o girl.png girl.svg",
+    )
+
+
+async def test_auto_reviewer_allow_runs_without_an_approval(env):
+    calls = []
+
+    async def reviewer(**kwargs):
+        calls.append(kwargs)
+        return "allow", "ordinary image conversion"
+
+    decision = await _shell_decision(env, reviewer)
+
+    assert decision.allowed is True and decision.requires_approval is False
+    assert "auto-reviewed" in decision.reason
+    assert calls and calls[0]["command"].startswith("rsvg-convert")
+    row = await db.fetchone("SELECT COUNT(*) AS n FROM approvals")
+    assert row["n"] == 0
+
+
+async def test_auto_reviewer_deny_does_not_create_an_approval(env):
+    async def reviewer(**kwargs):
+        return "deny", "writes outside the workspace"
+
+    decision = await _shell_decision(env, reviewer)
+
+    assert decision.allowed is False and decision.requires_approval is False
+    assert "auto-review denied" in decision.reason
+    row = await db.fetchone("SELECT COUNT(*) AS n FROM approvals")
+    assert row["n"] == 0
+
+
+async def test_auto_reviewer_ask_creates_a_human_approval(env):
+    async def reviewer(**kwargs):
+        return "ask", "uncertain"
+
+    decision = await _shell_decision(env, reviewer)
+
+    assert decision.requires_approval is True and decision.approval_id
+    row = await db.fetchone(
+        "SELECT status FROM approvals WHERE id=?", (decision.approval_id,)
+    )
+    assert row["status"] == "pending"
+
+
+async def test_auto_reviewer_is_not_used_for_a_dangerous_reason(env):
+    calls = []
+
+    async def reviewer(**kwargs):
+        calls.append(kwargs)
+        return "allow", ""
+
+    decision = await _shell_decision(env, reviewer, reason="rm is destructive")
+
+    assert decision.requires_approval is True
+    assert calls == [], "destructive calls must never reach the reviewer"
+
+
+async def test_auto_reviewer_failure_falls_back_to_a_human(env):
+    async def reviewer(**kwargs):
+        raise RuntimeError("reviewer down")
+
+    decision = await _shell_decision(env, reviewer)
+
+    assert decision.requires_approval is True and decision.approval_id
