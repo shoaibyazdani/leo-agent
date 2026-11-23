@@ -35,7 +35,6 @@ from leo.integrations.gateway import (
     Gateway,
     GatewayAdmissionError,
     GatewayError,
-    GatewayPermissionError,
 )
 from leo.integrations.messaging import (
     DiscordAdapter,
@@ -453,7 +452,7 @@ async def test_gateway_message_event_still_carries_admitted_payload():
 # ------------------------------- 6. approval argument binding / send idempotency
 
 
-async def test_send_approval_binds_target_text_and_subject():
+async def test_send_needs_no_approval_even_when_high_risk_requires_it():
     settings = Settings()
     settings.security.high_risk_requires_approval = True
     permissions = PermissionManagerImpl(settings, events=EventBus(persist=False))
@@ -463,41 +462,12 @@ async def test_send_approval_binds_target_text_and_subject():
         admission=ChannelAdmission(ChannelsConfig(default_mode="open")),
     )
 
-    with pytest.raises(GatewayPermissionError) as requested:
-        await gateway.send("fake", "chat-42", "hello", subject="group-1")
-    approval_id = requested.value.approval_id
-    assert approval_id
-    row = await db.fetchone("SELECT resource, metadata FROM approvals WHERE id=?", (approval_id,))
-    assert row["resource"] == "fake:chat-42"          # immutable target, not caller subject
-    assert json.loads(row["metadata"])["arguments_digest"]
-
-    await permissions.resolve_approval(approval_id, True, resolver="user")
-    sent = await gateway.send(
-        "fake", "chat-42", "hello", subject="group-1", approval_id=approval_id
-    )
+    # Outbound sends are MEDIUM: they are audited but never create a tap,
+    # even with high_risk_requires_approval enabled.
+    sent = await gateway.send("fake", "chat-42", "hello", subject="group-1")
     assert sent["success"] is True
-
-    # Each changed argument must fail to consume the earlier approval.
-    for kwargs in (
-        {"subject": "group-2"},                    # digest covers subject
-        {"text": "different text"},                # digest covers text
-        {"target": "chat-43"},                     # resource + digest cover target
-    ):
-        call = {"channel": "fake", "target": "chat-42", "text": "hello", "subject": "group-1"}
-        call.update(kwargs)
-        with pytest.raises(GatewayPermissionError, match="not valid"):
-            await gateway.send(
-                call["channel"], call["target"], call["text"],
-                subject=call["subject"], approval_id=approval_id,
-            )
     assert len(adapter.sent) == 1
-
-    # A fresh approval for the same target but a different subject still names
-    # the immutable destination as its resource.
-    with pytest.raises(GatewayPermissionError) as second:
-        await gateway.send("fake", "chat-42", "another", subject="group-9")
-    row2 = await db.fetchone("SELECT resource FROM approvals WHERE id=?", (second.value.approval_id,))
-    assert row2["resource"] == "fake:chat-42"
+    assert len(await permissions.pending_approvals()) == 0
 
 
 async def test_send_replays_idempotent_response_without_second_adapter_call():
