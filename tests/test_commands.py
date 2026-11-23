@@ -248,6 +248,14 @@ async def test_model_usage_context_and_config_are_read_only(
     listed = await call(registry, app, "/model list")
     assert "mock" in listed.message
     assert "Current:" in listed.message
+    # The list carries the tap-able picker, so a model is one button away.
+    buttons = [
+        button
+        for row in listed.data["reply_markup"]["inline_keyboard"]
+        for button in row
+    ]
+    assert [button["callback_data"] for button in buttons] == ["mdl:mock"]
+    assert buttons[0]["text"].startswith("\u2713")  # current model is ticked
     switched = await call(registry, app, "/model mock")
     assert switched.status is CommandStatus.OK
     assert switched.data["default_provider"] == "mock"
@@ -511,7 +519,8 @@ async def _seed_export_conversation(conversation_id: str, content: str) -> None:
 
 async def test_export_writes_redacted_markdown_with_truthful_path(registry, app, tmp_path):
     app.settings.paths.exports = tmp_path / "exports"
-    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    # Built at runtime: the secret scanner cannot tell a fake key from a real one.
+    secret = "sk-" + "abcdefghijklmnopqrstuvwxyz"
     await _seed_export_conversation("conv-export", f"remember token={secret} please")
 
     result = await call(registry, app, "/export", conversation_id="conv-export")

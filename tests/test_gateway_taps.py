@@ -29,7 +29,7 @@ class FakeAdapter:
 
     def __init__(self) -> None:
         self.answers: list[str] = []
-        self.edits: list[tuple[str, str, str]] = []
+        self.edits: list[tuple[str, str, str, dict]] = []
 
     def set_callback_sink(self, sink) -> None:
         self.sink = sink
@@ -39,7 +39,7 @@ class FakeAdapter:
         return True
 
     async def edit_message_text(self, target, message_id, text, reply_markup=None) -> bool:
-        self.edits.append((str(target), str(message_id), str(text)))
+        self.edits.append((str(target), str(message_id), str(text), dict(reply_markup or {})))
         return True
 
 
@@ -171,3 +171,65 @@ def test_edit_message_text_accepts_not_modified(monkeypatch) -> None:
 
     assert asyncio.get_event_loop_policy() is not None
     assert asyncio.run(adapter.edit_message_text("1", "2", "same text")) is True
+
+
+@pytest.mark.asyncio
+async def test_a_model_tap_is_relayed_as_a_slash_command(tmp_path, monkeypatch) -> None:
+    """A picker button must switch the model in the process that owns settings.
+
+    The gateway polls and sees the tap but must not edit config behind the
+    brain's back: it queues ``/model <name>`` as ordinary work.
+    """
+    db.set_db_path(tmp_path / "taps.db")
+    from leo import db as db_module
+    await db_module.initialize()
+
+    adapter = FakeAdapter()
+    admitted: list[tuple[str, str, str]] = []
+
+    async def admit(text: str, channel: str, subject: str) -> None:
+        admitted.append((text, channel, subject))
+
+    settings = Settings()
+    settings.channels = ChannelsConfig(policies={"telegram": {"allow": [OWNER], "mode": "allowlist"}})
+    permissions = PermissionManagerImpl(settings)
+
+    result = await handle_tap(
+        "telegram",
+        {"callback_id": "cb1", "chat_id": OWNER, "message_id": "42",
+         "sender_id": OWNER, "data": "mdl:beam-free"},
+        settings=settings, permissions=permissions,
+        adapters={"telegram": adapter}, admit=admit,
+    )
+
+    assert result["ok"] is True and result["model"] == "beam-free"
+    assert admitted == [("/model beam-free", "telegram", OWNER)]
+    assert adapter.edits and adapter.edits[-1][2].count("beam-free") == 1
+    # the picker is removed so the same button cannot be tapped twice
+    assert adapter.edits[-1][3]["inline_keyboard"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_stranger_cannot_tap_the_model_picker(tmp_path) -> None:
+    db.set_db_path(tmp_path / "taps2.db")
+    from leo import db as db_module
+    await db_module.initialize()
+
+    adapter = FakeAdapter()
+    admitted: list[tuple[str, str, str]] = []
+
+    async def admit(text: str, channel: str, subject: str) -> None:
+        admitted.append((text, channel, subject))
+
+    settings = Settings()
+    settings.channels = ChannelsConfig(policies={"telegram": {"allow": [OWNER], "mode": "allowlist"}})
+    result = await handle_tap(
+        "telegram",
+        {"callback_id": "cb2", "chat_id": STRANGER, "message_id": "43",
+         "sender_id": STRANGER, "data": "mdl:beam-free"},
+        settings=settings, permissions=PermissionManagerImpl(settings),
+        adapters={"telegram": adapter}, admit=admit,
+    )
+
+    assert result["ok"] is False
+    assert admitted == []

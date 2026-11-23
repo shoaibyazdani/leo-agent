@@ -27,6 +27,11 @@ from ..security.approval_buttons import (
 _LOG = get_logger("gateway.callbacks")
 
 ResolveFn = Callable[[str, bool, str], Awaitable[Mapping[str, Any]]]
+# A model tap is relayed as a normal slash command, so the switch happens in the
+# process that owns settings instead of being written behind its back.
+AdmitFn = Callable[[str, str, str], Awaitable[None]]
+
+MODEL_TAP_PREFIX = "mdl:"
 
 
 def approval_senders(settings: Any, channel: str) -> list[str]:
@@ -107,6 +112,7 @@ async def handle_tap(
     adapters: Mapping[str, Any],
     resolve: ResolveFn | None = None,
     allowed: Iterable[str] | None = None,
+    admit: AdmitFn | None = None,
 ) -> dict[str, Any]:
     """Authorize, resolve and acknowledge one tap. Never raises."""
     adapter = adapters.get(channel)
@@ -127,6 +133,14 @@ async def handle_tap(
         _LOG.info("approval tap refused", extra={
             "channel": channel, "sender_id": sender_id, "reason": "not authorized"})
         return {"ok": False, "reason": "not authorized"}
+
+    raw_data = str(descriptor.get("data") or "")
+    if raw_data.startswith(MODEL_TAP_PREFIX):
+        return await _model_tap(
+            raw_data[len(MODEL_TAP_PREFIX):], adapter=adapter, reply=reply,
+            chat_id=chat_id, message_id=message_id, sender_id=sender_id,
+            channel=channel, admit=admit,
+        )
 
     parsed = parse_callback_data(descriptor.get("data"))
     if not parsed:
@@ -200,12 +214,46 @@ async def handle_tap(
             "grant_id": granted or None}
 
 
+async def _model_tap(
+    name: str,
+    *,
+    adapter: Any,
+    reply: Callable[[str], Awaitable[None]],
+    chat_id: str,
+    message_id: str,
+    sender_id: str,
+    channel: str,
+    admit: AdmitFn | None,
+) -> dict[str, Any]:
+    """Apply a model chosen from the picker keyboard."""
+    name = name.strip()
+    if not name:
+        await reply("No model on that button")
+        return {"ok": False, "reason": "empty model"}
+    if admit is None:
+        await reply("This process cannot switch models; run /model <name>")
+        return {"ok": False, "reason": "no admission path"}
+    await admit(f"/model {name}", channel, chat_id or sender_id)
+    await reply(f"Switching to {name}")
+    if chat_id and message_id and hasattr(adapter, "edit_message_text"):
+        await adapter.edit_message_text(
+            chat_id, message_id,
+            f"\U0001f4e6 Model: {name}\nApplying now — the confirmation follows below.",
+            {"inline_keyboard": []},
+        )
+    _LOG.info("model tap relayed", extra={
+        "channel": channel, "model": name, "sender_id": sender_id})
+    return {"ok": True, "model": name}
+
+
 def install(settings: Any, permissions: Any, adapters: Mapping[str, Any],
-            resolve: ResolveFn | None = None) -> bool:
+            resolve: ResolveFn | None = None,
+            admit: AdmitFn | None = None) -> bool:
     """Attach the tap handler to every adapter that can receive one."""
     async def sink(channel: str, descriptor: Mapping[str, Any]) -> None:
         await handle_tap(channel, descriptor, settings=settings,
-                         permissions=permissions, adapters=adapters, resolve=resolve)
+                         permissions=permissions, adapters=adapters, resolve=resolve,
+                         admit=admit)
 
     installed = False
     for adapter in adapters.values():
