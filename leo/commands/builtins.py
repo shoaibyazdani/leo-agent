@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -301,34 +302,123 @@ async def config_command(ctx: CommandContext) -> CommandResult:
     return _summary(ctx, "config", "Read-only LEO configuration snapshot", values)
 
 
+def _provider_list(providers: Mapping[str, Any], current: str) -> str:
+    """One provider per line, flagged, so the list is readable in a chat panel."""
+    rows = []
+    for name, cfg in sorted(providers.items()):
+        flags = []
+        if name == current:
+            flags.append("default")
+        if not getattr(cfg, "enabled", True):
+            flags.append("disabled")
+        suffix = f"  [{', '.join(flags)}]" if flags else ""
+        rows.append(f"{name} -> {getattr(cfg, 'model', '') or '-'}{suffix}")
+    return "\n".join(rows) or "(none)"
+
+
+def _persist_default_provider(provider: str) -> tuple[bool, str | None]:
+    """Rewrite only the ``models.default`` scalar, preserving the rest of leo.yaml.
+
+    A full YAML round-trip would expand the catalog's anchors and drop the
+    operator's comments, so this edits the single line in place.
+    """
+    cfg_path = Path(os.getenv("LEO_CONFIG", "leo.yaml"))
+    try:
+        original = cfg_path.read_text(encoding="utf-8")
+    except OSError:
+        return False, "leo.yaml is not readable"
+    lines = original.splitlines()
+    in_models = False
+    replaced = False
+    for index, line in enumerate(lines):
+        if not in_models:
+            if line.rstrip() == "models:":
+                in_models = True
+            continue
+        if line and not line[0].isspace():
+            break  # next top-level section
+        match = re.match(r"^(\s+)default\s*:", line)
+        if match:
+            lines[index] = f"{match.group(1)}default: {provider}"
+            replaced = True
+            break
+    if not replaced:
+        return False, "no models.default entry found in leo.yaml"
+    updated = "\n".join(lines) + ("\n" if original.endswith("\n") else "")
+    try:
+        cfg_path.with_name(cfg_path.name + ".bak").write_text(original, encoding="utf-8")
+        temporary = cfg_path.with_name(cfg_path.name + ".tmp")
+        temporary.write_text(updated, encoding="utf-8")
+        os.replace(temporary, cfg_path)
+    except OSError:
+        return False, "could not write leo.yaml"
+    return True, None
+
+
 async def model_command(ctx: CommandContext) -> CommandResult:
     app = ctx.app
     reported = getattr(getattr(app, "router", None), "status", None)
     status = reported() if callable(reported) else app.settings.model_status()
     providers = app.settings.models.providers
+    current = app.settings.models.default
     sub = ctx.argv[0].lower() if ctx.argv else "status"
     if sub == "list":
         data = {
-            name: {"model": cfg.model, "kind": cfg.kind, "enabled": cfg.enabled}
+            name: {"model": cfg.model, "kind": cfg.kind, "enabled": cfg.enabled,
+                   "default": name == current}
             for name, cfg in sorted(providers.items())
         }
-        return _summary(ctx, "model", f"Configured providers: {', '.join(data) or '(none)'}", data)
-    if sub == "status":
-        data = dict(status)
-        data.setdefault("configured_default", app.settings.models.default)
         return _summary(
             ctx, "model",
-            f"model status={status.get('status', 'unknown')}, default={app.settings.models.default}",
+            f"{len(data)} providers configured; default={current}\n"
+            + _provider_list(providers, current),
             data,
         )
-    target = status if sub == "reset" else providers.get(sub)
-    message = (
-        "LEO has no runtime model switch or session override. "
-        "Set models.default in leo.yaml and restart; no setting was changed."
+    if sub == "status":
+        data = dict(status)
+        data.setdefault("configured_default", current)
+        return _summary(
+            ctx, "model",
+            f"model status={status.get('status', 'unknown')}, default={current}",
+            data,
+        )
+    if sub == "reset":
+        return CommandResult.unsupported(
+            "model",
+            "There is no implicit reset. Switch explicitly with /model <name>, "
+            "or set models.default in leo.yaml and restart; no setting was changed.",
+            data={"status": status},
+        )
+    # /model <name> switches the live default the same way the web UI control
+    # does: the router reads settings.models.default per turn, so it applies to
+    # the next message, and the choice is persisted so it survives a restart.
+    target = providers.get(sub)
+    if target is None:
+        known = ", ".join(sorted(providers)) or "(none)"
+        raise ValueError(f"unknown provider {sub!r}; configured: {known}")
+    if not target.enabled:
+        return CommandResult.unsupported(
+            "model", f"provider {sub!r} is disabled; nothing was changed.",
+            data={"status": status},
+        )
+    if not target.model:
+        return CommandResult.unsupported(
+            "model", f"provider {sub!r} has no model; nothing was changed.",
+            data={"status": status},
+        )
+    app.settings.models.default = sub
+    persisted, warning = _persist_default_provider(sub)
+    await _audit(ctx, "slash.model.switch", sub, "default provider switched via slash")
+    message = f"Default model: {sub} -> {target.model} (applies to the next turn)"
+    if persisted:
+        message += "; saved to leo.yaml"
+    else:
+        message += f"; NOT persisted ({warning or 'unknown reason'})"
+    return _summary(
+        ctx, "model", message,
+        {"default_provider": sub, "model": target.model,
+         "persisted": persisted, "warning": warning},
     )
-    if sub != "reset" and target is None:
-        raise ValueError(f"unknown provider {sub!r}")
-    return CommandResult.unsupported("model", message, data={"status": status})
 
 
 async def usage_command(ctx: CommandContext) -> CommandResult:

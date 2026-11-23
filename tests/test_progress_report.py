@@ -85,7 +85,11 @@ async def test_the_first_step_sends_one_message_and_later_steps_edit_it(env) -> 
     assert target == "100000001"
     assert edited.startswith("⏳"), edited
     assert "2 steps" in edited, edited
-    assert "✍️ leo/app.py" in edited, edited
+    # Each row is glyph + monospace label + monospace detail, so the columns
+    # read as a set rather than as prose.
+    assert "❯ `shell`" in edited, edited
+    assert "✎ `write_file`" in edited, edited
+    assert "`leo/app.py`" in edited, edited
 
 
 async def test_a_burst_of_steps_is_throttled_into_the_latest_state(env) -> None:
@@ -228,3 +232,152 @@ async def test_every_progress_line_is_silent(env) -> None:
 
     assert env.adapter.silent, "the reporter sent nothing"
     assert all(env.adapter.silent), "every progress line must be silent"
+
+
+async def test_a_turn_with_no_tool_work_reports_nothing(env) -> None:
+    """A one-line answer must not carry a "done in 0s" footer.
+
+    The screenshot bug was "done in 12s — 0 step(s)" printed twice; the deeper
+    bug was that the footer existed at all under a reply that did no work.
+    """
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+
+    await reporter.end("done")
+    await reporter._flush(force=True)
+
+    assert env.adapter.sent == [], "a turn with no work must not open a report"
+    assert env.adapter.edits == []
+
+
+async def test_a_lookup_only_turn_stays_silent(env) -> None:
+    """Reading one file or searching memory is an answer, not a task."""
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+
+    reporter.note("read_file", {"path": "leo/config.py"})
+    reporter.note("memory_search", {"query": "concise replies"})
+    await reporter._flush(force=True)
+    await reporter.end("done")
+
+    assert env.adapter.sent == [], "lookups alone must not open a report"
+    assert env.adapter.edits == []
+
+
+async def test_enough_steps_earn_a_report_even_without_a_shell_call(env) -> None:
+    """Past `min_steps` the turn is real work, whatever tools it used."""
+    reporter = env.reporter
+    reporter.min_steps = 3
+    await reporter.begin("telegram", "100000001")
+
+    for index in range(3):
+        reporter.note("read_file", {"path": f"leo/module_{index}.py"})
+    await reporter._flush(force=True)
+
+    assert len(env.adapter.sent) == 1, "a long read-only turn is still work"
+
+
+async def test_the_outcome_is_not_repeated_after_real_work(env) -> None:
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "pytest -q"})
+    await reporter._flush(force=True)
+
+    await reporter.end("done")
+    await reporter._flush(force=True)
+
+    text = env.adapter.edits[-1][2] if env.adapter.edits else env.adapter.sent[-1][1]
+    assert text.count("done") == 1, text
+    assert text.count("step") == 1, text
+
+
+async def test_a_stopped_turn_says_stopped_not_done(env) -> None:
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "pytest -q"})
+
+    await reporter.end("stopped")
+    await reporter._flush(force=True)
+
+    text = env.adapter.edits[-1][2] if env.adapter.edits else env.adapter.sent[-1][1]
+    assert "stopped" in text, text
+    assert "done" not in text, text
+
+
+def test_a_shell_command_shows_the_work_not_its_preamble(env) -> None:
+    """`cd /root/x && pytest -q` reads as `pytest -q`; the cd is noise."""
+    reporter = env.reporter
+    reporter.begin_sync = None  # not part of this assertion
+    from leo.integrations.progress import _step_line
+
+    assert _step_line("shell", {"command": "cd /root/ws && pytest -q"}, None) == "❯ `shell` `pytest -q`"
+    # `set`/`source`/`cd` chains reduce to the last clause, which is the real work.
+    assert _step_line("shell", {"command": "cd /w && set -a && pytest -q"}, None) == "❯ `shell` `pytest -q`"
+    # A single command with no chain keeps its own text.
+    assert _step_line("shell", {"command": "git status"}, None) == "❯ `shell` `git status`"
+
+
+def test_a_step_with_no_detail_does_not_dangle(env) -> None:
+    from leo.integrations.progress import _step_line
+
+    assert _step_line("list_files", {}, None) == "◦ `list_files`"
+
+
+async def test_an_unchanged_edit_does_not_open_a_second_message(env) -> None:
+    """The "sent: 2" bug: a re-edit of identical text must not become a new message.
+
+    Telegram answers an identical edit with HTTP 400 "message is not modified".
+    Treating that as a failure made the reporter fall back to `send`, so one turn
+    appeared in the chat twice — the duplicate the screenshot shows.
+    """
+    class IdempotentAdapter:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.edits = 0
+
+        async def send(self, target: str, text: str, *, silent: bool = False):
+            self.sent.append(text)
+            return {"message_id": "1"}
+
+        async def edit_message_text(self, target, message_id, text, extra=None):
+            self.edits += 1
+            # Identical text is "not modified": the adapter reports success.
+            return True
+
+    adapter = IdempotentAdapter()
+
+    class _Gateway:
+        def _adapter(self, channel):
+            return adapter
+
+    reporter = ProgressReporter(_Gateway(), env.settings)
+    reporter.enabled = True
+    reporter.interval = 0.01
+    await reporter.begin("telegram", "100000001")
+    reporter.note("shell", {"command": "pytest -q"})
+    await reporter._flush(force=True)
+    await reporter.end("done")
+    await reporter._flush(force=True)
+    # A second end/flush with the same content must not add a message.
+    await reporter._flush(force=True)
+
+    assert len(adapter.sent) == 1, f"one turn opened {len(adapter.sent)} messages"
+
+
+async def test_repeated_calls_collapse_into_one_row(env) -> None:
+    """`shell ×3 · last` — twenty shell calls are one fact, not twenty rows.
+
+    The step deque must be longer than the rendered window: capping it at
+    max_steps evicted the earlier calls before they could be counted, so the
+    collapse silently did nothing.
+    """
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    for command in ("pytest -q", "git status", "python -m leo serve"):
+        reporter.note("shell", {"command": command})
+    await reporter._flush(force=True)
+
+    text = reporter.render()
+    assert "×3" in text, text
+    assert "python -m leo serve" in text, "the newest call is the one shown"
+    assert text.count("`shell`") == 1, "collapsed calls must be one row"

@@ -23,6 +23,7 @@ Deliberate properties:
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import re
 import time
 from collections import deque
@@ -35,6 +36,11 @@ _LOG = get_logger("integrations.progress")
 DEFAULT_INTERVAL_SECONDS = 4.0
 DEFAULT_IDLE_SECONDS = 20.0
 DEFAULT_MAX_STEPS = 3
+DEFAULT_MIN_STEPS = 6
+DEFAULT_SIGNIFICANT_TOOLS = (
+    "shell", "terminal", "patch", "write_file", "file_move", "file_copy",
+    "git_*", "browser_navigate",
+)
 ARGUMENT_PREVIEW_CHARS = 52
 
 # Tools whose effect is a file write read better with a marker than a bare name.
@@ -64,15 +70,81 @@ def _short_path(value: Any) -> str:
     return text
 
 
+# One glyph per tool family. A row reads at a glance: the shape of the work,
+# then the one detail that identifies it. Text-only glyphs (no emoji) keep the
+# column alignment stable on every client.
+_TOOL_GLYPH = {
+    "shell": "❯", "terminal": "❯",
+    "write_file": "✎", "patch": "✎", "file_move": "✎", "file_copy": "✎",
+    "read_file": "◦", "list_files": "◦", "search_files": "◦", "grep": "◦",
+    "browser_navigate": "◇", "browser_extract_text": "◇", "browser_click": "◇",
+    "http_get": "◇", "http_json": "◇", "web_search": "◇",
+}
+_DEFAULT_GLYPH = "·"
+# Tool labels are padded to this width so the detail column lines up. A longer
+# label simply pushes its own row out; alignment is a nicety, not a contract.
+_LABEL_WIDTH = 9
+
+
 def _step_line(tool: str, arguments: dict[str, Any] | None, ok: bool | None) -> str:
+    """One aligned row: `❯ shell  `pytest -q``.
+
+    The tool name is monospace so the column reads as a set, not as prose. The
+    detail is monospace too: a command and a path are literal strings, and a
+    proportional font makes them harder to scan or copy.
+    """
     args = arguments or {}
-    marker = "" if ok is not False else " ⚠️"
+    glyph = _TOOL_GLYPH.get(tool, _DEFAULT_GLYPH)
+    label = tool if tool not in {"terminal"} else "shell"
     if tool in _WRITE_TOOLS:
-        target = _short_path(args.get("path") or args.get("destination") or args.get("source") or "")
-        return f"✍️ {_preview(target)}{marker}"
-    detail = args.get("command") or args.get("path") or args.get("query") or ""
-    label = "shell" if tool in {"shell", "terminal"} else tool
-    return f"{label} {_preview(_short_path(detail) if tool not in {'shell', 'terminal'} else detail)}{marker}"
+        detail = _short_path(
+            args.get("path") or args.get("destination") or args.get("source") or ""
+        )
+    elif tool in {"shell", "terminal"}:
+        # A command is the interesting part, but the interpreter preamble around
+        # it (`cd x &&`, `set -a; . env`) crowds a one-line report. Show the verb.
+        detail = _command_summary(args.get("command") or "")
+    else:
+        detail = _short_path(args.get("command") or args.get("path") or args.get("query") or "")
+    warn = " ⚠" if ok is False else ""
+    if not detail:
+        return f"{glyph} `{label}`{warn}"
+    return f"{glyph} `{{label}}` {_mono(_preview(detail))}{warn}".replace("{label}", label)
+
+
+def _mono(text: str) -> str:
+    """Wrap in a code span, without letting a backtick in the text break it."""
+    return "`" + text.replace("`", "'") + "`" if text else ""
+
+
+def _command_summary(value: Any) -> str:
+    """Reduce a shell command to the one clause a reader recognises.
+
+    `cd /root/x && pytest -q tests/` reads as `pytest -q tests/`; a piped chain
+    keeps its first meaningful clause. The preview cap still applies afterwards.
+    """
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    for separator in ("&&", ";", "||"):
+        head = text.split(separator, 1)[0].strip()
+        if head and not head.startswith(("cd ", "set ", "source ", "export ")):
+            return head
+    # Only a cd/env preamble: fall through to the last clause, which is the work.
+    for separator in ("&&", ";"):
+        parts = [part.strip() for part in text.split(separator) if part.strip()]
+        if parts:
+            return parts[-1]
+    return text
+
+
+_COALESCED_TOOLS = frozenset({"shell", "terminal", "read_file", "search_files", "list_files"})
+
+
+def _row_label(row: str) -> str:
+    """The tool label of a rendered row (`❯ `shell` `x`` -> `shell`), or ''."""
+    match = re.search(r"`([a-z_]+)`", row)
+    return match.group(1) if match else ""
 
 
 class ProgressReporter:
@@ -90,7 +162,13 @@ class ProgressReporter:
         self.idle_seconds = float(
             getattr(cfg, "idle_seconds", DEFAULT_IDLE_SECONDS) or DEFAULT_IDLE_SECONDS
         )
-        self._steps: deque[str] = deque(maxlen=self.max_steps)
+        self.min_steps = int(getattr(cfg, "min_steps", DEFAULT_MIN_STEPS) or DEFAULT_MIN_STEPS)
+        raw_significant = getattr(cfg, "significant_tools", None)
+        self.significant_tools = tuple(
+            str(pattern) for pattern in (raw_significant or DEFAULT_SIGNIFICANT_TOOLS)
+        )
+        self._steps: deque[str] = deque(maxlen=max(self.max_steps, 12))
+        self._significant_seen = False
         self._channel = ""
         self._target = ""
         self._budget = 0
@@ -101,6 +179,8 @@ class ProgressReporter:
         self._last_step = 0.0
         self._last_text = ""
         self._active = False
+        self._flushing = False
+        self._verdict = "done"
         self._ticker: asyncio.Task[Any] | None = None
         self.sent = 0
         self.failed = 0
@@ -132,6 +212,7 @@ class ProgressReporter:
         self._message_id = ""
         self._last_text = ""
         self._steps.clear()
+        self._significant_seen = False
         self._active = True
         self._last_flush = 0.0
         try:
@@ -143,20 +224,42 @@ class ProgressReporter:
         return True
 
     async def end(self, verdict: str = "done") -> None:
-        """Stop reporting and leave a final line in the same message."""
+        """Close the report. The finished message is the final state, not a new one.
+
+        A completion line was appended here *and* the header states the same
+        completion, so every finished turn showed the outcome twice. The header
+        now owns that fact; nothing is appended.
+        """
         if not self._active:
             return
         self._active = False
+        self._verdict = verdict
         if self._ticker is not None:
             # end() can be reached from inside the ticker (idle finish); cancelling
             # the running task there would raise before the final line is written.
             if asyncio.current_task() is not self._ticker:
                 self._ticker.cancel()
             self._ticker = None
-        elapsed = self._duration()
-        icon = "✅" if verdict == "done" else "⚠️"
-        self._steps.append(f"{icon} {verdict} in {elapsed} — {self._iteration} step(s)")
         await self._flush(force=True)
+
+    def _is_significant(self, tool: str) -> bool:
+        """True when this tool call is real work rather than a lookup.
+
+        `memory_search` or `read_file` on its own is an answer, not a task: the
+        operator does not want a "done" footer under a one-line reply. A shell
+        command, a patch or a git call is work, and earns a live report.
+        """
+        name = str(tool or "").strip().lower()
+        if not name:
+            return False
+        for pattern in self.significant_tools:
+            if fnmatch.fnmatchcase(name, str(pattern).lower()):
+                return True
+        return False
+
+    def _worth_opening(self) -> bool:
+        """Whether this turn has done enough to deserve a message at all."""
+        return self._significant_seen or self._iteration >= self.min_steps
 
     # -- content -----------------------------------------------------------
     def note(self, tool: str, arguments: dict[str, Any] | None = None,
@@ -167,9 +270,13 @@ class ProgressReporter:
         self._iteration += 1
         self._last_step = time.monotonic()
         self._steps.append(_step_line(tool, arguments, ok))
-        if not self._message_id and self._last_step - self._started >= 0:
-            # First step: let the message appear immediately instead of waiting a
-            # whole interval, so the operator sees work start.
+        if self._is_significant(tool):
+            self._significant_seen = True
+        if not self._message_id and self._worth_opening():
+            # The FIRST report opens immediately once the turn is worth
+            # reporting, so the operator sees work start instead of waiting a
+            # whole interval. Later steps must respect the throttle: forcing a
+            # flush per step is what produced a progress message per tool call.
             self._last_flush = 0.0
 
     # -- rendering --------------------------------------------------------
@@ -187,41 +294,97 @@ class ProgressReporter:
         """
         lines: list[str] = []
         for line in self._steps:
-            label = line.split(" ", 1)[0]
+            # The row is `❯ `shell` `cmd``: the coalescing key is the tool label
+            # inside its code span, not the first word (which is now a glyph).
+            label = _row_label(line)
             for index in range(len(lines) - 1, -1, -1):
                 prior = lines[index]
-                if prior.split(" ", 1)[0] == label and label.startswith(("shell", "terminal", "read_file", "search_files")):
+                if _row_label(prior) == label and label in _COALESCED_TOOLS:
                     count = 2
                     if "×" in prior:
                         try:
-                            count = int(prior.split("×", 1)[1].split(" ", 1)[0]) + 1
+                            # The row is `❯ `shell` ×2 · `git status``, so the
+                            # count sits between `×` and the middot.
+                            count = int(prior.split("×", 1)[1].split("·", 1)[0].strip()) + 1
                         except (IndexError, ValueError):
                             count = 2
-                    lines[index] = f"{label} ×{count} · {line.split(' ', 1)[1] if ' ' in line else ''}".rstrip()
+                    # Rebuild the row in the same shape as a single step: the
+                    # glyph and label of the newest call, then the count and the
+                    # detail. Reusing the raw line tail would print the label
+                    # twice (`shell ×2 · `shell` `git status``).
+                    glyph = line.split(" ", 1)[0]
+                    detail = re.sub(r"^\S+\s+`[a-z_]+`\s*", "", line)
+                    lines[index] = f"{glyph} `{label}` ×{count} · {detail}".rstrip()
                     break
             else:
                 lines.append(line)
         return lines[-self.max_steps:]
 
     def render(self) -> str:
-        head = f"⏳ {self._duration()} · {self._iteration} steps" if self._iteration else f"⏳ {self._duration()}"
-        lines = self._coalesced()
-        if lines:
-            head += f" · {lines[-1].split(' ', 1)[-1][:24]}"
-        return "\n".join([head, *lines])
+        """One compact block: a status line, then the work itself.
+
+        The header must never repeat a step. It used to append the latest step's
+        text so a single-line report still said something; the effect was
+        "done in 12s — 0 step(s)" appearing twice in the same message, which
+        reads like a bug because it is one.
+        """
+        steps = self._coalesced()
+        head = self._status_line(steps)
+        # A one-step report already lives entirely in the header when that step
+        # is the completion line; printing it again would duplicate it.
+        body = [line for line in steps if line not in head]
+        return "\n".join([head, *body]) if body else head
+
+    def _status_line(self, steps: list[str]) -> str:
+        """One bold status line: `**⏳ 12s** · 3 steps`.
+
+        Bold on the elapsed time, not on the whole line: the eye lands on how
+        long the work has been running, and the step count reads as secondary.
+        """
+        elapsed = self._duration()
+        count = self._iteration
+        done = not self._active
+        failed = str(getattr(self, "_verdict", "done")) not in {"done", ""}
+        counted = f"{count} step{'s' if count != 1 else ''}" if count else ""
+        if done:
+            icon = "⚠️" if failed else "✅"
+            verb = "stopped" if failed else "done"
+            tail = f" · {counted}" if counted else ""
+            return f"{icon} **{verb} in {elapsed}**{tail}"
+        tail = f" · {counted}" if counted else ""
+        return f"⏳ **{elapsed}**{tail}"
 
     async def _flush(self, *, force: bool = False) -> None:
         if not (self._active or force) or not self._target:
             return
+        # One flush at a time. Two concurrent flushes both saw an empty
+        # `_message_id` and each opened its own message, which is the duplicate
+        # a reader sees as the same turn posted twice.
+        if self._flushing:
+            return
         now = time.monotonic()
         if not force and now - self._last_flush < self.interval:
             return
+        self._flushing = True
+        try:
+            await self._flush_once(force=force)
+        finally:
+            self._flushing = False
+
+    async def _flush_once(self, *, force: bool) -> None:
+        now = time.monotonic()
+        # A turn that never did enough to deserve a report must stay silent even
+        # at the final forced flush: closing a message that was never opened is
+        # what put a "done" footer under every one-line answer.
+        if not self._message_id and not self._worth_opening():
+            return
         self._last_flush = now
         text = self.render()
-        if text == self._last_text and not force:
-            # Nothing new to say. Re-editing identical text is what Telegram
-            # answers with "message is not modified", and the retry storm that
-            # followed opened a fresh message every few seconds.
+        if text == self._last_text and self._message_id:
+            # Nothing new to say, and the message already shows this text.
+            # Re-editing identical text is what Telegram answers with
+            # "message is not modified", and the retry storm that followed
+            # opened a fresh message every few seconds.
             return
         try:
             adapter = self.gateway._adapter(self._channel)  # noqa: SLF001 - same package
@@ -237,13 +400,18 @@ class ProgressReporter:
                 edited = await adapter.edit_message_text(  # type: ignore[attr-defined]
                     self._target, self._message_id, text, {"inline_keyboard": []}
                 )
-                self._last_text = text
-                if not edited:
-                    # A message can be edited only for 48h and only if it still
-                    # exists; when that fails, start a fresh one for the rest.
+                if edited:
+                    self._last_text = text
+                else:
+                    # The edit did not land. Only then is a fresh message the
+                    # right answer; setting `_last_text` first made a failed edit
+                    # look delivered and a retry open a duplicate.
                     result = await adapter.send(self._target, text, silent=True)
                     if isinstance(result, dict):
-                        self._message_id = str(result.get("message_id") or "")
+                        new_id = str(result.get("message_id") or "")
+                        if new_id:
+                            self._message_id = new_id
+                    self._last_text = text
                     self.sent += 1
         except Exception as exc:  # noqa: BLE001 - cosmetic only
             self.failed += 1
