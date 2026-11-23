@@ -168,21 +168,23 @@ def sign_resolution(secret: str, approval_id: str, decision: str) -> str:
 SESSION_GRANT_SECONDS = 8 * 60 * 60
 
 # Actions whose authority lives in their arguments, not in a path resource.
-# A session grant is keyed on ``(action, resource)``; for these actions the
-# resource (a cwd) does not identify the operation, so "Always" would cover
-# every future call of the tool — every high-risk shell command, for example.
-ALWAYS_UNSCOPABLE_ACTIONS: frozenset[str] = frozenset({"tool:shell", "tool:terminal"})
+# "Always" for these is scoped to the exact call payload through the approval's
+# arguments digest; a cwd or the bare tool name would cover unrelated commands.
+ALWAYS_ARG_SCOPED_ACTIONS: frozenset[str] = frozenset({"tool:shell", "tool:terminal"})
 
 
-def session_grant_scopable(action: str, resource: Any) -> bool:
-    """Whether ``(action, resource)`` names the operation an "Always" covers.
+def session_grant_scopable(
+    action: str, resource: Any, arguments_digest: Any = None
+) -> bool:
+    """Whether an "Always" grant can name the operation shown.
 
-    Both halves are needed: a resource to match on, and an action whose
-    authority is not carried in its arguments. When either is missing, the
-    button is not offered and a tap that asks for it is refused.
+    Path tools are scoped by their resource. Shell/terminal carry their
+    authority in the arguments, so they need the approval's arguments digest;
+    without one the grant would cover every call of the tool, so the button is
+    omitted and a tap that asks for it is refused.
     """
-    if str(action or "").strip() in ALWAYS_UNSCOPABLE_ACTIONS:
-        return False
+    if str(action or "").strip() in ALWAYS_ARG_SCOPED_ACTIONS:
+        return bool(str(arguments_digest or "").strip())
     return resource is not None and str(resource).strip() != ""
 
 
@@ -191,17 +193,19 @@ def build_keyboard(
     action: str,
     *,
     resource: Any = None,
+    arguments_digest: Any = None,
     include_session: bool = True,
 ) -> dict[str, Any]:
     """Approve / Always / Reject keyboard for one approval.
 
-    ``Always`` means "this same action on this same resource, until the grant
-    expires" - it is a scoped, expiring grant, never a blanket allow. That
-    promise only holds when :func:`session_grant_scopable` says the pair names
-    the operation; otherwise the button is omitted rather than over-promising.
+    ``Always`` means "this same action on this same resource (or, for a shell
+    command, this same exact command), until the grant expires" - it is a
+    scoped, expiring grant, never a blanket allow. That promise only holds when
+    :func:`session_grant_scopable` says the approval names the operation;
+    otherwise the button is omitted rather than over-promising.
     """
     kind = approval_kind_for_action(action)
-    scoped = session_grant_scopable(action, resource)
+    scoped = session_grant_scopable(action, resource, arguments_digest)
     first_row = [
         {"text": "✅ Approve", "callback_data": build_callback_data(kind, "approve", approval_id)},
         {"text": "⛔ Reject", "callback_data": build_callback_data(kind, "reject", approval_id)},

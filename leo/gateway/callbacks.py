@@ -12,6 +12,7 @@ still goes through the privileged tool path there.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
@@ -167,17 +168,24 @@ async def handle_tap(
     granted = ""
     if decision == "session":
         row = await db.fetchone(
-            "SELECT action, resource FROM approvals WHERE id=?", (approval_id,)
+            "SELECT action, resource, metadata FROM approvals WHERE id=?", (approval_id,)
         )
         if row is None:
             await reply("Unknown approval")
             return {"ok": False, "reason": "unknown approval"}
-        # "Always" is a scoped grant: action + resource. When that pair does not
-        # name the operation (a shell command's authority is in its arguments,
-        # not in a cwd), the grant would authorize every future call, not the
-        # call the operator is looking at. Refuse and leave the approval pending
-        # so the operator can still tap Approve once.
-        if not session_grant_scopable(str(row["action"]), row["resource"]):
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        digest = (
+            str(metadata.get("arguments_digest") or "")
+            if isinstance(metadata, Mapping) else ""
+        )
+        # "Always" names the operation: a path for path tools, the canonical
+        # arguments digest for shell/terminal. Without that, the grant would
+        # cover every future call, not the command the operator is looking at.
+        # Refuse and leave the approval pending so Approve-once still works.
+        if not session_grant_scopable(str(row["action"]), row["resource"], digest):
             await reply("Always is not available for this action — approve it once")
             _LOG.info("unscoped always refused", extra={
                 "channel": channel, "approval_id": approval_id,
@@ -185,6 +193,7 @@ async def handle_tap(
             return {"ok": False, "reason": "unscoped approval"}
         granted = await permissions.grant_session(
             str(row["action"]), row["resource"], SESSION_GRANT_SECONDS, actor,
+            arguments_digest=digest or None,
         )
         decision = "approve"
 

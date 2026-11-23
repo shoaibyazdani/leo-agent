@@ -15,8 +15,14 @@ from ..config import Settings
 from ..contracts import Decision, RiskLevel, new_id, utcnow
 from ..logging import get_logger
 from ..events import Event, EventBus
+from .approval_buttons import ALWAYS_ARG_SCOPED_ACTIONS
 
 _LOG = get_logger("security")
+
+
+def _grant_scope(action: str, arguments_digest: str) -> str:
+    """Storage key for an "Always" grant scoped to one exact call payload."""
+    return f"grant:{action}:{arguments_digest}"
 
 
 def arguments_digest(arguments: Any) -> str | None:
@@ -224,7 +230,7 @@ class PermissionManagerImpl:
         if (
             allowed and not violation and risk is RiskLevel.HIGH and not verified_approval
             and self.settings.security.high_risk_requires_approval
-            and await self._has_live_grant(action, resource)
+            and await self._has_live_grant(action, resource, current_digest)
         ):
             allowed, reason, grant_applied = True, "session grant", True
 
@@ -248,7 +254,18 @@ class PermissionManagerImpl:
             )
             allowed, requires_approval, reason = False, True, "approval required"
             if self.events:
-                await self.events.emit("approval.requested", approval_id=approval_id, actor=actor, action=action, resource=resource, risk=risk.value)
+                await self.events.emit(
+                    "approval.requested",
+                    approval_id=approval_id,
+                    actor=actor,
+                    action=action,
+                    resource=resource,
+                    risk=risk.value,
+                    # A non-secret canonical hash: the notifier offers "Always"
+                    # for shell/terminal only when it can scope the grant to the
+                    # exact command shown.
+                    **({"arguments_digest": current_digest} if current_digest else {}),
+                )
 
         decision = Decision(
             allowed=allowed, reason=reason, risk=risk,
@@ -278,51 +295,81 @@ class PermissionManagerImpl:
         )
         return cursor.rowcount == 1
 
-    async def _has_live_grant(self, action: str, resource: str | None) -> bool:
-        """True when an unexpired session grant covers this action/resource.
+    async def _has_live_grant(
+        self,
+        action: str,
+        resource: str | None,
+        arguments_digest: str | None = None,
+    ) -> bool:
+        """True when an unexpired session grant covers this exact operation.
 
-        An unscoped grant (``resource IS NULL``) is refused here, not matched.
-        Such a grant means "every call of this action", not the one the operator
-        was shown — a shell command has no path resource, so a NULL grant would
-        silently cover every high-risk shell command for its lifetime.
+        Path tools are keyed on ``(action, resource)``. Shell/terminal carry
+        their authority in the arguments, so they are keyed on the approval's
+        canonical arguments digest instead; an unscoped grant is never matched.
         """
-        if resource is None or str(resource).strip() == "":
-            return False
         try:
-            row = await db.fetchone(
-                "SELECT id FROM approval_grants WHERE action=? AND resource IS ? "
-                "AND expires_at > ? LIMIT 1",
-                (action, resource, utcnow()),
-            )
+            if action in ALWAYS_ARG_SCOPED_ACTIONS:
+                digest = str(arguments_digest or "").strip()
+                if not digest:
+                    return False
+                row = await db.fetchone(
+                    "SELECT id FROM approval_grants WHERE action=? AND resource=? "
+                    "AND expires_at > ? LIMIT 1",
+                    (action, _grant_scope(action, digest), utcnow()),
+                )
+            else:
+                if resource is None or str(resource).strip() == "":
+                    return False
+                row = await db.fetchone(
+                    "SELECT id FROM approval_grants WHERE action=? AND resource IS ? "
+                    "AND expires_at > ? LIMIT 1",
+                    (action, resource, utcnow()),
+                )
         except Exception:  # noqa: BLE001 - a grant lookup must never crash a decision
             return False
         return row is not None
 
     async def grant_session(
-        self, action: str, resource: str | None, seconds: int, granted_by: str,
+        self,
+        action: str,
+        resource: str | None,
+        seconds: int,
+        granted_by: str,
         scope: str = "session",
+        arguments_digest: str | None = None,
     ) -> str:
-        """Record a scoped, expiring grant for one action/resource pair.
+        """Record a scoped, expiring grant for one operation.
 
-        A grant with no resource is refused: there is nothing to scope it to,
-        so it would authorize every future call of the action instead of the
-        call the operator approved.
+        Path tools store their resource. Shell/terminal store the canonical
+        arguments digest, so "Always" covers the exact command shown and no
+        other shell command. A grant that names neither is refused.
         """
         from datetime import timedelta
 
-        if resource is None or str(resource).strip() == "":
-            raise ValueError("a session grant needs a resource to scope it")
+        digest = str(arguments_digest or "").strip()
+        if action in ALWAYS_ARG_SCOPED_ACTIONS:
+            if not digest:
+                raise ValueError(
+                    "a shell/terminal session grant needs the arguments digest"
+                )
+            stored_resource = _grant_scope(action, digest)
+        else:
+            if resource is None or str(resource).strip() == "":
+                raise ValueError("a session grant needs a resource to scope it")
+            stored_resource = str(resource)
+            digest = ""
         grant_id = new_id("grn")
         created = utcnow()
         expires = (datetime.fromisoformat(created) + timedelta(seconds=max(60, int(seconds)))).isoformat()
+        metadata = json.dumps({"arguments_digest": digest}) if digest else "{}"
         await db.execute(
             "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,granted_by,scope,metadata) "
             "VALUES(?,?,?,?,?,?,?,?)",
-            (grant_id, created, expires, action, resource, granted_by, scope, "{}"),
+            (grant_id, created, expires, action, stored_resource, granted_by, scope, metadata),
         )
         if self.events:
             await self.events.emit("approval.granted", grant_id=grant_id, action=action,
-                                   resource=resource, granted_by=granted_by, scope=scope)
+                                   resource=stored_resource, granted_by=granted_by, scope=scope)
         return grant_id
 
     async def resolve_approval(self, approval_id: str, approved: bool, resolver: str = "user") -> Decision:

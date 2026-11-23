@@ -159,6 +159,38 @@ async def test_always_is_refused_for_a_shell_approval(env) -> None:
     assert await db.fetchall("SELECT id FROM approval_grants") == []
 
 
+async def test_always_is_scoped_to_the_shell_command_digest(env) -> None:
+    """Always on a shell approval covers that exact command, not all shell."""
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", None, RiskLevel.HIGH,
+        arguments_digest="digest-one",
+    )
+    assert decision.approval_id
+
+    result = await handle_tap(
+        "telegram", _tap(decision.approval_id, decision="session"),
+        settings=env.settings, permissions=env.permissions, adapters=env.adapters,
+    )
+
+    assert result["ok"] is True and result["grant_id"]
+    grants = await db.fetchall("SELECT action, resource FROM approval_grants")
+    assert [(g["action"], g["resource"]) for g in grants] == [
+        ("tool:shell", "grant:tool:shell:digest-one")
+    ]
+
+    same = await env.permissions.authorize(
+        "operator", "tool:shell", None, RiskLevel.HIGH,
+        arguments_digest="digest-one",
+    )
+    assert same.allowed is True and same.reason == "session grant"
+
+    other = await env.permissions.authorize(
+        "operator", "tool:shell", None, RiskLevel.HIGH,
+        arguments_digest="digest-two",
+    )
+    assert other.allowed is False and other.requires_approval is True
+
+
 async def test_a_foreign_payload_is_refused(env) -> None:
     descriptor = _tap(env.approval_id)
     descriptor["data"] = "totally-made-up"
