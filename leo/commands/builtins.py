@@ -326,6 +326,26 @@ def _provider_list(providers: Mapping[str, Any], current: str, *, columns: int =
     return "\n".join(rows) or "(none)"
 
 
+def _model_picker(
+    providers: Mapping[str, Any], current: str, *, columns: int = 2,
+) -> dict[str, Any]:
+    """Inline keyboard: one button per model, the default marked with a tick.
+
+    A tap sends ``/model <name>`` back through the queue, so the switch still
+    runs in the process that owns settings — the gateway only relays the tap.
+    """
+    enabled = [name for name, cfg in sorted(providers.items()) if getattr(cfg, "enabled", True)]
+    rows: list[list[dict[str, str]]] = []
+    step = max(1, columns)
+    for index in range(0, len(enabled), step):
+        row = []
+        for name in enabled[index:index + step]:
+            label = ("\u2713 " if name == current else "") + name
+            row.append({"text": label[:48], "callback_data": f"mdl:{name}"[:64]})
+        rows.append(row)
+    return {"inline_keyboard": rows}
+
+
 def _model_listing_message(
     providers: Mapping[str, Any], current: str, *, columns: int = 3,
 ) -> str:
@@ -397,7 +417,7 @@ async def model_command(ctx: CommandContext) -> CommandResult:
         return _summary(
             ctx, "model",
             _model_listing_message(providers, current),
-            data,
+            {**data, "reply_markup": _model_picker(providers, current)},
         )
     if sub == "status":
         data = dict(status)

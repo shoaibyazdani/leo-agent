@@ -109,9 +109,11 @@ async def test_turn_lease_excludes_another_holder():
 class _FakeAdapter:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.markup: dict | None = None
 
-    async def send(self, target: str, text: str) -> dict:
+    async def send(self, target: str, text: str, **kwargs) -> dict:
         self.sent.append((target, text))
+        self.markup = kwargs.get("reply_markup")
         return {"ok": True}
 
 
@@ -287,3 +289,42 @@ async def test_a_settled_claim_is_reported_once_and_lets_go_of_its_claim() -> No
     assert row["status"] == "cancelled", "terminal state must not be rewritten"
     assert row["claim_expires_at"] is None
     assert row["claimed_by"] is None
+
+
+async def test_an_answer_can_carry_an_inline_keyboard():
+    """/model sends its picker with the answer, so the buttons ride delivery."""
+    store = GatewayStore()
+    adapter = _FakeAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(channel="telegram", subject="100000001",
+                                        payload=payload())
+    keyboard = {"inline_keyboard": [
+        [{"text": "beam-free", "callback_data": "mdl:beam-free"}],
+    ]}
+
+    async with _client(api) as client:
+        await client.post("/v1/claim", json={"worker": "w1"})
+        done = (await client.post("/v1/complete", json={
+            "admission_id": admission_id, "answer": "pick one",
+            "conversation_id": "conv_pick", "reply_markup": keyboard,
+        })).json()
+
+    assert done["delivered"] is True
+    assert adapter.sent == [("100000001", "pick one")]
+    assert adapter.markup == keyboard
+
+
+async def test_an_answer_without_a_keyboard_keeps_a_text_only_adapter_working():
+    store = GatewayStore()
+    adapter = _FakeAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(channel="telegram", subject="100000001",
+                                        payload=payload())
+    async with _client(api) as client:
+        await client.post("/v1/claim", json={"worker": "w1"})
+        done = (await client.post("/v1/complete", json={
+            "admission_id": admission_id, "answer": "plain",
+        })).json()
+
+    assert done["delivered"] is True
+    assert adapter.markup is None
