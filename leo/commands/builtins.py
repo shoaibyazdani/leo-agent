@@ -440,7 +440,7 @@ async def model_command(ctx: CommandContext) -> CommandResult:
     status = reported() if callable(reported) else app.settings.model_status()
     providers = app.settings.models.providers
     current = app.settings.models.default
-    sub = ctx.argv[0].lower() if ctx.argv else "status"
+    sub = ctx.argv[0].lower() if ctx.argv else "list"
     if sub == "list":
         page = 0
         if len(ctx.argv) > 1:

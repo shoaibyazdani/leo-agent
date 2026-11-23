@@ -22,7 +22,7 @@ from leo.integrations.admission import ChannelAdmission
 from leo.integrations.channels import ALL_ADAPTERS
 from leo.integrations.gateway import Gateway, GatewayPermissionError
 from leo.integrations.messaging import MessagingAdapter
-from leo.security.permissions import ApprovalRequired, PermissionManagerImpl
+from leo.security.permissions import PermissionManagerImpl
 from leo.tools import integration_tools
 from leo.tools.executor import ToolExecutorImpl
 from leo.tools.registry import ToolRegistry
@@ -387,14 +387,14 @@ async def test_invalid_arguments_never_reach_gateway(env, monkeypatch):
     assert (await records_for("channel_send"))[0]["decision"] == "invalid_arguments"
 
 
-async def test_channel_send_high_risk_requires_approval(env, monkeypatch):
+async def test_channel_send_needs_no_approval(env, monkeypatch):
     monkeypatch.setenv(TOKEN_ENV, FAKE_TOKEN)
     gateway, adapter, admission = build_gateway(env)
     install_services(env, gateway, admission, adapter)
     env.settings.security.high_risk_requires_approval = True
 
-    with pytest.raises(ApprovalRequired):
-        await run(env, "channel_send", {
-            "channel": CHANNEL, "target": "chat-42", "text": "hello",
-        })
-    assert adapter.calls == []
+    result = await run(env, "channel_send", {
+        "channel": CHANNEL, "target": "chat-42", "text": "hello",
+    })
+    assert result.success is True
+    assert adapter.calls, "the send actually went out without a tap"

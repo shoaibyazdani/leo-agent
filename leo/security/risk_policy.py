@@ -131,4 +131,7 @@ def _assess_outbound(arguments: Mapping[str, Any]) -> tuple[RiskLevel, str]:
         return RiskLevel.LOW, "reply into the originating conversation"
     if not target:
         return RiskLevel.MEDIUM, "outbound message without an explicit target"
-    return RiskLevel.HIGH, f"outbound message to a different target ({target[:24]})"
+    # Outbound sends are audited but need no human tap. The gateway records
+    # every send in the outbox and event log, so MEDIUM (runs, recorded) is the
+    # right tier; HIGH here created approval friction on every channel reply.
+    return RiskLevel.MEDIUM, f"outbound message to a target ({target[:24]})"

@@ -139,7 +139,7 @@ async def handle_tap(
         return await _model_tap(
             raw_data[len(MODEL_TAP_PREFIX):], adapter=adapter, reply=reply,
             chat_id=chat_id, message_id=message_id, sender_id=sender_id,
-            channel=channel, admit=admit,
+            channel=channel, admit=admit, settings=settings,
         )
 
     parsed = parse_callback_data(descriptor.get("data"))
@@ -224,31 +224,38 @@ async def _model_tap(
     sender_id: str,
     channel: str,
     admit: AdmitFn | None,
+    settings: Any,
 ) -> dict[str, Any]:
     """Apply a model chosen from the picker keyboard."""
     name = name.strip()
-    # The guard belongs here, above every branch: a page tap needs an admission
-    # path just as much as a model tap, and calling None is not a fallback.
-    if admit is None:
-        await reply("This process cannot switch models; run /model <name>")
-        return {"ok": False, "reason": "no admission path"}
     if name.startswith("pg:"):
+        # Pagination is a pure re-render, not a config change: edit the SAME
+        # message in place with the new page's text + buttons. Queuing a fresh
+        # `/model list <n>` left the old message behind as stale text and posted
+        # a second picker below it. No config write means no admission path is
+        # needed, so this works in both the split gateway and the single app.
         try:
             page = int(name[3:])
         except (ValueError, TypeError):
             page = 0
-        await admit(f"/model list {page}", channel, chat_id or sender_id)
-        await reply(f"Page {page + 1}")
+        from ..commands.builtins import _model_listing_message, _model_picker
+
+        providers = settings.models.providers
+        current = settings.models.default
+        text = _model_listing_message(providers, current, page=page)
+        keyboard = _model_picker(providers, current, page=page)
         if chat_id and message_id and hasattr(adapter, "edit_message_text"):
-            await adapter.edit_message_text(
-                chat_id, message_id,
-                f"Model picker — page {page + 1}",
-                {"inline_keyboard": []},
-            )
+            await adapter.edit_message_text(chat_id, message_id, text, keyboard)
+        await reply("")  # stop the tap spinner; the message itself changed
         return {"ok": True, "page": page}
     if not name:
         await reply("No model on that button")
         return {"ok": False, "reason": "empty model"}
+    # Only an actual model switch writes config, so only it needs the privileged
+    # admission path. Keep this guard below the pagination branch.
+    if admit is None:
+        await reply("This process cannot switch models; run /model <name>")
+        return {"ok": False, "reason": "no admission path"}
     await admit(f"/model {name}", channel, chat_id or sender_id)
     await reply(f"Switching to {name}")
     if chat_id and message_id and hasattr(adapter, "edit_message_text"):

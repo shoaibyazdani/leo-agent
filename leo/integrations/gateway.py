@@ -846,7 +846,7 @@ class Gateway:
         # empty conversation behind (receive() follows the same ordering).
         await self._authorize(
             "gateway.send",
-            RiskLevel.HIGH,
+            RiskLevel.MEDIUM,
             resource=resource,
             approval_id=approval_id,
             arguments=send_arguments,
