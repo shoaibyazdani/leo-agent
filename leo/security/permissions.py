@@ -279,7 +279,15 @@ class PermissionManagerImpl:
         return cursor.rowcount == 1
 
     async def _has_live_grant(self, action: str, resource: str | None) -> bool:
-        """True when an unexpired session grant covers this action/resource."""
+        """True when an unexpired session grant covers this action/resource.
+
+        An unscoped grant (``resource IS NULL``) is refused here, not matched.
+        Such a grant means "every call of this action", not the one the operator
+        was shown — a shell command has no path resource, so a NULL grant would
+        silently cover every high-risk shell command for its lifetime.
+        """
+        if resource is None or str(resource).strip() == "":
+            return False
         try:
             row = await db.fetchone(
                 "SELECT id FROM approval_grants WHERE action=? AND resource IS ? "
@@ -294,9 +302,16 @@ class PermissionManagerImpl:
         self, action: str, resource: str | None, seconds: int, granted_by: str,
         scope: str = "session",
     ) -> str:
-        """Record a scoped, expiring grant for one action/resource pair."""
+        """Record a scoped, expiring grant for one action/resource pair.
+
+        A grant with no resource is refused: there is nothing to scope it to,
+        so it would authorize every future call of the action instead of the
+        call the operator approved.
+        """
         from datetime import timedelta
 
+        if resource is None or str(resource).strip() == "":
+            raise ValueError("a session grant needs a resource to scope it")
         grant_id = new_id("grn")
         created = utcnow()
         expires = (datetime.fromisoformat(created) + timedelta(seconds=max(60, int(seconds)))).isoformat()

@@ -6,6 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -49,6 +50,27 @@ def _mock_fallback_env_override() -> bool | None:
     if any(value != values[0] for value in values[1:]):
         raise ValueError(f"{_MOCK_FALLBACK_ENV} conflicts with {_MOCK_FALLBACK_MODELS_ENV}")
     return values[0]
+
+
+def _is_opencode_inference_gateway(url: str | None) -> bool:
+    """True only for the OpenCode Go inference endpoint LEO is built against.
+
+    OpenCode exposes several surfaces. The IDE's ``/zen/go`` endpoint is a
+    different product path, and a shared shell often exports it (or another
+    Anthropic-compatible gateway) as ``ANTHROPIC_BASE_URL``. LEO must not adopt
+    that value as its own opencode-go provider: this project's gateway is the
+    ``/inference/go/anthropic`` endpoint, and only that one gets the session
+    header this provider needs.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(str(url))
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").rstrip("/")
+    return host == "opencode.ai" and path == "/inference/go/anthropic"
 
 
 def _validate_env_name(field: str, value: str | None) -> str | None:
@@ -223,6 +245,44 @@ class CompactionConfig(BaseModel):
     model: str = ""
 
 
+class AutoNoteConfig(BaseModel):
+    """Autonomous memory-note learning.
+
+    LEO derives notes from its own durable history (the operator's statements,
+    bounded tool/run trajectories) and, by default, writes the safe ones
+    without asking. The sanitizer still drops secrets and instruction-shaped
+    text, every note carries evidence hashes, dedupe runs before the write, and
+    a supersede of an existing memory stays approval-bound.
+
+    Set ``enabled: false`` to restore the approval gate for every note.
+    """
+
+    enabled: bool = True
+    # Source kinds the engine may write unattended. ``external`` is refused by
+    # the policy validator, so web/tool-injected text cannot become a note.
+    trusted_sources: list[str] = Field(
+        default_factory=lambda: ["user", "tool", "run"]
+    )
+    # Categories eligible for an unattended write. Personal/project facts are
+    # included because they are exactly what the operator expects LEO to
+    # remember; remove them to keep those approval-bound.
+    allowed_categories: list[str] = Field(
+        default_factory=lambda: [
+            "working", "episodic", "semantic", "procedural",
+            "personal", "project", "organizational",
+        ]
+    )
+    max_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    promote_facts: bool = False
+    # Required for the personal/organizational/project categories above.
+    allow_high_risk_categories: bool = True
+    allow_unattended_writes: bool = True
+
+
+class LearningConfig(BaseModel):
+    auto_notes: AutoNoteConfig = Field(default_factory=AutoNoteConfig)
+
+
 class AutomationConfig(BaseModel):
     tick_seconds: float = 1.0
     recovery_on_startup: bool = True
@@ -308,6 +368,7 @@ class Settings(BaseModel):
     models: ModelConfig = Field(default_factory=ModelConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     progress: ProgressConfig = Field(default_factory=ProgressConfig)
+    learning: LearningConfig = Field(default_factory=LearningConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     computer: ComputerConfig = Field(default_factory=ComputerConfig)
@@ -391,22 +452,29 @@ class Settings(BaseModel):
             settings.models.allow_mock_fallback = mock_override
 
         # Environment-sourced provider configuration (values, not secret values).
-        # The gateway URL is not optional: a provider whose base_url is None can
-        # never be built, and one unbuildable provider used to black out every
-        # other model. Default to the same endpoint Hermes uses for opencode-go
-        # (the OpenAI-compatible client appends /v1/chat/completions).
-        base_url = os.getenv("ANTHROPIC_BASE_URL") or "https://opencode.ai/zen/go"
+        # The shim exists for env-only deployments of LEO's own OpenCode Go
+        # gateway. It activates only when ANTHROPIC_BASE_URL names that exact
+        # inference endpoint: the IDE's Anthropic surface and any other shared
+        # shell value are ignored, and a token alone never invents an endpoint.
+        base_url = os.getenv("ANTHROPIC_BASE_URL")
         model = os.getenv("ANTHROPIC_MODEL")
         token_env = "ANTHROPIC_AUTH_TOKEN" if os.getenv("ANTHROPIC_AUTH_TOKEN") else None
-        if "opencode-go" not in settings.models.providers and (base_url or token_env):
+        if (
+            "opencode-go" not in settings.models.providers
+            and _is_opencode_inference_gateway(base_url)
+        ):
             settings.models.providers["opencode-go"] = ModelProviderConfig(
                 base_url=base_url,
                 api_key_env=token_env,
-                model=model or "hy4-flash-free",
+                model=model or "deepseek-v4.1-flash",
                 # Anthropic-compatible gateways accept image content blocks;
                 # `vision` lets image-bearing turns route here instead of
                 # failing with "no provider satisfies the request".
                 capabilities=["text", "streaming", "tools", "structured", "usage", "vision"],
+                # Mirrors the shipped leo.yaml: this gateway requires a stable
+                # session id and rejects generic library user agents.
+                extra_header_env={"x-opencode-session": "LEO_OPENCODE_SESSION"},
+                extra_headers={"User-Agent": "leo-agent-os/0.1.0"},
             )
         # Automatic mock injection is opt-in only. An explicit ``kind: mock``
         # provider needs no flag; without either, a missing or broken live

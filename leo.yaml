@@ -19,6 +19,8 @@ models:
     # DeepSeek V4.1 Flash 1017 - 1,000,000 context - 384,000 output
     opencode-go: &opencode
       kind: anthropic-compatible
+      # LEO's inference gateway. The IDE's /zen/go surface is a different
+      # product path; never point LEO at it.
       base_url: https://opencode.ai/inference/go/anthropic
       api_key_env: ANTHROPIC_AUTH_TOKEN
       model: deepseek-v4.1-flash
@@ -279,6 +281,27 @@ paths:
   # at construction, so no tool-call argument can widen it. Relative paths are
   # resolved against the config root. Files outside this tree are refused.
   outbound_media: .leo/media/outbound
+
+learning:
+  # Autonomous memory notes. The engine reads LEO's own durable history and
+  # writes safe notes without asking; secrets, instruction-shaped text and
+  # external/tool-injected content are still dropped before a note exists, and
+  # every note keeps evidence hashes. Set enabled: false to restore a
+  # HIGH-risk approval for every note.
+  auto_notes:
+    enabled: true
+    # Only these source kinds may be written unattended. `external` is
+    # rejected by the policy, so web/injected text cannot become a note.
+    trusted_sources: [user, tool, run]
+    # Personal/project/organizational facts are included because they are what
+    # an assistant is normally expected to remember. Remove them to keep those
+    # approval-bound.
+    allowed_categories: [working, episodic, semantic, procedural, personal, project, organizational]
+    max_confidence: 0.8
+    allow_high_risk_categories: true
+    allow_unattended_writes: true
+    # Never promote unattended chat text to a FACT; notes stay UNVERIFIED.
+    promote_facts: false
 
 security:
   # Smart shell policy. smart auto-runs read-only/test commands, asks

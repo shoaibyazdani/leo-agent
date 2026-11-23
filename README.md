@@ -64,11 +64,15 @@ models:
       capabilities: [text, streaming, tools, structured, usage, vision]
 ```
 
-When `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` / `ANTHROPIC_AUTH_TOKEN` are set,
-LEO automatically registers an `opencode-go` provider using those values. The
-provider is the **OpenCode Go gateway** (the base URL); the model ID is whatever
-the gateway expects. This checkout's `leo.yaml` pins `opencode-go` to
-`deepseek-v4.1-flash` and also lists the other 30 models returned by
+When `ANTHROPIC_BASE_URL` names LEO's OpenCode Go inference gateway
+(`https://opencode.ai/inference/go/anthropic`) and `ANTHROPIC_AUTH_TOKEN` is
+set, LEO automatically registers an `opencode-go` provider using those values,
+including the gateway's required `x-opencode-session` header (from
+`LEO_OPENCODE_SESSION`) and User-Agent. A token alone injects nothing, and the
+IDE's Anthropic endpoint is deliberately ignored: LEO never adopts a shared
+shell's endpoint as its own. The model ID is whatever the gateway expects; this
+checkout's `leo.yaml` pins `opencode-go` to `deepseek-v4.1-flash` and also
+lists the other 30 models returned by
 `GET /inference/go/anthropic/v1/models`, each as its own provider named by the
 exact model id. Change `models.default` to any of those keys — or pick one in
 the dashboard's Model & providers dialog — to switch models. Per-model context

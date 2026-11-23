@@ -126,6 +126,9 @@ async def test_apply_fast_forwards_and_restarts(repo, monkeypatch):
 
     monkeypatch.setattr(builtins, "_git", fake_git)
     monkeypatch.setattr(builtins.shutil, "which", lambda _n: "/usr/bin/systemctl")
+    # Name the unit explicitly: auto-detection shells out to systemctl, which
+    # this test does not mock (and which does not exist on every host).
+    monkeypatch.setenv("LEO_SERVICE_UNITS", "leo-brain.service")
     spawned: list[list[str]] = []
     monkeypatch.setattr(
         builtins.subprocess, "Popen", lambda argv, **kwargs: spawned.append(argv)

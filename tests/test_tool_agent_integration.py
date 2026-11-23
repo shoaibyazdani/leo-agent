@@ -61,21 +61,21 @@ async def app(monkeypatch: pytest.MonkeyPatch) -> LeoApp:
 async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     names = [spec.name for spec in app.registry.list_specs()]
     assert names and len(names) == len(set(names)), "duplicate tool names"
-    # 24 non-operator registrar modules advertise 79 specs (this roster count
+    # 25 non-operator registrar modules advertise 82 specs (this roster count
     # still includes json_query); the operator registrar adds 9 and builtins add
-    # another 10, for 98 advertised names. json_query is deliberately withdrawn
+    # another 10, for 101 advertised names. json_query is deliberately withdrawn
     # from the model-callable catalogue because its caller-supplied data/default
-    # arguments let a model feed invented numbers back as evidence, leaving 97
-    # unique live names. preview_tools, http_tools and conversation_tools are all
-    # part of the shipped roster, not optional extras.
-    assert len(app.tool_roster) == 25, (
-        "expected the live 25-module tool roster including preview_tools, "
-        f"http_tools and conversation_tools; got {sorted(app.tool_roster)}"
+    # arguments let a model feed invented numbers back as evidence, leaving 100
+    # unique live names. preview_tools, http_tools, conversation_tools and
+    # edit_tools are all part of the shipped roster, not optional extras.
+    assert len(app.tool_roster) == 26, (
+        "expected the live 26-module tool roster including preview_tools, "
+        f"http_tools, conversation_tools and edit_tools; got {sorted(app.tool_roster)}"
     )
     registrars = {key: value for key, value in app.tool_roster.items() if key != "operator_tools"}
-    assert len(registrars) == 24, sorted(registrars)
-    assert {"preview_tools", "http_tools", "conversation_tools"} <= set(registrars)
-    assert sum(len(value) for value in registrars.values()) == 79
+    assert len(registrars) == 25, sorted(registrars)
+    assert {"preview_tools", "http_tools", "conversation_tools", "edit_tools"} <= set(registrars)
+    assert sum(len(value) for value in registrars.values()) == 82
     # The operator registrar declares 9 specs, but four of them drive the macOS
     # desktop through osascript/screencapture/pbcopy and are only registered on
     # darwin - on any other platform they would be advertised and then fail at
@@ -84,7 +84,7 @@ async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     # computer tools can actually run.
     operator_specs = 9 if sys.platform == "darwin" else 5
     assert len(app.tool_roster["operator_tools"]) == operator_specs
-    assert len(names) == 88 + operator_specs
+    assert len(names) == 91 + operator_specs
     assert "json_query" not in names  # operator/offline only, never model-callable
     assert all(app.tool_roster.values())
     for roster_names in app.tool_roster.values():
@@ -131,6 +131,13 @@ async def test_every_toolset_executes_through_real_executor(
     workspace.mkdir(exist_ok=True)
     sample = workspace / "sample.txt"
     sample.write_text("integration fixture")
+    # edit_tools.patch needs a real file inside the app's workspace roots.
+    patch_target = (
+        app.settings.resolve(app.settings.paths.workspaces)
+        / "toolset-probe" / "patch-me.txt"
+    )
+    patch_target.parent.mkdir(parents=True, exist_ok=True)
+    patch_target.write_text("alpha\n")
     browser = BrowserOperator(
         AllowAll(), backend=FakeBrowserPage(pages={"https://example.org/": "public text"}),
         profile_dir=workspace / "profile", base_dir=workspace, timeout=1.0,
@@ -190,6 +197,9 @@ async def test_every_toolset_executes_through_real_executor(
         ("context_tools", "context_stats", {}),
         ("conversation_tools", "conversation_messages", {"conversation_id": conversation_id}),
         ("data_tools", "base64_codec", {"operation": "encode", "text": "hello"}),
+        ("edit_tools", "patch", {
+            "path": str(patch_target), "old_string": "alpha", "new_string": "beta",
+        }),
         ("evaluation_tools", "evaluation_proposals", {}),
         ("event_tools", "event_query", {}),
         ("file_tools", "dir_tree", {"path": str(app.settings.root), "max_depth": 1, "max_entries": 3}),
@@ -236,7 +246,7 @@ async def test_every_toolset_executes_through_real_executor(
         outputs[module] = result.output
         seen_modules.add(module)
     app.settings.security.high_risk_requires_approval = high_risk_backup
-    assert len(seen_modules) == 25
+    assert len(seen_modules) == 26
     # The added toolsets really ran: a value decoded from the fetched HTTP
     # response, the process-local preview table's close handler, and a real
     # page read from the seeded durable conversation.

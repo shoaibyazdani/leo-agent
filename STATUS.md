@@ -8,7 +8,7 @@ narrative changelog.
 - Provider-independent agent platform: streaming chat in the dashboard and in
   the terminal (`leo chat`), durable tasks, layered memory, specialist agents,
   native tools and skills, approvals with audit, integrations adapters.
-- Measured from the live `LeoApp.initialize()` composition root: 95
+- Measured from the live `LeoApp.initialize()` composition root: 100
   registered tools, 38 available slash commands (126 registered slash
   commands in total) and 24 specialist agents.
 - Durable conversation compaction: older turns are summarized once, the summary
@@ -18,6 +18,12 @@ narrative changelog.
   context budget. The transcript is never rewritten.
 - Vision: image attachments route to providers that declare the `vision`
   capability and reach the model as image content blocks.
+- Autonomous memory learning: notes derived from the operator's own durable
+  history (explicit statements, bounded tool/run trajectories) are written with
+  evidence hashes after the secret/injection sanitizer; `learning.auto_notes`
+  in `leo.yaml` controls source kinds and categories, and setting
+  `learning.auto_notes.enabled: false` restores a HIGH-risk approval for every
+  note. Superseding an existing memory always requires an approval.
 - Local-first security model: loopback bind by default, `LEO_API_TOKEN`
   required for any non-loopback bind, HIGH-risk actions gated by approvals.
 

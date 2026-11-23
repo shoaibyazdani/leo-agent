@@ -1,8 +1,10 @@
-"""Tests for evidence-backed, approval-gated self-learning.
+"""Tests for evidence-backed self-learning.
 
 The suite checks that notes are grounded in durable history, that secrets and
 raw tool output never reach memory/events/audit, that dedupe and lifecycle
 transitions are real, and that consolidation cannot bypass the HIGH-risk gate.
+The shipped policy writes eligible notes unattended; the policy-off path keeps
+the approval gate, and supersedes stay gated in both modes.
 """
 
 from __future__ import annotations
@@ -326,6 +328,35 @@ async def test_trusted_auto_policy_writes_only_low_risk_sources(env):
                        allowed_categories=("personal",)).validated()
     with pytest.raises(ValueError, match="trusted sources"):
         AutoNotePolicy(enabled=True).validated()
+
+
+async def test_high_risk_categories_can_be_opted_in_for_unattended_writes(env):
+    """The shipped policy opts in: personal/project facts save without asking."""
+    engine = make_engine(env, auto_policy=AutoNotePolicy(
+        enabled=True, trusted_sources=("user",), allowed_categories=("personal",),
+        allow_high_risk_categories=True, allow_unattended_writes=True,
+        max_confidence=0.9,
+    ))
+    proposal = await engine.propose(NoteDraft(
+        content="My name is Alice Example", source_kind="user",
+        category=MemoryCategory.PERSONAL, confidence=0.8,
+    ))
+    assert proposal["status"] == "proposed" and proposal["policy"] == "auto"
+    assert proposal["approval_id"] is None
+
+    saved = await engine.accept(proposal["id"])
+    assert saved["category"] == MemoryCategory.PERSONAL.value
+    assert saved["metadata"]["policy"] == "auto"
+    assert saved["metadata"]["approval_id"] is None
+    assert await db.fetchone("SELECT id FROM approvals WHERE action=?", (ACTION_NOTE,)) is None
+
+    # A supersede still edits a memory a human already has, so it stays gated.
+    supersede = await engine.propose(NoteDraft(
+        content="The operator prefers to be addressed as Alice E. Smith",
+        source_kind="user", category=MemoryCategory.PERSONAL,
+        supersedes=["mem_existing"],
+    ))
+    assert supersede["status"] == "awaiting_approval"
 
 
 # ---------------------------------------------------------------------- dedupe

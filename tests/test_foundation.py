@@ -22,8 +22,9 @@ def test_config_defaults_and_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("LEO_ENVIRONMENT", "test")
     monkeypatch.setenv("LEO_CONFIG", str(tmp_path / "missing.yaml"))
     # A live provider comes from the operator's environment; mock is never
-    # injected unless the operator explicitly opts in.
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://example.invalid/anthropic")
+    # injected unless the operator explicitly opts in. The env shim accepts
+    # only LEO's OpenCode Go inference gateway, not the IDE's endpoint.
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://opencode.ai/inference/go/anthropic")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-token")
     monkeypatch.delenv("LEO_ALLOW_MOCK_FALLBACK", raising=False)
     monkeypatch.delenv("LEO_MODELS_ALLOW_MOCK_FALLBACK", raising=False)

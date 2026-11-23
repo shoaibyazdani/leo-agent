@@ -195,7 +195,13 @@ class ApprovalNotifier:
         try:
             adapter = self.gateway._adapter(channel)  # noqa: SLF001 - same package
             action = str(payload.get("action") or "")
-            keyboard = build_keyboard(str(payload.get("approval_id") or ""), action)
+            keyboard = build_keyboard(
+                str(payload.get("approval_id") or ""),
+                action,
+                # No resource means nothing to scope an "Always" grant to, so
+                # the button is not offered at all.
+                resource=payload.get("resource"),
+            )
             try:
                 await adapter.send(target, text, reply_markup=keyboard)
             except TypeError:

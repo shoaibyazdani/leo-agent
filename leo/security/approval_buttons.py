@@ -167,22 +167,47 @@ def sign_resolution(secret: str, approval_id: str, decision: str) -> str:
 
 SESSION_GRANT_SECONDS = 8 * 60 * 60
 
+# Actions whose authority lives in their arguments, not in a path resource.
+# A session grant is keyed on ``(action, resource)``; for these actions the
+# resource (a cwd) does not identify the operation, so "Always" would cover
+# every future call of the tool — every high-risk shell command, for example.
+ALWAYS_UNSCOPABLE_ACTIONS: frozenset[str] = frozenset({"tool:shell", "tool:terminal"})
+
+
+def session_grant_scopable(action: str, resource: Any) -> bool:
+    """Whether ``(action, resource)`` names the operation an "Always" covers.
+
+    Both halves are needed: a resource to match on, and an action whose
+    authority is not carried in its arguments. When either is missing, the
+    button is not offered and a tap that asks for it is refused.
+    """
+    if str(action or "").strip() in ALWAYS_UNSCOPABLE_ACTIONS:
+        return False
+    return resource is not None and str(resource).strip() != ""
+
 
 def build_keyboard(
-    approval_id: str, action: str, *, include_session: bool = True
+    approval_id: str,
+    action: str,
+    *,
+    resource: Any = None,
+    include_session: bool = True,
 ) -> dict[str, Any]:
     """Approve / Always / Reject keyboard for one approval.
 
     ``Always`` means "this same action on this same resource, until the grant
-    expires" - it is a scoped, expiring grant, never a blanket allow.
+    expires" - it is a scoped, expiring grant, never a blanket allow. That
+    promise only holds when :func:`session_grant_scopable` says the pair names
+    the operation; otherwise the button is omitted rather than over-promising.
     """
     kind = approval_kind_for_action(action)
+    scoped = session_grant_scopable(action, resource)
     first_row = [
         {"text": "✅ Approve", "callback_data": build_callback_data(kind, "approve", approval_id)},
         {"text": "⛔ Reject", "callback_data": build_callback_data(kind, "reject", approval_id)},
     ]
     rows = [first_row]
-    if include_session:
+    if include_session and scoped:
         rows.append([{
             "text": f"🔁 Always ({SESSION_GRANT_SECONDS // 3600}h)",
             "callback_data": build_callback_data(kind, "session", approval_id),

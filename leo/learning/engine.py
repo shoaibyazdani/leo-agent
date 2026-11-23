@@ -186,7 +186,7 @@ class ApprovalRequired(LearningDenied):
 
 
 class AutoNotePolicy(BaseModel):
-    """Explicit operator opt-in for low-risk note writes.
+    """Explicit operator opt-in for unattended note writes.
 
     ``trusted_sources`` is a per-kind allowlist of source kinds the engine can
     derive (``user``, ``tool``, ``run``). Wildcards, chat actors, model names
@@ -194,6 +194,12 @@ class AutoNotePolicy(BaseModel):
     makes a draft *auto-eligible*; writes stay approval-bound until the
     operator also sets ``allow_unattended_writes``. Chat text is never promoted
     to ``FACT`` on an unattended write.
+
+    High-risk categories (personal, organizational, project) require the
+    separate ``allow_high_risk_categories`` opt-in. It defaults to False so a
+    bare policy can never widen itself; the shipped configuration enables it
+    because LEO's learning sources are its own durable transcripts, and the
+    sanitizer, evidence and dedupe gates still run on every write.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -204,6 +210,7 @@ class AutoNotePolicy(BaseModel):
     max_confidence: float = 0.7
     promote_facts: bool = False
     allow_unattended_writes: bool = False
+    allow_high_risk_categories: bool = False
 
     def validated(self) -> AutoNotePolicy:
         unknown = [kind for kind in self.trusted_sources if kind not in _SOURCE_KINDS]
@@ -218,9 +225,20 @@ class AutoNotePolicy(BaseModel):
             return self
         if not self.trusted_sources:
             raise ValueError("an auto-note policy must name trusted sources")
-        unsafe = set(self.allowed_categories) - {c.value for c in _LOW_RISK_CATEGORIES}
-        if unsafe:
-            raise ValueError(f"auto-note policy cannot trust high-risk categories: {sorted(unsafe)}")
+        known_categories = {c.value for c in MemoryCategory}
+        unknown_categories = set(self.allowed_categories) - known_categories
+        if unknown_categories:
+            raise ValueError(
+                f"unsupported note categories: {sorted(unknown_categories)}"
+            )
+        high_risk = set(self.allowed_categories) & {
+            c.value for c in _HIGH_RISK_CATEGORIES
+        }
+        if high_risk and not self.allow_high_risk_categories:
+            raise ValueError(
+                f"auto-note policy cannot trust high-risk categories: {sorted(high_risk)}; "
+                "set allow_high_risk_categories=true to opt in"
+            )
         if not math.isfinite(self.max_confidence) or not 0.0 <= self.max_confidence <= 1.0:
             raise ValueError("max_confidence must be within [0, 1]")
         if (
@@ -678,8 +696,15 @@ class LearningEngine:
         return RiskLevel.LOW.value
 
     def _auto_eligible(self, draft: NoteDraft) -> bool:
+        """Whether this draft may be written without an approval.
+
+        The category allowlist is the authority, not the risk tier: the shipped
+        policy names the trusted source kinds and categories explicitly. A
+        supersede is still always approval-bound, because it edits a memory a
+        human already has.
+        """
         policy = self.auto_policy
-        if not policy.enabled or self._risk(draft) != RiskLevel.LOW.value:
+        if not policy.enabled:
             return False
         if draft.source_kind not in policy.trusted_sources:
             return False
@@ -1746,6 +1771,7 @@ class LearningEngine:
             "trusted_sources": list(self.auto_policy.trusted_sources),
             "auto_categories": list(self.auto_policy.allowed_categories),
             "unattended_auto_writes": bool(self.auto_policy.allow_unattended_writes),
+            "auto_high_risk_categories": bool(self.auto_policy.allow_high_risk_categories),
             "auto_notes_approval_bound": not bool(self.auto_policy.allow_unattended_writes),
             "chat_fact_promotion_requires_approval": True,
             "supersede_always_requires_approval": True,
