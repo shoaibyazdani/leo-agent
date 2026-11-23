@@ -234,16 +234,31 @@ async def test_status_version_whoami_and_help_execute(registry, app):
     assert "cannot resolve approvals" in identity.message
 
 
-async def test_model_usage_context_and_config_are_read_only(registry, app):
+async def test_model_usage_context_and_config_are_read_only(
+    registry, app, monkeypatch, tmp_path
+):
+    # /model <name> now persists models.default; point it at a scratch file so
+    # the test can never rewrite the operator's real leo.yaml.
+    scratch = tmp_path / "leo.yaml"
+    scratch.write_text("models:\n  default: mock\n  providers: {}\n", encoding="utf-8")
+    monkeypatch.setenv("LEO_CONFIG", str(scratch))
+
     model = await call(registry, app, "/model")
     assert model.status is CommandStatus.OK and model.data["status"] == "simulated"
     listed = await call(registry, app, "/model list")
     assert "mock" in listed.message
+    assert "default=" in listed.message
     switched = await call(registry, app, "/model mock")
-    assert switched.status is CommandStatus.UNSUPPORTED
-    assert "no runtime model switch" in switched.message
+    assert switched.status is CommandStatus.OK
+    assert switched.data["default_provider"] == "mock"
+    assert switched.data["persisted"] is True
+    assert "saved to leo.yaml" in switched.message
+    assert scratch.read_text(encoding="utf-8").count("default: mock") == 1
     unknown_provider = await call(registry, app, "/model other")
     assert unknown_provider.status is CommandStatus.ERROR
+    reset = await call(registry, app, "/model reset")
+    assert reset.status is CommandStatus.UNSUPPORTED
+    assert "no runtime model switch" not in reset.message
     usage = await call(registry, app, "/usage")
     assert usage.status is CommandStatus.OK and usage.data["calls"] == 0
     context = await call(registry, app, "/context")
