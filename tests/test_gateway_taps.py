@@ -233,3 +233,58 @@ async def test_a_stranger_cannot_tap_the_model_picker(tmp_path) -> None:
 
     assert result["ok"] is False
     assert admitted == []
+
+
+@pytest.mark.asyncio
+async def test_a_page_tap_asks_the_brain_for_that_page(tmp_path) -> None:
+    """Next/Back must render a page the same way a model tap renders a switch."""
+    db.set_db_path(tmp_path / "taps3.db")
+    from leo import db as db_module
+    await db_module.initialize()
+
+    adapter = FakeAdapter()
+    admitted: list[tuple[str, str, str]] = []
+
+    async def admit(text: str, channel: str, subject: str) -> None:
+        admitted.append((text, channel, subject))
+
+    settings = Settings()
+    settings.channels = ChannelsConfig(policies={"telegram": {"allow": [OWNER], "mode": "allowlist"}})
+    result = await handle_tap(
+        "telegram",
+        {"callback_id": "cb3", "chat_id": OWNER, "message_id": "44",
+         "sender_id": OWNER, "data": "mdl:pg:2"},
+        settings=settings, permissions=PermissionManagerImpl(settings),
+        adapters={"telegram": adapter}, admit=admit,
+    )
+
+    assert result == {"ok": True, "page": 2}
+    assert admitted == [("/model list 2", "telegram", OWNER)]
+    assert "page 3" in adapter.edits[-1][2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["mdl:beam-free", "mdl:pg:1"])
+async def test_no_admission_path_is_reported_not_crashed(tmp_path, data: str) -> None:
+    """Both branches need an admission path; calling None must never be reached.
+
+    The page branch was added above the guard once, so a page tap in a process
+    without an admission path raised TypeError instead of answering.
+    """
+    db.set_db_path(tmp_path / "taps4.db")
+    from leo import db as db_module
+    await db_module.initialize()
+
+    adapter = FakeAdapter()
+    settings = Settings()
+    settings.channels = ChannelsConfig(policies={"telegram": {"allow": [OWNER], "mode": "allowlist"}})
+    result = await handle_tap(
+        "telegram",
+        {"callback_id": "cb4", "chat_id": OWNER, "message_id": "45",
+         "sender_id": OWNER, "data": data},
+        settings=settings, permissions=PermissionManagerImpl(settings),
+        adapters={"telegram": adapter}, admit=None,
+    )
+
+    assert result == {"ok": False, "reason": "no admission path"}
+    assert adapter.edits == []
