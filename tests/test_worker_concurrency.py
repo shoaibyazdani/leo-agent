@@ -154,6 +154,54 @@ async def test_renewal_stops_after_the_maximum_lifetime(monkeypatch):
     assert 1 <= len(renewals) <= 3, renewals
 
 
+async def test_a_turn_past_its_ceiling_is_stopped_not_redone(monkeypatch):
+    """The ceiling must END the turn, not hand the same job to a second worker.
+
+    Live symptom: a tool-heavy turn hit the 10-minute ceiling, renewals stopped,
+    the lease lapsed, the queue re-claimed the admission and every attempt
+    restarted the work from scratch — attempts 3, no progress, one stuck row.
+    """
+    store = GatewayStore()
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="1", payload=payload("9", "long job")
+    )
+
+    class SlowBrain(_Brain):
+        def __init__(self) -> None:
+            super().__init__(delay=30.0)
+            self.cancelled = False
+
+        async def ask(self, text, channel=None, subject=None, conversation_id=None):
+            try:
+                return await super().ask(
+                    text, channel=channel, subject=subject, conversation_id=conversation_id
+                )
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    brain = SlowBrain()
+    worker_module, original, _ = _wire(monkeypatch, store, brain, concurrency=1)
+    try:
+        answered = await _run(worker_module, brain, wait_seconds=0.0, once=True,
+                              concurrency=1, turn_max_seconds=1.5, lease_seconds=3)
+    finally:
+        worker_module.GatewayClient = original
+
+    from leo import db
+
+    row = await store.admission(admission_id)
+    queue = await db.fetchone(
+        "SELECT status, attempts FROM gateway_queue WHERE admission_id=?", (admission_id,)
+    )
+    assert row["status"] == "done"      # terminal: neither left claimed nor requeued
+    assert queue["status"] == "done"
+    assert queue["attempts"] == 1       # no second attempt redoing the same work
+    assert brain.cancelled is True      # the turn was actually stopped, not abandoned
+    assert answered == 0
+    assert (await store.stats())["queue"] == {"done": 1}
+
+
 async def test_a_renewed_turn_expires_once_renewal_stops():
     """The queue behaviour behind the ceiling: no renewal → reclaimable."""
     store = GatewayStore()

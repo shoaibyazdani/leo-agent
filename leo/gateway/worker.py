@@ -135,7 +135,7 @@ def resolve_token(token: str | None = None) -> str:
     return stored
 
 
-DEFAULT_TURN_MAX_SECONDS = 600.0
+DEFAULT_TURN_MAX_SECONDS = 1800.0
 
 
 async def _keep_lease(
@@ -170,6 +170,50 @@ async def _keep_lease(
             continue  # a transient gateway blip must not abort the turn
 
 
+async def _abandon_turn(
+    client: GatewayClient,
+    admission_id: str,
+    turn: "asyncio.Task[Any]",
+    limit: float,
+) -> None:
+    """End a turn that outlived its ceiling, and say so in the chat.
+
+    Letting the lease simply lapse is what made a long turn loop: the worker kept
+    working while the queue handed the same admission to another worker, so every
+    attempt restarted the job from scratch. Stopping the turn here keeps exactly
+    one worker on the work, and the operator is told why it ended instead of
+    watching a turn that never answers.
+    """
+    minutes = max(1, int(limit // 60))
+    _LOG.warning(
+        f"turn stopped at its {minutes}-minute limit: {admission_id}",
+        extra={"admission_id": admission_id, "limit_seconds": limit},
+    )
+    turn.cancel()
+    try:
+        await asyncio.wait_for(turn, timeout=2.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+    except Exception:  # noqa: BLE001 - the turn is already abandoned; its error is noise
+        pass
+    note = (
+        f"⏹ Stopped: this turn ran longer than the {minutes}-minute limit. "
+        "Nothing was lost — ask again with a narrower scope, or raise "
+        "`--turn-max-seconds` on the brain unit."
+    )
+    try:
+        await client.complete(admission_id, note, "")
+        return
+    except (httpx.HTTPError, GatewayClientError):
+        pass
+    # The lease may already have lapsed, in which case the admission cannot be
+    # completed. Bury it without a retry so it is not restarted from zero.
+    try:
+        await client.fail(admission_id, f"turn exceeded its {minutes}-minute limit", retry=False)
+    except (httpx.HTTPError, GatewayClientError):
+        pass
+
+
 async def _claim_loop(
     client: GatewayClient,
     app: Any,
@@ -202,13 +246,27 @@ async def _claim_loop(
             _keep_lease(client, admission_id, me, lease_seconds, turn_max_seconds),
             name="leo-lease",
         )
-        try:
-            result = await app.ask(
+        turn = asyncio.create_task(
+            app.ask(
                 text,
                 channel=str(admission.get("channel") or "gateway"),
                 subject=str(admission.get("subject") or ""),
                 conversation_id=admission.get("conversation_id") or None,
+            ),
+            name="leo-turn",
+        )
+        try:
+            # Whichever finishes first decides the fate of the turn. Without this
+            # race the ceiling only stopped RENEWING: the worker kept working,
+            # another worker re-claimed the lapsed admission, and a long turn was
+            # redone from scratch on every attempt — three attempts, no progress.
+            finished, _pending = await asyncio.wait(
+                {turn, keepalive}, return_when=asyncio.FIRST_COMPLETED
             )
+            if turn not in finished:
+                await _abandon_turn(client, admission_id, turn, turn_max_seconds)
+                continue
+            result = turn.result()
             answer = str(result.get("content") or "")
             if str(result.get("status") or "") == "cancelled":
                 # A stopped turn is terminal. Bury the admission BEFORE delivery so
@@ -233,8 +291,9 @@ async def _claim_loop(
             except (httpx.HTTPError, GatewayClientError):
                 pass
         finally:
-            keepalive.cancel()
-            await asyncio.gather(keepalive, return_exceptions=True)
+            for helper in (keepalive, turn):
+                helper.cancel()
+            await asyncio.gather(keepalive, turn, return_exceptions=True)
         if once:
             return answered
 

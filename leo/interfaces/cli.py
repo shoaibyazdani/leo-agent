@@ -158,8 +158,8 @@ def serve(
         help="Turns answered in parallel; 1 means a long turn blocks the queue",
     ),
     turn_max_seconds: float = typer.Option(
-        600.0, "--turn-max-seconds",
-        help="Stop renewing a lease after this long, so a stuck turn can be retried",
+        1800.0, "--turn-max-seconds",
+        help="Stop the turn after this long (a tool-heavy turn legitimately runs long)",
     ),
 ) -> None:
     """Start the local HTTP API and web dashboard, or run as a gateway worker."""
@@ -193,7 +193,7 @@ def serve(
 
 
 def _serve_worker(url: str | None, *, once: bool = False, concurrency: int = 1,
-                  turn_max_seconds: float = 600.0) -> None:
+                  turn_max_seconds: float = 1800.0) -> None:
     """Run the brain against a gateway instead of owning the channels."""
     import asyncio
 
