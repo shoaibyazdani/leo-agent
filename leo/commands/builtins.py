@@ -302,18 +302,44 @@ async def config_command(ctx: CommandContext) -> CommandResult:
     return _summary(ctx, "config", "Read-only LEO configuration snapshot", values)
 
 
-def _provider_list(providers: Mapping[str, Any], current: str) -> str:
-    """One provider per line, flagged, so the list is readable in a chat panel."""
-    rows = []
-    for name, cfg in sorted(providers.items()):
-        flags = []
-        if name == current:
-            flags.append("default")
-        if not getattr(cfg, "enabled", True):
-            flags.append("disabled")
-        suffix = f"  [{', '.join(flags)}]" if flags else ""
-        rows.append(f"{name} -> {getattr(cfg, 'model', '') or '-'}{suffix}")
+def _provider_list(providers: Mapping[str, Any], current: str, *, columns: int = 3) -> str:
+    """Models in columns, the current one marked — scannable in a chat panel.
+
+    Each provider entry carries exactly one model, so listing the provider name
+    AND the model name doubled every row. One name per cell, ``*`` on the
+    default, disabled entries named once at the end.
+    """
+    enabled = [name for name, cfg in sorted(providers.items()) if getattr(cfg, "enabled", True)]
+    disabled = [name for name, cfg in sorted(providers.items()) if not getattr(cfg, "enabled", True)]
+    width = min(28, max((len(name) for name in enabled), default=8))
+    rows: list[str] = []
+    step = max(1, columns)
+    for index in range(0, len(enabled), step):
+        cells = [
+            (("* " if name == current else "  ") + name).ljust(width + 2)
+            for name in enabled[index:index + step]
+        ]
+        rows.append("".join(cells).rstrip())
+    if disabled:
+        rows.append("")
+        rows.append("hidden: " + ", ".join(disabled))
     return "\n".join(rows) or "(none)"
+
+
+def _model_listing_message(
+    providers: Mapping[str, Any], current: str, *, columns: int = 3,
+) -> str:
+    """Bare ``/model`` body: current line, the model grid, one footer line."""
+    cfg_current = providers.get(current)
+    current_model = str(getattr(cfg_current, "model", "") or current)
+    enabled = sum(1 for cfg in providers.values() if getattr(cfg, "enabled", True))
+    header = f"Current: * {current_model}" + (f"  ({enabled} models)" if enabled else "")
+    return _join_body(header, _provider_list(providers, current, columns=columns))
+
+
+def _join_body(header: str, body: str) -> str:
+    """Header, blank line, body, blank line, one-line footer."""
+    return "\n".join([header, "", body, "", "`/model <name>` switch · `/model status` details"])
 
 
 def _persist_default_provider(provider: str) -> tuple[bool, str | None]:
@@ -370,8 +396,7 @@ async def model_command(ctx: CommandContext) -> CommandResult:
         }
         return _summary(
             ctx, "model",
-            f"{len(data)} providers configured; default={current}\n"
-            + _provider_list(providers, current),
+            _model_listing_message(providers, current),
             data,
         )
     if sub == "status":

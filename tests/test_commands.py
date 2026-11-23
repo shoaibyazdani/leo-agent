@@ -247,7 +247,7 @@ async def test_model_usage_context_and_config_are_read_only(
     assert model.status is CommandStatus.OK and model.data["status"] == "simulated"
     listed = await call(registry, app, "/model list")
     assert "mock" in listed.message
-    assert "default=" in listed.message
+    assert "Current:" in listed.message
     switched = await call(registry, app, "/model mock")
     assert switched.status is CommandStatus.OK
     assert switched.data["default_provider"] == "mock"
@@ -662,3 +662,35 @@ def test_discovery_vocabulary_is_covered(registry):
     missing = expected - names - aliases
     assert not missing, f"missing slash commands: {sorted(missing)}"
     assert all(spec.handler is None or callable(spec.handler) for spec in registry.all())
+
+
+def test_model_listing_is_a_scannable_grid() -> None:
+    """/model must be a list of models, not a block per provider.
+
+    Live complaint: 31 providers rendered ~90 lines, each with the provider name,
+    a fake ``--provider <name>`` token and the model name again on the next line.
+    A chat panel has room for a grid, not an audit.
+    """
+    from leo.commands.builtins import _model_listing_message
+    from leo.config import ModelProviderConfig
+
+    providers = {
+        f"model-{index:02d}": ModelProviderConfig(
+            kind="openai-compatible", base_url="https://x.test", model=f"model-{index:02d}"
+        )
+        for index in range(30)
+    }
+    providers["off-01"] = ModelProviderConfig(
+        kind="openai-compatible", base_url="https://x.test", model="off-01", enabled=False
+    )
+
+    text = _model_listing_message(providers, "model-07")
+
+    assert text.splitlines()[0] == "Current: * model-07  (30 models)"
+    assert len(text.splitlines()) <= 16, "30 models must not become 90 lines"
+    assert "--provider" not in text
+    assert "hidden: off-01" in text
+    assert "* model-07" in text
+    for name in ("model-00", "model-12", "model-29"):
+        assert text.count(name) == 1
+    assert text.count("model-07") == 2  # header + grid cell
