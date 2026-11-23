@@ -498,20 +498,123 @@ async def new_command(ctx: CommandContext) -> CommandResult:
     )
 
 
-async def _schedule_restart(ctx: CommandContext, command: str = "restart") -> bool:
-    """Spawn a detached child that restarts the service once this reply lands."""
-    unit = str(os.getenv("LEO_SERVICE_UNIT") or "leo-agent.service")
-    delay = max(1, int(os.getenv("LEO_RESTART_DELAY_SECONDS") or 3))
-    if not shutil.which("systemctl"):
+_UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9@._-]+\.service$")
+
+
+def _own_units() -> list[str]:
+    """Units that actually supervise this process, taken from our own cgroup.
+
+    A hardcoded default unit is a guess. On this host LEO runs as three
+    siblings (leo-gateway / leo-ui / leo-brain); leo-agent.service is a
+    disabled leftover that cannot bind port 8765, so restarting the guessed
+    unit restarted nothing and instead kick-started a crash loop each boot.
+    /proc/self/cgroup is authoritative about the slice we actually live in.
+    """
+    units: list[str] = []
+    try:
+        text = Path("/proc/self/cgroup").read_text()
+    except OSError:
+        return []
+    for line in text.splitlines():
+        _, sep, path = line.partition("::")
+        if not sep or not path:
+            continue
+        name = path.rstrip("/").rsplit("/", 1)[-1]
+        if _UNIT_NAME_RE.match(name):
+            units.append(name)
+    return sorted(set(units))
+
+
+def _unit_belongs_to_install(unit: str, install_root: str) -> bool:
+    """True when this unit actually runs code from our checkout.
+
+    FragmentPath is useless here: it is always /etc/systemd/system/foo.service,
+    regardless of which checkout the unit launches. WorkingDirectory and
+    ExecStart are what name the install.
+    """
+    if not install_root:
+        return False
+    try:
+        done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["systemctl", "show", "-p", "WorkingDirectory", "-p", "ExecStart", "--value", unit],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if done.returncode != 0:
+        return False
+    return install_root in (done.stdout or "")
+
+
+def _active_leo_units() -> list[str]:
+    """Active leo* units whose unit file comes from this checkout.
+
+    Gateways, API and brain are separate units, so restarting only the one we
+    happen to live in leaves the others serving the previous config.
+    """
+    try:
+        done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["systemctl", "list-units", "--type=service", "--state=active",
+             "--no-legend", "--plain", "--no-pager"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if done.returncode != 0:
+        return []
+    root = str(_install_root())
+    return sorted({
+        parts[0] for parts in (line.split() for line in (done.stdout or "").splitlines())
+        if parts and _UNIT_NAME_RE.match(parts[0]) and parts[0].startswith("leo")
+        and _unit_belongs_to_install(parts[0], root)
+    })
+
+
+def _restart_targets() -> tuple[list[str], str]:
+    """Resolve which units a restart must cover, and how they were chosen.
+
+    Precedence: LEO_SERVICE_UNITS > LEO_SERVICE_UNIT > auto-detection, so an
+    explicit operator setting is never overridden.
+    """
+    multi = (os.getenv("LEO_SERVICE_UNITS") or "").strip()
+    if multi:
+        return [u.strip() for u in multi.split(",") if u.strip()], "LEO_SERVICE_UNITS"
+    single = (os.getenv("LEO_SERVICE_UNIT") or "").strip()
+    if single:
+        return [single], "LEO_SERVICE_UNIT"
+    discovered = _active_leo_units()
+    for unit in _own_units():
+        if unit not in discovered:
+            discovered.append(unit)
+    if discovered:
+        return sorted(set(discovered)), "auto-detected"
+    return ["leo-agent.service"], "fallback default"
+
+
+def _spawn_restart(units: list[str], delay: int) -> bool:
+    """Detached child that restarts the units once this reply has landed."""
+    if not units or not shutil.which("systemctl"):
         return False
     try:
         subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user input
-            ["/bin/sh", "-c", f"sleep {delay}; systemctl restart {unit}"],
+            ["/bin/sh", "-c", f"sleep {delay}; systemctl restart {' '.join(units)}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
     except OSError:
         return False
-    await _audit(ctx, f"slash.{command}.restart", unit, f"scheduled restart in {delay}s")
+    return True
+
+
+async def _schedule_restart(ctx: CommandContext, command: str = "restart") -> bool:
+    """Spawn a detached child that restarts the service once this reply lands."""
+    units, source = _restart_targets()
+    delay = max(1, int(os.getenv("LEO_RESTART_DELAY_SECONDS") or 3))
+    if not _spawn_restart(units, delay):
+        return False
+    await _audit(
+        ctx, f"slash.{command}.restart", ",".join(units),
+        f"scheduled restart in {delay}s ({source})",
+    )
     return True
 
 
@@ -642,34 +745,30 @@ async def restart_command(ctx: CommandContext) -> CommandResult:
     restart is an independent, detached child that sleeps first - the same
     pattern the operator used before there was a command for it.
     """
-    unit = str(os.getenv("LEO_SERVICE_UNIT") or "leo-agent.service")
+    units, source = _restart_targets()
     delay = max(1, int(os.getenv("LEO_RESTART_DELAY_SECONDS") or 3))
     if not shutil.which("systemctl"):
         return _summary(
             ctx, "restart",
             "Cannot restart: systemctl is not available on this host. "
-            f"Restart the process that runs 'leo serve' manually (unit guess: {unit}).",
-            {"unit": unit, "scheduled": False},
+            f"Restart the process that runs 'leo serve' manually (targets: {', '.join(units)}).",
+            {"units": units, "scheduled": False},
         )
-    try:
-        subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user input
-            ["/bin/sh", "-c", f"sleep {delay}; systemctl restart {unit}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError as exc:
+    if not _spawn_restart(units, delay):
         return _summary(
             ctx, "restart",
-            f"Cannot restart {unit}: {exc}",
-            {"unit": unit, "scheduled": False, "error": str(exc)},
+            f"Cannot restart {', '.join(units)}: the detached restart could not be spawned.",
+            {"units": units, "scheduled": False, "source": source},
         )
-    await _audit(ctx, "slash.restart", unit, f"scheduled restart in {delay}s")
+    await _audit(
+        ctx, "slash.restart", ",".join(units),
+        f"scheduled restart in {delay}s ({source})",
+    )
     return _summary(
         ctx, "restart",
-        "♻️ Restarting LEO — back in a few seconds. "
+        f"♻️ Restarting {', '.join(units)} — back in a few seconds. "
         "Anything you send meanwhile arrives once I'm up.",
-        {"unit": unit, "scheduled": True, "delay_seconds": delay},
+        {"units": units, "scheduled": True, "delay_seconds": delay, "source": source},
     )
 
 
