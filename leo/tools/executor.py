@@ -15,7 +15,7 @@ from typing import Any
 
 from .. import db
 from ..config import Settings
-from ..contracts import RiskLevel, ToolCall, ToolResult, new_id, utcnow
+from ..contracts import Decision, RiskLevel, ToolCall, ToolResult, new_id, utcnow
 from ..events import Event, EventBus
 from ..logging import get_logger
 from ..security.permissions import ApprovalRequired, PermissionManagerImpl, arguments_digest
@@ -439,6 +439,69 @@ class ToolExecutorImpl:
             return False
         return bool(row and row["status"] == "denied")
 
+    async def _await_approval(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str | None,
+        risk: RiskLevel,
+        approval_id: str,
+        current_digest: str | None,
+    ) -> Decision:
+        """Wait for a human to resolve this approval, bounded by its timeout.
+
+        Approval is in the same database for both the single-process app and a
+        split worker/gateway, so polling the row is enough: the transport that
+        handles the button tap writes the decision. Approved -> re-authorize
+        with the approval id so the normal one-shot/verified path continues.
+        Denied, expired, missing or timed out -> an ordinary denial the model
+        can answer, never another ApprovalRequired (which would end the turn).
+        """
+        timeout = max(1.0, float(getattr(self.settings.security, "approval_timeout_seconds", 900)))
+        poll = max(0.05, float(getattr(self.settings.security, "approval_poll_seconds", 2.0)))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        _LOG.info("waiting for approval", extra={
+            "approval_id": approval_id, "action": action, "timeout_seconds": timeout,
+        })
+        while True:
+            try:
+                row = await db.fetchone(
+                    "SELECT status FROM approvals WHERE id=?", (approval_id,)
+                )
+            except Exception as exc:  # noqa: BLE001 - a lookup blip must not end the wait
+                _LOG.warning("approval wait lookup failed", extra={
+                    "approval_id": approval_id, "error": type(exc).__name__})
+                row = None
+            status = str(row["status"]) if row is not None else ""
+            if status == "approved":
+                decision = await self.permissions.authorize(
+                    actor, action, resource, risk,
+                    approval_id=approval_id, arguments_digest=current_digest,
+                )
+                if decision.allowed:
+                    return decision
+                return Decision(
+                    allowed=False,
+                    reason=decision.reason or "approval is no longer valid",
+                    risk=risk,
+                )
+            if status in {"denied", "expired", "consumed"}:
+                return Decision(allowed=False, reason=f"approval {status}", risk=risk)
+            if row is None:
+                # A vanished row cannot be resolved by waiting: wrong/cleaned
+                # database or a deleted approval. Fall back to a denial.
+                return Decision(allowed=False, reason="approval not found", risk=risk)
+            if loop.time() >= deadline:
+                minutes = max(1, int(timeout // 60))
+                return Decision(
+                    allowed=False,
+                    reason=f"approval timed out after {minutes} min",
+                    risk=risk,
+                )
+            await asyncio.sleep(poll)
+
     def _context(self, call: ToolCall, task_key: str, dry_run: bool) -> dict[str, Any]:
         try:
             db_path: str | None = str(db.get_db_path())
@@ -612,6 +675,7 @@ class ToolExecutorImpl:
                     metadata["missing_capabilities"] = missing
                 else:
                     resource = self._resource_for(registration, call)
+                    current_digest = arguments_digest(call.arguments)
                     permission_decision = await self.permissions.authorize(
                         call.actor,
                         "tool:" + call.name,
@@ -620,8 +684,30 @@ class ToolExecutorImpl:
                         approval_id=approval_id,
                         task_id=task_key,
                         tool_call_id=call.id,
-                        arguments_digest=arguments_digest(call.arguments),
+                        arguments_digest=current_digest,
                     )
+                    # Hold the turn while a human decides. Without this the turn
+                    # ended at ApprovalRequired, so an approval tapped seconds
+                    # later had nothing left to authorize: the operator had to
+                    # tell LEO again that they had approved. The wait is bounded
+                    # by approval_timeout_seconds and cancellation-aware.
+                    if (
+                        permission_decision.requires_approval
+                        and not permission_decision.allowed
+                        and permission_decision.approval_id
+                        and getattr(self.settings.security, "wait_for_approval", False)
+                    ):
+                        approval_id = permission_decision.approval_id
+                        metadata["approval_id"] = approval_id
+                        metadata["waited_for_approval"] = True
+                        permission_decision = await self._await_approval(
+                            actor=call.actor,
+                            action="tool:" + call.name,
+                            resource=resource,
+                            risk=risk,
+                            approval_id=approval_id,
+                            current_digest=current_digest,
+                        )
                     # One-shot tools (shell) consume the verified approval before
                     # dispatch, so a replay cannot run the same command twice.
                     if (
