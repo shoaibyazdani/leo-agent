@@ -107,16 +107,56 @@ async def test_a_stranger_cannot_resolve(env) -> None:
 
 
 async def test_always_writes_a_scoped_grant_and_approves(env) -> None:
+    # "Always" is offered for path-bearing writes, where the resource names the
+    # operation. Shell approvals are covered by the refusal test below.
+    path = str(env.tmp_path / "app.py")
+    decision = await env.permissions.authorize(
+        "operator", "tool:file_write", path, RiskLevel.HIGH,
+    )
     result = await handle_tap(
-        "telegram", _tap(env.approval_id, decision="session"), settings=env.settings,
+        "telegram", _tap(decision.approval_id, decision="session"), settings=env.settings,
         permissions=env.permissions, adapters=env.adapters,
     )
 
     assert result["ok"] is True and result["grant_id"]
     grants = await db.fetchall("SELECT action, resource FROM approval_grants")
-    assert [(g["action"], g["resource"]) for g in grants] == [("tool:shell", "shell:ls")]
-    row = await db.fetchone("SELECT status FROM approvals WHERE id=?", (env.approval_id,))
+    assert [(g["action"], g["resource"]) for g in grants] == [("tool:file_write", path)]
+    row = await db.fetchone("SELECT status FROM approvals WHERE id=?", (decision.approval_id,))
     assert row["status"] == "approved"
+
+
+async def test_always_is_refused_for_a_shell_approval(env) -> None:
+    """A shell command's authority is in its arguments, not in a cwd, so
+    "Always" must not become "every high-risk shell command for 8 hours". The
+    approval stays pending so the operator can still approve it once.
+
+    Both shapes the executor can produce are covered: no cwd at all (the common
+    case) and a cwd, which still does not identify the command.
+    """
+    for resource in (None, str(env.tmp_path)):
+        decision = await env.permissions.authorize(
+            "operator", "tool:shell", resource, RiskLevel.HIGH,
+        )
+        assert decision.approval_id
+
+        result = await handle_tap(
+            "telegram", _tap(decision.approval_id, decision="session"),
+            settings=env.settings, permissions=env.permissions, adapters=env.adapters,
+        )
+
+        assert result["ok"] is False and result["reason"] == "unscoped approval"
+        assert "not available" in env.adapter.answers[-1]
+        row = await db.fetchone(
+            "SELECT status FROM approvals WHERE id=?", (decision.approval_id,)
+        )
+        assert row["status"] == "pending", "the operator must still approve once"
+        # And a different HIGH shell call is still gated.
+        later = await env.permissions.authorize(
+            "operator", "tool:shell", resource, RiskLevel.HIGH,
+        )
+        assert later.allowed is False and later.requires_approval is True
+
+    assert await db.fetchall("SELECT id FROM approval_grants") == []
 
 
 async def test_a_foreign_payload_is_refused(env) -> None:

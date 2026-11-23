@@ -69,7 +69,7 @@ def adapter(monkeypatch):
 
 
 def test_keyboard_offers_approve_always_and_reject() -> None:
-    keyboard = build_keyboard("apr_123", "tool:shell")
+    keyboard = build_keyboard("apr_123", "tool:file_write", resource="/project/app.py")
 
     rows = keyboard["inline_keyboard"]
     labels = [button["text"] for row in rows for button in row]
@@ -81,6 +81,25 @@ def test_keyboard_offers_approve_always_and_reject() -> None:
             parsed = parse_callback_data(button["callback_data"])
             assert parsed is not None, button["callback_data"]
             assert parsed["approval_id"] == "apr_123"
+
+
+def test_keyboard_omits_always_when_the_grant_cannot_be_scoped() -> None:
+    """A grant is keyed on (action, resource). With no resource, or an action
+    whose authority is in its arguments (shell), "Always" would cover every
+    future call, so the button must not be offered."""
+    for keyboard in (
+        build_keyboard("apr_123", "tool:shell"),
+        build_keyboard("apr_123", "tool:shell", resource=None),
+        build_keyboard("apr_123", "tool:shell", resource="   "),
+        # A cwd does not identify which shell command was approved.
+        build_keyboard("apr_123", "tool:shell", resource="/project"),
+        build_keyboard("apr_123", "tool:terminal", resource="/project"),
+        build_keyboard("apr_123", "tool:memory_forget"),
+    ):
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        assert not any("Always" in text for text in labels), labels
+        assert any("Approve" in text for text in labels)
+        assert any("Reject" in text for text in labels)
 
 
 def test_session_decision_survives_the_round_trip() -> None:
@@ -178,35 +197,65 @@ async def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 async def test_a_granted_session_skips_the_next_approval(env) -> None:
+    path = str(env.tmp_path / "app.py")
     first = await env.permissions.authorize(
-        "operator", "tool:shell", "shell:ls", RiskLevel.HIGH,
+        "operator", "tool:file_write", path, RiskLevel.HIGH,
     )
     assert first.allowed is False and first.requires_approval is True
 
-    await env.permissions.grant_session("tool:shell", "shell:ls", 600, f"telegram-button:{OWNER}")
+    await env.permissions.grant_session("tool:file_write", path, 600, f"telegram-button:{OWNER}")
 
     second = await env.permissions.authorize(
-        "operator", "tool:shell", "shell:ls", RiskLevel.HIGH,
+        "operator", "tool:file_write", path, RiskLevel.HIGH,
     )
     assert second.allowed is True
     assert second.reason == "session grant"
 
 
 async def test_a_grant_does_not_leak_to_another_resource(env) -> None:
-    await env.permissions.grant_session("tool:shell", "shell:ls", 600, OWNER)
+    path = str(env.tmp_path / "app.py")
+    other_path = str(env.tmp_path / "secrets.py")
+    await env.permissions.grant_session("tool:file_write", path, 600, OWNER)
 
     other = await env.permissions.authorize(
-        "operator", "tool:shell", "shell:rm", RiskLevel.HIGH,
+        "operator", "tool:file_write", other_path, RiskLevel.HIGH,
     )
     assert other.allowed is False, "a grant is scoped to one resource"
 
 
 async def test_an_expired_grant_is_ignored(env) -> None:
-    await env.permissions.grant_session("tool:shell", "shell:ls", 60, OWNER)
+    path = str(env.tmp_path / "app.py")
+    await env.permissions.grant_session("tool:file_write", path, 60, OWNER)
     await db.execute("UPDATE approval_grants SET expires_at=?", ("2000-01-01T00:00:00+00:00",))
 
     decision = await env.permissions.authorize(
-        "operator", "tool:shell", "shell:ls", RiskLevel.HIGH,
+        "operator", "tool:file_write", path, RiskLevel.HIGH,
+    )
+
+    assert decision.allowed is False and decision.requires_approval is True
+
+
+async def test_an_unscoped_grant_cannot_be_created(env) -> None:
+    """A shell call has no path resource; "Always" must not become "all shell"."""
+    with pytest.raises(ValueError, match="needs a resource"):
+        await env.permissions.grant_session("tool:shell", None, 600, OWNER)
+    with pytest.raises(ValueError, match="needs a resource"):
+        await env.permissions.grant_session("tool:shell", "  ", 600, OWNER)
+    rows = await db.fetchall("SELECT action FROM approval_grants")
+    assert rows == []
+
+
+async def test_a_legacy_unscoped_grant_never_authorizes(env) -> None:
+    """A NULL-resource row written before the guard existed stays inert."""
+    await db.execute(
+        "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,granted_by,scope) "
+        "VALUES(?,?,?,?,?,?,?)",
+        ("grn_legacy", "2026-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00",
+         "tool:shell", None, OWNER, "session"),
+    )
+
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", None, RiskLevel.HIGH,
     )
 
     assert decision.allowed is False and decision.requires_approval is True
