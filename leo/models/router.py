@@ -185,14 +185,20 @@ class ModelRouter:
         )
 
     def _is_blocked(self) -> bool:
-        """Blocked only when NOTHING could be built.
+        """Blocked when nothing can answer, or when a mock would stand in unseen.
 
-        One unbuildable entry is a degraded configuration, not an outage: the
-        broken provider is reported in ``build_errors`` and the healthy ones keep
-        answering. Previously any build error blocked every model, so a single
-        stale or half-configured entry took the whole agent offline.
+        One unbuildable live provider is a degraded configuration, not an
+        outage: the healthy providers keep answering and the failure is reported
+        in ``build_errors``. But a mock that only became routable because the
+        live default failed must not silently take over: that is an offline
+        downgrade the operator did not opt into. An explicit mock provider with
+        no build errors is its own opt-in and remains "simulated".
         """
-        return not self.providers
+        if not self.providers:
+            return True
+        if self.simulated and self._build_errors and not self._mock_fallback_allowed:
+            return True
+        return False
 
     def _blocked_reason(self) -> str:
         """Scrubbed, operator-facing explanation of a blocked model state."""
