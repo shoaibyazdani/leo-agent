@@ -41,7 +41,9 @@ TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
 RESOLUTION_REF_LENGTH = 43
 
 APPROVAL_KIND_CODES: dict[str, str] = {"tool": "t", "learning": "l", "gateway": "g"}
-DECISION_CODES: dict[str, str] = {"approve": "a", "reject": "r", "session": "s"}
+DECISION_CODES: dict[str, str] = {
+    "approve": "a", "reject": "r", "session": "s", "trust": "w",
+}
 _KIND_BY_CODE = {code: kind for kind, code in APPROVAL_KIND_CODES.items()}
 _DECISION_BY_CODE = {code: decision for decision, code in DECISION_CODES.items()}
 
@@ -194,15 +196,18 @@ def build_keyboard(
     *,
     resource: Any = None,
     arguments_digest: Any = None,
+    trust_days: float | None = None,
+    allow_workspace_trust: bool = True,
     include_session: bool = True,
 ) -> dict[str, Any]:
-    """Approve / Always / Reject keyboard for one approval.
+    """Approve / this-command / trust-workspace / Reject for one approval.
 
-    ``Always`` means "this same action on this same resource (or, for a shell
-    command, this same exact command), until the grant expires" - it is a
-    scoped, expiring grant, never a blanket allow. That promise only holds when
-    :func:`session_grant_scopable` says the approval names the operation;
-    otherwise the button is omitted rather than over-promising.
+    ``This command`` covers the exact shell command (or the exact resource for
+    path tools). ``Trust workspace`` covers ordinary shell/terminal work in the
+    checkout for its lifetime; destructive, credential, privilege,
+    arbitrary-code and self-modifying commands still ask. Both are scoped,
+    expiring grants, never a blanket allow, and are only offered where the
+    approval names that scope.
     """
     kind = approval_kind_for_action(action)
     scoped = session_grant_scopable(action, resource, arguments_digest)
@@ -211,11 +216,29 @@ def build_keyboard(
         {"text": "⛔ Reject", "callback_data": build_callback_data(kind, "reject", approval_id)},
     ]
     rows = [first_row]
+    second: list[dict[str, str]] = []
     if include_session and scoped:
-        rows.append([{
-            "text": f"🔁 Always ({SESSION_GRANT_SECONDS // 3600}h)",
+        label = (
+            f"🔁 This command ({SESSION_GRANT_SECONDS // 3600}h)"
+            if str(action or "") in ALWAYS_ARG_SCOPED_ACTIONS
+            else f"🔁 Always ({SESSION_GRANT_SECONDS // 3600}h)"
+        )
+        second.append({
+            "text": label,
             "callback_data": build_callback_data(kind, "session", approval_id),
-        }])
+        })
+    if (
+        include_session
+        and allow_workspace_trust
+        and str(action or "") in ALWAYS_ARG_SCOPED_ACTIONS
+    ):
+        days = max(1, int(round(float(trust_days if trust_days is not None else 30))))
+        second.append({
+            "text": f"🏠 Trust workspace ({days}d)",
+            "callback_data": build_callback_data(kind, "trust", approval_id),
+        })
+    if second:
+        rows.append(second)
     return {"inline_keyboard": rows}
 
 

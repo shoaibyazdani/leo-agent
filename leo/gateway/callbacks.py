@@ -19,12 +19,14 @@ from typing import Any
 from .. import db
 from ..logging import get_logger
 from ..security.approval_buttons import (
+    ALWAYS_ARG_SCOPED_ACTIONS,
     SESSION_GRANT_SECONDS,
     is_authorized,
     parse_callback_data,
     resolve_locator,
     session_grant_scopable,
 )
+from ..security.permissions import reason_is_trustable
 
 _LOG = get_logger("gateway.callbacks")
 
@@ -166,7 +168,8 @@ async def handle_tap(
     decision = str(parsed.get("decision") or "")
     actor = f"{channel}-button:{sender_id}"
     granted = ""
-    if decision == "session":
+    grant_label = ""
+    if decision in {"session", "trust"}:
         row = await db.fetchone(
             "SELECT action, resource, metadata FROM approvals WHERE id=?", (approval_id,)
         )
@@ -181,20 +184,45 @@ async def handle_tap(
             str(metadata.get("arguments_digest") or "")
             if isinstance(metadata, Mapping) else ""
         )
-        # "Always" names the operation: a path for path tools, the canonical
-        # arguments digest for shell/terminal. Without that, the grant would
-        # cover every future call, not the command the operator is looking at.
-        # Refuse and leave the approval pending so Approve-once still works.
-        if not session_grant_scopable(str(row["action"]), row["resource"], digest):
-            await reply("Always is not available for this action — approve it once")
-            _LOG.info("unscoped always refused", extra={
-                "channel": channel, "approval_id": approval_id,
-                "action": row["action"]})
-            return {"ok": False, "reason": "unscoped approval"}
-        granted = await permissions.grant_session(
-            str(row["action"]), row["resource"], SESSION_GRANT_SECONDS, actor,
-            arguments_digest=digest or None,
-        )
+        action_name = str(row["action"])
+        if decision == "trust":
+            if action_name not in ALWAYS_ARG_SCOPED_ACTIONS:
+                await reply("Workspace trust is only available for shell commands")
+                return {"ok": False, "reason": "workspace trust unavailable"}
+            if not reason_is_trustable(
+                str(metadata.get("risk_reason") or "")
+                if isinstance(metadata, Mapping) else ""
+            ):
+                await reply(
+                    "Workspace trust does not cover this command — approve it once"
+                )
+                return {"ok": False, "reason": "workspace trust unavailable"}
+            days = max(
+                1.0,
+                float(getattr(settings.security, "workspace_trust_days", 30) or 30),
+            )
+            workspace = row["resource"] or str(settings.root)
+            granted = await permissions.grant_workspace(
+                action_name, workspace, int(days * 86400), actor,
+            )
+            grant_label = f"workspace for {int(days)}d"
+        else:
+            # "This command" names the operation: a path for path tools, the
+            # canonical arguments digest for shell/terminal. Without that, the
+            # grant would cover every future call, not the command the operator
+            # is looking at. Refuse and leave the approval pending so
+            # Approve-once still works.
+            if not session_grant_scopable(action_name, row["resource"], digest):
+                await reply("This command grant is not available — approve it once")
+                _LOG.info("unscoped always refused", extra={
+                    "channel": channel, "approval_id": approval_id,
+                    "action": action_name})
+                return {"ok": False, "reason": "unscoped approval"}
+            granted = await permissions.grant_session(
+                action_name, row["resource"], SESSION_GRANT_SECONDS, actor,
+                arguments_digest=digest or None,
+            )
+            grant_label = f"this command for {SESSION_GRANT_SECONDS // 3600}h"
         decision = "approve"
 
     approved = decision == "approve"
@@ -216,7 +244,7 @@ async def handle_tap(
     verdict = "approved" if approved else "rejected"
     note = f"{verdict}: {approval_id}"
     if granted:
-        note += f" · always for {SESSION_GRANT_SECONDS // 3600}h"
+        note += f" · {grant_label}"
     await reply(note if ok else f"Failed: {result.get('error') or 'unknown error'}")
 
     # The message keeps the record; the buttons go away so a resolved approval

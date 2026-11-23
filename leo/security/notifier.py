@@ -30,6 +30,7 @@ from ..events import Event, EventBus
 from ..logging import get_logger
 from datetime import datetime
 from .approval_buttons import build_keyboard
+from .permissions import reason_is_trustable
 
 _LOG = get_logger("security.notifier")
 
@@ -132,14 +133,21 @@ class ApprovalNotifier:
         action = str(payload.get("action") or "?")
         resource = payload.get("resource")
         risk = str(payload.get("risk") or "?")
+        command = str(payload.get("command") or "").strip()
+        reason = str(payload.get("risk_reason") or "").strip()
         timeout = int(getattr(self.settings.security, "approval_timeout_seconds", 900))
         minutes = max(1, timeout // 60)
         lines = [
             "🔐 Approval needed",
             f"action: {action}",
         ]
+        if command:
+            lines.append(f"command: `{command[:400]}`")
         if resource:
-            lines.append(f"resource: {resource}")
+            label = "workspace" if action in {"tool:shell", "tool:terminal"} else "resource"
+            lines.append(f"{label}: {resource}")
+        if reason:
+            lines.append(f"why: {reason[:200]}")
         lines += [
             f"risk: {risk}",
             f"id: {approval_id}",
@@ -202,6 +210,20 @@ class ApprovalNotifier:
                 # it by the exact arguments digest. Either must be present.
                 resource=payload.get("resource"),
                 arguments_digest=payload.get("arguments_digest"),
+                trust_days=float(
+                    getattr(self.settings.security, "workspace_trust_days", 30) or 30
+                ),
+                # A destructive/credential/arbitrary-code call is not covered
+                # by a workspace trust, so do not offer a button that would lie.
+                allow_workspace_trust=reason_is_trustable(
+                    payload.get("risk_reason")
+                ),
+                # manual mode ignores grants, so offering trust buttons there
+                # would promise something the resolver will not honor.
+                include_session=(
+                    getattr(self.settings.security, "approval_mode", "smart")
+                    == "smart"
+                ),
             )
             try:
                 await adapter.send(target, text, reply_markup=keyboard)

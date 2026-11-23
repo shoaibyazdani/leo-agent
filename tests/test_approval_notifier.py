@@ -210,6 +210,19 @@ def test_message_contains_no_secret_material() -> None:
     assert "525083981" in text
 
 
+def test_message_shows_the_command_and_reason() -> None:
+    notifier = ApprovalNotifier(FakeGateway(), _settings())
+    text = notifier._message({
+        "approval_id": "apr_2", "action": "tool:shell",
+        "resource": "/root/workspace", "risk": "high",
+        "command": "rsvg-convert -z 2 -o girl.png girl.svg",
+        "risk_reason": "unclassified command (rsvg-convert)",
+    })
+    assert "command:" in text and "rsvg-convert" in text
+    assert "why:" in text and "unclassified" in text
+    assert "workspace:" in text
+
+
 def test_start_is_idempotent() -> None:
     bus = EventBus(persist=False)
     notifier = ApprovalNotifier(FakeGateway(events=bus), _settings(), events=bus)

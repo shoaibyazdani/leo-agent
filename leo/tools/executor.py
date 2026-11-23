@@ -675,7 +675,23 @@ class ToolExecutorImpl:
                     metadata["missing_capabilities"] = missing
                 else:
                     resource = self._resource_for(registration, call)
+                    # A shell command without an explicit cwd runs in the
+                    # checkout, so the checkout is its workspace resource. That
+                    # makes the approval card name the scope a workspace trust
+                    # covers, instead of showing no resource at all.
+                    if call.name in {"shell", "terminal"} and (
+                        resource is None or str(resource).strip() == ""
+                    ):
+                        resource = str(self.settings.root.resolve())
                     current_digest = arguments_digest(call.arguments)
+                    command_preview = ""
+                    if call.name in {"shell", "terminal"}:
+                        try:
+                            command_preview = str(
+                                self._redact(str(call.arguments.get("command") or ""))
+                            )[:300]
+                        except Exception:  # noqa: BLE001 - preview is cosmetic
+                            command_preview = ""
                     permission_decision = await self.permissions.authorize(
                         call.actor,
                         "tool:" + call.name,
@@ -685,6 +701,8 @@ class ToolExecutorImpl:
                         task_id=task_key,
                         tool_call_id=call.id,
                         arguments_digest=current_digest,
+                        risk_reason=risk_reason,
+                        command_preview=command_preview,
                     )
                     # Hold the turn while a human decides. Without this the turn
                     # ended at ApprovalRequired, so an approval tapped seconds

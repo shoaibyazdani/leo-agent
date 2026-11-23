@@ -182,13 +182,60 @@ async def test_always_is_scoped_to_the_shell_command_digest(env) -> None:
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-one",
     )
-    assert same.allowed is True and same.reason == "session grant"
+    assert same.allowed is True and same.reason == "approval grant"
 
     other = await env.permissions.authorize(
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-two",
     )
     assert other.allowed is False and other.requires_approval is True
+
+
+async def test_trust_workspace_tap_creates_a_workspace_grant(env) -> None:
+    workspace = str(env.tmp_path.resolve())
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="unclassified command (rsvg-convert)",
+    )
+
+    result = await handle_tap(
+        "telegram", _tap(decision.approval_id, decision="trust"),
+        settings=env.settings, permissions=env.permissions, adapters=env.adapters,
+    )
+
+    assert result["ok"] is True and result["grant_id"]
+    grants = await db.fetchall("SELECT action, resource, scope FROM approval_grants")
+    assert [(g["action"], g["resource"], g["scope"]) for g in grants] == [
+        ("tool:shell", workspace, "workspace")
+    ]
+
+    normal = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="unclassified command (rsvg-convert)",
+    )
+    assert normal.allowed is True and normal.reason == "approval grant"
+
+    destructive = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="rm is destructive",
+    )
+    assert destructive.allowed is False and destructive.requires_approval is True
+
+
+async def test_workspace_trust_is_refused_for_a_destructive_approval(env) -> None:
+    workspace = str(env.tmp_path.resolve())
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="rm is destructive",
+    )
+
+    result = await handle_tap(
+        "telegram", _tap(decision.approval_id, decision="trust"),
+        settings=env.settings, permissions=env.permissions, adapters=env.adapters,
+    )
+
+    assert result["ok"] is False and result["reason"] == "workspace trust unavailable"
+    assert await db.fetchall("SELECT id FROM approval_grants") == []
 
 
 async def test_a_foreign_payload_is_refused(env) -> None:

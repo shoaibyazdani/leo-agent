@@ -76,20 +76,21 @@ def test_smart_risk_classification() -> None:
         "sqlite3 db 'SELECT count(*) FROM kv'", "ps aux", "ss -lntp",
         "curl -s https://127.0.0.1:8765/health", "find leo -name '*.py'",
         "sed -n '1,20p' leo/core/app.py", "rg -n selfheal leo",
+        "cd /tmp && pytest -q",
     ):
         assert risk("shell", {"command": command}, settings) is RiskLevel.LOW, command
     for command in (
         # bounded, audited writes: they run, and the audit row says why
         "touch marker", "mkdir -p build", "git add .", "git commit -m 'x'",
         "systemctl restart leo-brain", "sqlite3 db 'DELETE FROM kv'",
-        "cp a b", "curl -o out.html https://x",
+        "cp a b", "curl -o out.html https://x", "echo x > file",
     ):
         assert risk("shell", {"command": command}, settings) is RiskLevel.MEDIUM, command
     for command in (
         # destructive, arbitrary-code or unreversible: still ask
         "rm -rf build", "python -c 'print(1)'", "node -e '1'",
         "git reset --hard", "git clean -fd", "git push --force origin main",
-        "git branch -D old", "unknown-binary --x", "echo x > file",
+        "git branch -D old", "unknown-binary --x", "echo x > /etc/leo-probe",
         "pytest; rm -rf build", "chmod -R 777 .",
     ):
         assert risk("shell", {"command": command}, settings) is RiskLevel.HIGH, command
@@ -167,7 +168,7 @@ async def test_shell_approval_is_consumed_once(shell_env) -> None:
     env = shell_env
     call = ToolCall(
         name="shell",
-        arguments={"command": "echo x >> counter.txt", "cwd": str(env.tmp_path)},
+        arguments={"command": "sh -c 'echo x >> counter.txt'", "cwd": str(env.tmp_path)},
         actor="tester",
     )
     with pytest.raises(ApprovalRequired) as pending:

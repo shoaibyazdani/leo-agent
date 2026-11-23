@@ -310,6 +310,12 @@ security:
   # ending the turn and forgetting the decision.
   wait_for_approval: true
   approval_poll_seconds: 2
+  # smart: normal workspace shell runs under a workspace trust; the rest asks
+  # with once / this-command / trust-workspace options. manual: always ask.
+  # off: no ordinary prompts (hardline, deny globs and path rules still apply).
+  approval_mode: smart
+  # "Trust workspace" button lifetime; the reference tools use until-revoked.
+  workspace_trust_days: 30
   # Smart shell policy. smart auto-runs read-only/test commands, asks
   # for risky or unknown ones, and always denies the hardline blocklist.
   # manual asks for every command; off runs everything except hardline.
