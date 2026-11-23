@@ -304,6 +304,12 @@ learning:
     promote_facts: false
 
 security:
+  # Hold a chat turn while a HIGH-risk approval is pending. The same tool call
+  # resumes automatically when the operator taps Approve/Always; deny, expiry
+  # or the 15-minute approval timeout returns a denial to the model instead of
+  # ending the turn and forgetting the decision.
+  wait_for_approval: true
+  approval_poll_seconds: 2
   # Smart shell policy. smart auto-runs read-only/test commands, asks
   # for risky or unknown ones, and always denies the hardline blocklist.
   # manual asks for every command; off runs everything except hardline.

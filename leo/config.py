@@ -127,6 +127,14 @@ class SecurityConfig(BaseModel):
     shell_max_output_bytes: int = Field(default=200_000, ge=1_000, le=2_000_000)
     deny_commands: list[str] = Field(default_factory=list)
     approval_timeout_seconds: int = 900
+    # Hold a chat turn while a HIGH-risk approval is pending, bounded by
+    # approval_timeout_seconds. Approved -> the same tool call resumes;
+    # denied/expired/timed out -> a denial the model can answer, instead of
+    # ending the turn and forgetting that the human already approved. Off by
+    # default so CLI/API callers keep the immediate ApprovalRequired contract;
+    # the shipped leo.yaml enables it for chat surfaces.
+    wait_for_approval: bool = False
+    approval_poll_seconds: float = Field(default=2.0, ge=0.05, le=60.0)
     max_tool_calls_per_task: int = 200
     # Server-side ceiling: no caller hint (or configured per-task cap) may
     # exceed this value. 200 matches the legacy default cap.
@@ -518,6 +526,7 @@ class Settings(BaseModel):
             "paths": ["data", "logs", "workspaces", "exports", "outbound_media"],
             "security": [
                 "workspace_only", "allow_medium_risk", "high_risk_requires_approval",
+                "wait_for_approval", "approval_poll_seconds",
                 "max_tool_calls_per_task", "max_tool_calls_ceiling",
             ],
             "automation": ["max_concurrent_tasks", "default_task_timeout_seconds"],

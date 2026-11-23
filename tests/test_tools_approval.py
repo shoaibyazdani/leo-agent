@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -316,3 +317,64 @@ async def test_chat_actor_cannot_resolve_any_approval(env):
     row = await db.fetchone("SELECT status,metadata FROM approvals WHERE id=?", (approval_id,))
     assert row["status"] == "pending"
     assert "resolved_by" not in json.loads(row["metadata"])
+
+
+# ---------------------------------------------------------- waiting for a human
+
+async def _pending_approval(action: str, timeout: float = 3.0) -> str:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        row = await db.fetchone(
+            "SELECT id FROM approvals WHERE action=? AND status='pending' "
+            "ORDER BY rowid DESC LIMIT 1",
+            (action,),
+        )
+        if row is not None:
+            return str(row["id"])
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"no pending approval for {action}")
+
+
+async def test_wait_for_approval_resumes_the_same_call(env):
+    """Approving after the request lands resumes the waiting tool call."""
+    env.settings.security.wait_for_approval = True
+    env.settings.security.approval_poll_seconds = 0.02
+    env.settings.security.approval_timeout_seconds = 5
+
+    task = asyncio.create_task(run(env, DANGER))
+    approval_id = await _pending_approval("tool:" + DANGER)
+    await env.permissions.resolve_approval(approval_id, True, resolver="operator")
+
+    result = await asyncio.wait_for(task, 5)
+    assert result.decision == "allowed"
+    assert result.success is True
+    assert env.executed, "the waiting call must dispatch after approval"
+
+
+async def test_wait_for_approval_denied_returns_a_denial(env):
+    env.settings.security.wait_for_approval = True
+    env.settings.security.approval_poll_seconds = 0.02
+    env.settings.security.approval_timeout_seconds = 5
+
+    task = asyncio.create_task(run(env, DANGER))
+    approval_id = await _pending_approval("tool:" + DANGER)
+    await env.permissions.resolve_approval(approval_id, False, resolver="operator")
+
+    result = await asyncio.wait_for(task, 5)
+    assert result.decision == "denied"
+    assert result.success is False
+    assert "approval denied" in (result.error or "")
+    assert not env.executed
+
+
+async def test_wait_for_approval_times_out_without_killing_the_turn(env):
+    env.settings.security.wait_for_approval = True
+    env.settings.security.approval_poll_seconds = 0.05
+    env.settings.security.approval_timeout_seconds = 1
+
+    result = await run(env, DANGER)
+
+    assert result.decision == "denied"
+    assert "timed out" in (result.error or "")
+    assert not env.executed
