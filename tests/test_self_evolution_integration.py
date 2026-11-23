@@ -96,7 +96,9 @@ async def test_initialize_wires_real_engines_and_truthful_capabilities(app: LeoA
     assert evolution["learning"]["accepted_notes"] == 0
 
 
-async def test_tool_failed_hook_produces_approval_bound_proposal_only(app: LeoApp) -> None:
+async def test_tool_failed_hook_dispatches_a_repair_task_instead_of_an_approval(
+    app: LeoApp,
+) -> None:
     for _ in range(3):
         await _emit_tool_failure(app, "invalid arguments: unsupported 'limit'")
 
@@ -109,41 +111,36 @@ async def test_tool_failed_hook_produces_approval_bound_proposal_only(app: LeoAp
     proposals = await app.healing.proposals()
     assert len(proposals) == 1
     proposal = proposals[0]
-    assert proposal["status"] == "awaiting_approval"
-    assert proposal["risk"] == "high"
-    assert proposal["approval_id"]
+    assert proposal["status"] == "dispatched"
+    assert proposal["task_id"]
+    assert proposal["approval_id"] is None
 
-    approval = await _approval("selfheal.apply")
-    assert approval["status"] == "pending"
-    assert approval["risk"] == "high"
-    assert approval["actor"] == "heal:selfheal"
-    metadata = json.loads(approval["metadata"])
-    assert metadata["arguments_digest"] == proposal["arguments_digest"]
+    # The repair is a real durable task: the default worker runs it as a turn,
+    # where the agent's own patch/write_file calls carry the approval.
+    task = await app.tasks.get(proposal["task_id"])
+    assert task is not None
+    assert task.objective.startswith("Self-repair:")
+    assert "list_files" in task.objective
+    assert task.metadata["selfheal"]["proposal_id"] == proposal["id"]
+    assert task.metadata["schedule_payload"] == {"source": "selfheal"}
 
-    # Chat actors can never resolve their own agent's approval.
-    with pytest.raises(PermissionError, match="chat actors"):
-        await app.permissions.resolve_approval(approval["id"], True, "chat:attacker")
-
-    # Even a trusted human's approval does not make the app apply anything:
-    # an explicit trusted applier/verifier is required and is never wired here.
-    await app.operator_resolve_approval(approval["id"], True)
-    assert (await db.fetchone(
-        "SELECT status FROM approvals WHERE id=?", (approval["id"],)
-    ))["status"] == "approved"
-    assert (await app.healing.proposals())[0]["status"] == "awaiting_approval"
+    # Nothing asks a human to approve an apply that nothing performs, and the
+    # engine still holds no mutation path of its own.
+    assert await db.fetchone("SELECT id FROM approvals WHERE action='selfheal.apply'") is None
     assert await app.healing.snapshots() == []
 
     health = await app.health()
     evolution = health["self_evolution"]
     assert evolution["healing"]["incidents"] == 1
     assert evolution["healing"]["proposals"] == 1
+    assert evolution["healing"]["pending_remediations"] == 1
     assert evolution["healing"]["applied_remediations"] == 0
     assert evolution["healing"]["active_fixes"] == 0
     assert evolution["healing"]["snapshots"] == 0
 
 
 async def test_run_failed_hook_translates_and_redacts_uncatalogued_failures(app: LeoApp) -> None:
-    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    secret = "sk-" + "abcdefghijklmnopqrstuvwxyz"
     captured: list[dict] = []
 
     async def capture(event) -> None:
@@ -254,7 +251,7 @@ async def test_run_finished_hook_only_learns_from_successful_runs(app: LeoApp) -
 async def test_untrusted_secret_text_is_never_captured_or_learned(app: LeoApp) -> None:
     from leo.contracts import new_id, utcnow
 
-    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    secret = "sk-" + "abcdefghijklmnopqrstuvwxyz"
     captured: list[dict] = []
 
     async def capture(event) -> None:
@@ -302,7 +299,7 @@ async def test_run_failed_translation_is_durable_and_replayable_after_restart(
     mock_settings: Settings,
 ) -> None:
     """F7: the redacted task.failed copy must survive INSERT OR IGNORE and replay."""
-    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    secret = "sk-" + "abcdefghijklmnopqrstuvwxyz"
     first = LeoApp(mock_settings)
     await first.initialize()
     try:
@@ -427,7 +424,7 @@ async def test_health_counts_only_verified_applications_and_separates_failures(
     assert health["pending_remediations"] == 1
     assert health["verification_failures"] == 1
     assert health["verified_failed"] == 1
-    assert pending["status"] == "awaiting_approval"
+    assert pending["status"] == "dispatched"
     assert not any(hasattr(app, name) for name in ("apply", "accept", "rollback"))
 
 

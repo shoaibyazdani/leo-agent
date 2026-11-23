@@ -10,9 +10,12 @@ entirely on LEO primitives:
   exponential backoff; schema/permission failures are never auto-retried, and
   a permission denial is never proposed as a remediation at all — a refused
   gate is the security model working, not damage to repair.
-* Every remediation is inert until a HIGH-risk approval, bound by canonical
-  argument digest and resolved by a trusted *non-chat, non-self* human, is
-  consumed one-shot. A disabled approval gate does not grant self-repair.
+* Every remediation is either DISPATCHED as a durable task (the shipped path:
+  the agent then fixes the cause in its own turn with ``patch``/``write_file``,
+  so the approval lands on the diff it actually writes) or, for a caller that
+  supplies its own applier, inert until a HIGH-risk approval bound by canonical
+  argument digest and resolved by a trusted *non-chat, non-self* human, consumed
+  one-shot. A disabled approval gate does not grant self-repair.
 * Before any mutation a rollback snapshot is written. The engine never opens or
   edits source files: mutations, independent verification and rollbacks are
   performed by trusted, caller-supplied ``applier`` / ``verifier`` /
@@ -74,6 +77,7 @@ WATCHED_TOPICS = (
 )
 
 ACTION_APPLY = "selfheal.apply"
+ACTION_TASK = "selfheal.task"
 
 # Actions whose failure is not an incident. A reaction is cosmetic and
 # non-destructive: the provider refusing one (an old message id, a chat that
@@ -158,6 +162,10 @@ class Remediation(BaseModel):
     evidence_event_ids: list[str] = Field(default_factory=list)
     evidence_hashes: dict[str, str] = Field(default_factory=dict)
     approval_id: str | None = None
+    # Set when the repair was queued as a durable task for the agent to fix in a
+    # turn (the shipped path). ``approval_id`` stays for a caller that wires its
+    # own applier.
+    task_id: str | None = None
     snapshot_id: str | None = None
     attempts: int = 0
     evaluation_proposal_id: str | None = None
@@ -267,6 +275,7 @@ class SelfHealingEngine:
         backoff_base_seconds: float = 1.0,
         max_backoff_seconds: float = 60.0,
         evaluation: Any = None,
+        task_engine: Any = None,
         sleep: Callable[[float], Any] | None = None,
         now: Callable[[], datetime] | None = None,
         redact_patterns: list[str] | None = None,
@@ -280,6 +289,7 @@ class SelfHealingEngine:
         self.events = events if events is not None else EventBus()
         self.permissions = permissions or PermissionManagerImpl(self.settings, self.events)
         self.evaluation = evaluation
+        self.task_engine = task_engine
         self.actor = str(actor or ACTOR)
         self.min_occurrences = int(min_occurrences)
         self.max_attempts = int(max_attempts)
@@ -591,6 +601,133 @@ class SelfHealingEngine:
                 return f"evidence changed or vanished: {event_id}"
         return None
 
+    async def _request_approval(
+        self,
+        incident: FailureIncident,
+        proposal: Remediation,
+        resource: str,
+        arguments: dict[str, Any],
+        digest: str,
+        title: str,
+        steps: list[str],
+    ) -> None:
+        """Legacy path: ask a human to approve a remediation the CALLER applies.
+
+        Only correct when the caller supplies its own applier/verifier. The
+        shipped app wires a task engine instead, so the agent performs the fix in
+        a turn and the approval lands on the edit it actually writes.
+        """
+        proposal_id = proposal.id
+        decision = await self.permissions.authorize(
+            self.actor, ACTION_APPLY, resource, RiskLevel.HIGH,
+            arguments=arguments, arguments_digest=digest,
+            proposal_id=proposal_id, incident_id=incident.id,
+            evidence_count=incident.occurrences, title=title,
+        )
+        proposal.approval_id = decision.approval_id
+        # A deployment with the HIGH-risk gate disabled is NOT permission to
+        # self-modify: without a resolvable approval id the proposal stays inert.
+        if decision.allowed and not decision.requires_approval:
+            await self._audit(
+                ACTION_APPLY, resource, "denied",
+                "high-risk approval gate disabled; refusing to self-apply",
+                {"proposal_id": proposal_id}, correlation_id=proposal_id,
+            )
+            await self._emit(
+                "selfheal.denied", incident_id=incident.id, proposal_id=proposal_id,
+                reason="high-risk approval gate disabled; refusing to self-apply",
+            )
+        else:
+            proposal.status = "awaiting_approval"
+            await self._audit(
+                ACTION_APPLY, resource, "pending",
+                "remediation proposed; awaiting HIGH-risk approval",
+                {"proposal_id": proposal_id, "approval_id": decision.approval_id,
+                 "arguments_digest": digest},
+                correlation_id=proposal_id,
+            )
+            await self._emit(
+                "selfheal.approval",
+                incident_id=incident.id, proposal_id=proposal_id,
+                approval_id=decision.approval_id, risk=RiskLevel.HIGH.value,
+                arguments_digest=digest, title=title, steps=steps,
+            )
+
+    def _repair_objective(
+        self,
+        incident: FailureIncident,
+        title: str,
+        rationale: str,
+        steps: list[str],
+    ) -> str:
+        lines = [
+            f"Self-repair: {title}",
+            "",
+            f"A recurring failure was detected in this deployment and recorded "
+            f"{incident.occurrences} times.",
+            f"class: {incident.kind} · target: {incident.target} · signature: {incident.signature}",
+        ]
+        sample = (incident.sample_error or "").strip()
+        if sample:
+            lines += ["", f"Last error:\n{sample}"]
+        if rationale.strip():
+            lines += ["", rationale.strip()]
+        if steps:
+            lines += ["", "Suggested investigation:"]
+            lines += [f"{index}. {step}" for index, step in enumerate(steps, 1)]
+        lines += [
+            "",
+            "Fix the cause, not the symptom:",
+            "- read the code path that produces this failure before changing it;",
+            "- use patch/write_file for the smallest change that removes it;",
+            "- run the tests covering what you changed and report their output;",
+            "- do not touch unrelated files, the transcript or the security model.",
+        ]
+        return "\n".join(lines)
+
+    async def _dispatch_repair(
+        self,
+        incident: FailureIncident,
+        proposal: Remediation,
+        title: str,
+        rationale: str,
+        steps: list[str],
+    ) -> str | None:
+        """Queue the repair as a durable task so the agent fixes it in a turn."""
+        create = getattr(self.task_engine, "create", None)
+        if not callable(create):
+            _LOG.warning(
+                "selfheal repair not dispatched: the task engine has no create(); "
+                f"incident {incident.id}"
+            )
+            return None
+        metadata = {
+            # Marks the task dispatchable without naming an owner agent: the task
+            # engine falls back to its default worker, which runs a real turn.
+            "schedule_payload": {"source": "selfheal"},
+            "selfheal": {
+                "proposal_id": proposal.id,
+                "incident_id": incident.id,
+                "kind": incident.kind,
+                "target": incident.target,
+                "fingerprint": incident.fingerprint,
+            },
+        }
+        try:
+            task = await create(
+                self._repair_objective(incident, title, rationale, steps),
+                metadata=metadata,
+                idempotency_key=f"selfheal:{incident.fingerprint}",
+            )
+        except Exception as exc:  # noqa: BLE001 - a repair that cannot be queued must not break observation
+            _LOG.warning(
+                f"selfheal repair task could not be created for incident "
+                f"{incident.id}: {type(exc).__name__}: {exc}"
+            )
+            return None
+        task_id = str(getattr(task, "id", "") or "")
+        return task_id or None
+
     async def propose(self, incident_id: str) -> dict[str, Any] | None:
         """Create an inert, approval-bound remediation for a recurring incident."""
         incident = await self._load(f"incident:{incident_id}", FailureIncident)
@@ -648,39 +785,28 @@ class SelfHealingEngine:
         incident.state = "proposed"
         await self._save(f"incident:{incident.id}", incident.model_dump())
 
-        decision = await self.permissions.authorize(
-            self.actor, ACTION_APPLY, resource, RiskLevel.HIGH,
-            arguments=arguments, arguments_digest=digest,
-            proposal_id=proposal_id, incident_id=incident.id,
-            evidence_count=incident.occurrences, title=title,
-        )
-        proposal.approval_id = decision.approval_id
-        # A deployment with the HIGH-risk gate disabled is NOT permission to
-        # self-modify: without a resolvable approval id the proposal stays inert.
-        if decision.allowed and not decision.requires_approval:
+        if self.task_engine is not None:
+            # The repair is DISPATCHED, not approved into a void: LEO fixes it in
+            # its own turn with patch/write_file, so the approval that matters is
+            # bound to the diff it actually writes — not to a proposal that no
+            # caller can apply. A proposal nobody can execute is a fake control.
+            task_id = await self._dispatch_repair(incident, proposal, title, rationale, steps)
+            proposal.task_id = task_id
+            proposal.status = "dispatched" if task_id else "proposed"
             await self._audit(
-                ACTION_APPLY, resource, "denied",
-                "high-risk approval gate disabled; refusing to self-apply",
-                {"proposal_id": proposal_id}, correlation_id=proposal_id,
-            )
-            await self._emit(
-                "selfheal.denied", incident_id=incident.id, proposal_id=proposal_id,
-                reason="high-risk approval gate disabled; refusing to self-apply",
-            )
-        else:
-            proposal.status = "awaiting_approval"
-            await self._audit(
-                ACTION_APPLY, resource, "pending",
-                "remediation proposed; awaiting HIGH-risk approval",
-                {"proposal_id": proposal_id, "approval_id": decision.approval_id,
-                 "arguments_digest": digest},
+                ACTION_TASK, resource, "dispatched" if task_id else "denied",
+                ("repair task dispatched to the agent" if task_id
+                 else "repair task could not be created"),
+                {"proposal_id": proposal_id, "task_id": task_id},
                 correlation_id=proposal_id,
             )
             await self._emit(
-                "selfheal.approval",
-                incident_id=incident.id, proposal_id=proposal_id,
-                approval_id=decision.approval_id, risk=RiskLevel.HIGH.value,
-                arguments_digest=digest, title=title, steps=steps,
+                "selfheal.dispatched", incident_id=incident.id, proposal_id=proposal_id,
+                task_id=task_id, title=title, steps=steps,
+            )
+        else:
+            await self._request_approval(
+                incident, proposal, resource, arguments, digest, title, steps
             )
         await self._save(f"proposal:{proposal_id}", proposal.model_dump())
         await self._emit(
@@ -1299,6 +1425,9 @@ class SelfHealingEngine:
                 if item.get("status") in ("proposed", "awaiting_approval")
             ),
             "applying": sum(1 for item in proposals if item.get("status") == "applying"),
+            # A dispatched repair is pending work: the agent is fixing it in a
+            # turn. It is still never counted as applied.
+            "dispatched": sum(1 for item in proposals if item.get("status") == "dispatched"),
             "verified_applied": sum(
                 1 for item in proposals
                 if item.get("status") == "applied"

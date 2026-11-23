@@ -865,7 +865,8 @@ class LeoApp:
                 try:
                     self.healing = SelfHealingEngine(
                         self.events, self.permissions, self.settings,
-                        evaluation=self.evaluation, auto_attach=False,
+                        evaluation=self.evaluation, task_engine=self.tasks,
+                        auto_attach=False,
                     )
                 except TypeError:  # tolerate a narrower public constructor
                     self.healing = SelfHealingEngine(
@@ -1371,7 +1372,11 @@ class LeoApp:
                     "incidents": len(incidents),
                     "proposals": len(proposals),
                     "applied_remediations": counts["verified_applied"],
-                    "pending_remediations": counts["proposed"] + counts["applying"],
+                    # A dispatched repair is pending work (the agent is fixing it
+                    # in a turn), never an applied one.
+                    "pending_remediations": (
+                        counts["proposed"] + counts["applying"] + counts.get("dispatched", 0)
+                    ),
                     "verification_failures": verification_failures,
                     "verified_failed": verification_failures,
                     "active_fixes": counts["applying"],
