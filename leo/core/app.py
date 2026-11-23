@@ -720,7 +720,26 @@ class LeoApp:
             channel, descriptor, settings=self.settings, permissions=self.permissions,
             adapters=self.gateway.adapters, resolve=_resolve,
             allowed=self._approval_senders(channel),
+            admit=self._admit_slash_from_tap,
         )
+
+    async def _admit_slash_from_tap(self, text: str, channel: str, subject: str) -> None:
+        """Relay a keyboard tap as the slash command it stands for.
+
+        The split deployment queues ``/model <name>`` so the brain — which owns
+        settings — performs the switch. Running as one process, the app *is* the
+        brain: the same command runs here, through the same registry, and its
+        answer goes back to the chat that was tapped. Without this the picker
+        replied "this process cannot switch models" and the buttons were inert.
+        """
+        result = await self.commands.dispatch(
+            text, app=self, principal=f"channel:{subject}",
+            surface="chat", channel=channel,
+        )
+        reply = str(getattr(result, "message", "") or "")
+        adapter = self.gateway.adapters.get(channel)
+        if reply and adapter is not None:
+            await adapter.send(subject, reply)
 
     async def _store_channel_attachment(self, channel: str, descriptor: dict[str, Any]) -> str | None:
         """Download a channel's file and store it, returning the attachment id.
