@@ -33,10 +33,10 @@ from ..contracts import RiskLevel
 # registration that ships a wrong tier does not silently become an approval.
 READ_TOOLS: frozenset[str] = frozenset(
     {
-        "file_read", "file_list", "file_search", "search_files", "read_file",
-        "grep", "glob", "web_search", "http_get", "memory_search", "memory_list",
-        "task_list", "task_status", "task_result", "metrics_snapshot",
-        "schedule_list", "skill_list", "agent_list", "config_get",
+        # Only names whose registered tier is above LOW. Everything else that
+        # inspects state is already registered LOW, so naming it here would be a
+        # second, drifting copy of the roster.
+        "metrics_snapshot", "webhook_verify",
     }
 )
 
@@ -44,8 +44,9 @@ READ_TOOLS: frozenset[str] = frozenset(
 # They run under MEDIUM (recorded, no approval) unless a path rule below escalates.
 BOUNDED_WRITE_TOOLS: frozenset[str] = frozenset(
     {
-        "write_file", "patch", "file_copy", "file_move", "memory_add",
-        "memory_forget", "learning.note", "task_create", "schedule_create",
+        # memory_forget is NOT here: a deleted memory has no undelete on the tool
+        # surface, so it stays behind the approval its spec and docstring promise.
+        "file_copy", "file_move", "memory_add", "task_create", "schedule_create",
         "attachment_add", "attachment_remove",
     }
 )
@@ -65,7 +66,7 @@ SENSITIVE_DIRS: frozenset[str] = frozenset({".git", ".ssh", ".gnupg", ".aws", ".
 # Adding a model or changing the agent's own behaviour is self-modification of
 # the product, not work on the user's files.
 SELF_MODIFY_TOOLS: frozenset[str] = frozenset(
-    {"model_add", "model_config", "apply_improvement", "skill_install", "skill_remove", "skill_write"}
+    {"model_add", "apply_improvement"}
 )
 
 
@@ -93,10 +94,8 @@ def assess_call(
         return _assess_outbound(arguments)
 
     if name == "memory_forget":
-        return RiskLevel.MEDIUM, "deletes a stored memory row (audited, recoverable from the vault)"
-
-    if name == "learning.note":
-        return RiskLevel.MEDIUM, "records an internal learning note"
+        # The one memory operation with no way back through the tool surface.
+        return RiskLevel.HIGH, "deletes a stored memory row; there is no undelete"
 
     if name in READ_TOOLS:
         return RiskLevel.LOW, "read-only inspection"
