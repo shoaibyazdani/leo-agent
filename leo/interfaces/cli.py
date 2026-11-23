@@ -21,6 +21,8 @@ task_app = typer.Typer(help="Durable task management")
 skill_app = typer.Typer(help="Native skills")
 memory_app = typer.Typer(help="Persistent memory")
 approval_app = typer.Typer(help="High-risk action approvals")
+grants_app = typer.Typer(help="Session and workspace approval grants")
+approval_app.add_typer(grants_app, name="grants")
 model_app = typer.Typer(help="Model providers and usage")
 agent_app = typer.Typer(help="Specialized agents")
 cli.add_typer(task_app, name="task")
@@ -483,6 +485,22 @@ def approval_cleanup(
             resolver=resolver, apply=apply, limit=limit,
         )
     show(report)
+
+
+@grants_app.command("list")
+def grants_list(
+    include_expired: bool = typer.Option(False, "--all", help="include expired grants"),
+) -> None:
+    """List live session and workspace grants."""
+    show(run(lambda: ready().permissions.list_grants(include_expired=include_expired)))
+
+
+@grants_app.command("revoke")
+def grants_revoke(grant_id: str) -> None:
+    """Revoke one grant immediately."""
+    with _handle_errors("grant revoke"):
+        revoked = run(ready().permissions.revoke_grant, grant_id)
+    show({"grant_id": grant_id, "revoked": revoked})
 
 
 @model_app.command("presets")

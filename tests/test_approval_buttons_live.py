@@ -101,14 +101,25 @@ def test_keyboard_omits_always_when_the_grant_cannot_be_scoped() -> None:
         assert any("Reject" in text for text in labels)
 
 
-def test_keyboard_offers_always_for_a_shell_approval_with_a_digest() -> None:
-    """A shell approval with its exact arguments digest is safely scopable."""
+def test_keyboard_offers_scoped_grants_for_a_shell_approval() -> None:
+    """Shell gets the exact-command grant and the workspace trust."""
     for action in ("tool:shell", "tool:terminal"):
         keyboard = build_keyboard(
             "apr_123", action, resource="/project", arguments_digest="a" * 64
         )
         labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
-        assert any("Always" in text for text in labels), labels
+        assert any("This command" in text for text in labels), labels
+        assert any("Trust workspace" in text for text in labels), labels
+
+
+def test_keyboard_omits_trust_for_a_dangerous_reason() -> None:
+    keyboard = build_keyboard(
+        "apr_123", "tool:shell", arguments_digest="a" * 64,
+        allow_workspace_trust=False,
+    )
+    labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+    assert any("This command" in text for text in labels), labels
+    assert not any("Trust workspace" in text for text in labels), labels
 
 
 def test_session_decision_survives_the_round_trip() -> None:
@@ -218,7 +229,7 @@ async def test_a_granted_session_skips_the_next_approval(env) -> None:
         "operator", "tool:file_write", path, RiskLevel.HIGH,
     )
     assert second.allowed is True
-    assert second.reason == "session grant"
+    assert second.reason == "approval grant"
 
 
 async def test_a_grant_does_not_leak_to_another_resource(env) -> None:
@@ -272,13 +283,80 @@ async def test_a_shell_grant_is_scoped_to_the_exact_arguments_digest(env) -> Non
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-one",
     )
-    assert same.allowed is True and same.reason == "session grant"
+    assert same.allowed is True and same.reason == "approval grant"
 
     other = await env.permissions.authorize(
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-two",
     )
     assert other.allowed is False and other.requires_approval is True
+
+
+async def test_a_workspace_trust_covers_normal_shell_only(env) -> None:
+    """Trust workspace skips ordinary work; destructive commands still ask."""
+    workspace = str(env.tmp_path.resolve())
+    first = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="unclassified command (rsvg-convert)",
+    )
+    assert first.requires_approval is True
+
+    await env.permissions.grant_workspace("tool:shell", workspace, 600, OWNER)
+
+    normal = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="unclassified command (rsvg-convert)",
+    )
+    assert normal.allowed is True and normal.reason == "approval grant"
+
+    destructive = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="rm is destructive",
+    )
+    assert destructive.allowed is False and destructive.requires_approval is True
+
+
+async def test_approval_mode_off_skips_the_high_risk_gate(env) -> None:
+    env.settings.security.approval_mode = "off"
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", str(env.tmp_path.resolve()), RiskLevel.HIGH,
+        risk_reason="rm is destructive",
+    )
+    assert decision.allowed is True
+    assert decision.reason == "approval mode off"
+
+
+async def test_workspace_grants_can_be_listed_and_revoked(env) -> None:
+    workspace = str(env.tmp_path.resolve())
+    grant_id = await env.permissions.grant_workspace(
+        "tool:shell", workspace, 600, OWNER
+    )
+
+    grants = await env.permissions.list_grants()
+    assert any(
+        item["id"] == grant_id and item["scope"] == "workspace"
+        for item in grants
+    )
+    assert await env.permissions.revoke_grant(grant_id) is True
+    assert await env.permissions.list_grants() == []
+
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="unclassified command",
+    )
+    assert decision.allowed is False and decision.requires_approval is True
+
+
+async def test_manual_mode_ignores_grants(env) -> None:
+    workspace = str(env.tmp_path.resolve())
+    await env.permissions.grant_workspace("tool:shell", workspace, 600, OWNER)
+    env.settings.security.approval_mode = "manual"
+
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", workspace, RiskLevel.HIGH,
+        risk_reason="unclassified command",
+    )
+    assert decision.allowed is False and decision.requires_approval is True
 
 
 async def test_a_legacy_unscoped_grant_never_authorizes(env) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,24 @@ _LOG = get_logger("security")
 def _grant_scope(action: str, arguments_digest: str) -> str:
     """Storage key for an "Always" grant scoped to one exact call payload."""
     return f"grant:{action}:{arguments_digest}"
+
+
+# A workspace trust is for ordinary development commands. Destructive,
+# credential, privilege, arbitrary-code, outbound and self-modifying work keeps
+# asking even when the workspace is trusted.
+_DANGEROUS_REASON = re.compile(
+    r"(?i)("
+    r"destruct|credential|privilege|escalat|power/unit|remote rewrite|force|"
+    r"recursive permission|removes an installed|key/keystore|private key|"
+    r"outside allowed roots|unparseable|arbitrary code|hardline|substitution|"
+    r"shell policy manual|shell disabled"
+    r")"
+)
+
+
+def reason_is_trustable(reason: str | None) -> bool:
+    """True when a workspace trust may cover a HIGH call for this reason."""
+    return not _DANGEROUS_REASON.search(str(reason or ""))
 
 
 def arguments_digest(arguments: Any) -> str | None:
@@ -201,6 +220,8 @@ class PermissionManagerImpl:
         current_digest = context.get("arguments_digest")
         if not current_digest and context.get("arguments") is not None:
             current_digest = arguments_digest(context.get("arguments"))
+        risk_reason = str(context.get("risk_reason") or "")
+        command_preview = str(context.get("command_preview") or "")
         verified_approval = False
         if supplied_approval:
             row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (supplied_approval,))
@@ -223,27 +244,41 @@ class PermissionManagerImpl:
         if allowed and risk is RiskLevel.MEDIUM and not self.settings.security.allow_medium_risk:
             allowed, reason = False, "medium-risk actions disabled by policy"
 
-        # A session grant answers "the operator already said yes to this exact
-        # action on this exact resource, minutes ago". It is checked before a new
-        # approval is created, and it can never waive a path violation.
+        # YOLO mode: run HIGH-risk work without ordinary prompts. Path rules,
+        # the hardline floor, deny globs and medium-risk policy still apply.
+        if (
+            allowed and not violation and risk is RiskLevel.HIGH and not verified_approval
+            and self.settings.security.approval_mode == "off"
+        ):
+            allowed, reason = True, "approval mode off"
+
+        # A session/workspace grant answers "the operator already said yes to
+        # this operation (or this workspace's ordinary work)". It is checked
+        # before a new approval is created and can never waive a path violation.
         grant_applied = False
         if (
             allowed and not violation and risk is RiskLevel.HIGH and not verified_approval
             and self.settings.security.high_risk_requires_approval
-            and await self._has_live_grant(action, resource, current_digest)
+            and self.settings.security.approval_mode != "off"
+            and await self._has_live_grant(action, resource, current_digest, risk_reason)
         ):
-            allowed, reason, grant_applied = True, "session grant", True
+            allowed, reason, grant_applied = True, "approval grant", True
 
         # A grant already answered this request; asking again would queue a
         # second approval for an action the operator just allowed.
         if (
             allowed and not grant_applied and risk is RiskLevel.HIGH
             and self.settings.security.high_risk_requires_approval and not verified_approval
+            and self.settings.security.approval_mode != "off"
         ):
             approval_id = new_id("apr")
             metadata = _safe_approval_metadata(context)
             if current_digest:
                 metadata["arguments_digest"] = current_digest
+            if risk_reason:
+                metadata["risk_reason"] = risk_reason
+            if command_preview:
+                metadata["command_preview"] = command_preview
             await db.execute(
                 "INSERT INTO approvals(id,created_at,status,actor,action,resource,risk,reason,requested_by,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
@@ -265,6 +300,8 @@ class PermissionManagerImpl:
                     # for shell/terminal only when it can scope the grant to the
                     # exact command shown.
                     **({"arguments_digest": current_digest} if current_digest else {}),
+                    **({"risk_reason": risk_reason} if risk_reason else {}),
+                    **({"command": command_preview} if command_preview else {}),
                 )
 
         decision = Decision(
@@ -295,39 +332,70 @@ class PermissionManagerImpl:
         )
         return cursor.rowcount == 1
 
+    def _workspace_contains(self, workspace: str, resource: str | None) -> bool:
+        """True when the call's cwd (or the default root) is inside the grant."""
+        try:
+            boundary = Path(str(workspace)).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        call_path = Path(str(resource)).expanduser().resolve() if resource else Path(
+            self.settings.root
+        ).resolve()
+        try:
+            call_path.relative_to(boundary)
+            return True
+        except ValueError:
+            return False
+
     async def _has_live_grant(
         self,
         action: str,
         resource: str | None,
         arguments_digest: str | None = None,
+        risk_reason: str | None = None,
     ) -> bool:
-        """True when an unexpired session grant covers this exact operation.
+        """True when an unexpired grant covers this call.
 
-        Path tools are keyed on ``(action, resource)``. Shell/terminal carry
-        their authority in the arguments, so they are keyed on the approval's
-        canonical arguments digest instead; an unscoped grant is never matched.
+        Path tools are keyed on ``(action, resource)``; shell/terminal on the
+        exact arguments digest. A third scope, a **workspace trust**, covers
+        ordinary shell commands in one workspace for its lifetime — but never a
+        destructive, credential, privilege, arbitrary-code or self-modifying
+        command. ``manual`` mode ignores every grant.
         """
+        if self.settings.security.approval_mode == "manual":
+            return False
         try:
             if action in ALWAYS_ARG_SCOPED_ACTIONS:
                 digest = str(arguments_digest or "").strip()
-                if not digest:
+                if digest:
+                    exact = await db.fetchone(
+                        "SELECT id FROM approval_grants WHERE action=? AND resource=? "
+                        "AND expires_at > ? LIMIT 1",
+                        (action, _grant_scope(action, digest), utcnow()),
+                    )
+                    if exact is not None:
+                        return True
+                if not reason_is_trustable(risk_reason):
                     return False
-                row = await db.fetchone(
-                    "SELECT id FROM approval_grants WHERE action=? AND resource=? "
-                    "AND expires_at > ? LIMIT 1",
-                    (action, _grant_scope(action, digest), utcnow()),
+                rows = await db.fetchall(
+                    "SELECT resource FROM approval_grants WHERE action=? "
+                    "AND scope='workspace' AND expires_at > ?",
+                    (action, utcnow()),
                 )
-            else:
-                if resource is None or str(resource).strip() == "":
-                    return False
-                row = await db.fetchone(
-                    "SELECT id FROM approval_grants WHERE action=? AND resource IS ? "
-                    "AND expires_at > ? LIMIT 1",
-                    (action, resource, utcnow()),
-                )
+                for item in rows or []:
+                    if self._workspace_contains(str(item["resource"]), resource):
+                        return True
+                return False
+            if resource is None or str(resource).strip() == "":
+                return False
+            row = await db.fetchone(
+                "SELECT id FROM approval_grants WHERE action=? AND resource IS ? "
+                "AND expires_at > ? LIMIT 1",
+                (action, resource, utcnow()),
+            )
+            return row is not None
         except Exception:  # noqa: BLE001 - a grant lookup must never crash a decision
             return False
-        return row is not None
 
     async def grant_session(
         self,
@@ -371,6 +439,70 @@ class PermissionManagerImpl:
             await self.events.emit("approval.granted", grant_id=grant_id, action=action,
                                    resource=stored_resource, granted_by=granted_by, scope=scope)
         return grant_id
+
+    async def grant_workspace(
+        self,
+        action: str,
+        workspace: str | None,
+        seconds: int,
+        granted_by: str,
+    ) -> str:
+        """Trust ordinary shell/terminal work in one workspace for a bounded time.
+
+        Destructive, credential, privilege, arbitrary-code and self-modifying
+        commands are excluded by :func:`reason_is_trustable`; the hardline and
+        deny-glob floors still apply before this is consulted.
+        """
+        from datetime import timedelta
+
+        if action not in ALWAYS_ARG_SCOPED_ACTIONS:
+            raise ValueError("a workspace trust applies to shell/terminal only")
+        boundary = str(
+            Path(str(workspace or self.settings.root)).expanduser().resolve()
+        )
+        grant_id = new_id("grn")
+        created = utcnow()
+        expires = (datetime.fromisoformat(created) + timedelta(seconds=max(60, int(seconds)))).isoformat()
+        await db.execute(
+            "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,granted_by,scope,metadata) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (grant_id, created, expires, action, boundary, granted_by, "workspace", "{}"),
+        )
+        if self.events:
+            await self.events.emit(
+                "approval.granted", grant_id=grant_id, action=action,
+                resource=boundary, granted_by=granted_by, scope="workspace",
+            )
+        return grant_id
+
+    async def list_grants(self, *, include_expired: bool = False) -> list[dict[str, Any]]:
+        """List live approval grants (a workspace trust is one of these)."""
+        sql = (
+            "SELECT id,created_at,expires_at,action,resource,granted_by,scope "
+            "FROM approval_grants"
+        )
+        params: tuple[Any, ...] = ()
+        if not include_expired:
+            sql += " WHERE expires_at > ?"
+            params = (utcnow(),)
+        sql += " ORDER BY created_at DESC"
+        rows = await db.fetchall(sql, params)
+        return [dict(row) for row in rows or []]
+
+    async def revoke_grant(self, grant_id: str, *, actor: str = "operator") -> bool:
+        """Revoke one grant immediately; the audit row is never deleted."""
+        cursor = await db.execute(
+            "DELETE FROM approval_grants WHERE id=?", (grant_id,)
+        )
+        revoked = bool(getattr(cursor, "rowcount", 0))
+        if revoked:
+            await self._audit(
+                actor, "approval.grant.revoke", grant_id, RiskLevel.LOW,
+                Decision(
+                    allowed=True, reason="approval grant revoked", risk=RiskLevel.LOW,
+                ),
+            )
+        return revoked
 
     async def resolve_approval(self, approval_id: str, approved: bool, resolver: str = "user") -> Decision:
         resolver_name = str(resolver).strip()

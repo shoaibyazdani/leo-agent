@@ -43,12 +43,13 @@ def _settings() -> Settings:
         ("shell", {"command": "git commit -m 'x'"}, RiskLevel.MEDIUM),
         ("shell", {"command": "systemctl restart leo-brain"}, RiskLevel.MEDIUM),
         ("shell", {"command": "sqlite3 leo.db 'DELETE FROM kv'"}, RiskLevel.MEDIUM),
+        ("shell", {"command": "echo x > out.txt"}, RiskLevel.MEDIUM),
         # destructive, arbitrary-code, unreversible: still ask
         ("shell", {"command": "rm -rf build"}, RiskLevel.HIGH),
         ("shell", {"command": "git reset --hard origin/main"}, RiskLevel.HIGH),
         ("shell", {"command": "python -c 'print(1)'"}, RiskLevel.HIGH),
         ("shell", {"command": "rm -rf /"}, RiskLevel.HIGH),
-        ("shell", {"command": "echo x > out.txt"}, RiskLevel.HIGH),
+        ("shell", {"command": "echo x > /etc/leo-probe"}, RiskLevel.HIGH),
         # edits: the workspace is not a minefield, credentials are
         ("write_file", {"path": "leo/core/app.py"}, RiskLevel.MEDIUM),
         ("patch", {"path": "tests/test_selfheal.py"}, RiskLevel.MEDIUM),

@@ -17,7 +17,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import shlex
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 from ..config import Settings
 from ..contracts import RiskLevel
@@ -54,10 +54,10 @@ _HARDLINE: tuple[tuple[re.Pattern[str], str], ...] = (
 # below) is escalated in smart mode.
 _SAFE_COMMANDS = frozenset(
     {
-        "basename", "cat", "cut", "date", "df", "diff", "dirname", "du", "echo",
-        "false", "file", "head", "ls", "mypy", "pytest", "pwd", "readlink",
-        "realpath", "sort", "stat", "tail", "test", "tr", "tree", "true",
-        "uniq", "wc", "which", "whoami",
+        "basename", "cat", "cd", "cut", "date", "df", "diff", "dirname", "du",
+        "echo", "false", "file", "head", "ls", "mypy", "pytest", "pwd",
+        "readlink", "realpath", "sort", "stat", "tail", "test", "tr", "tree",
+        "true", "uniq", "wc", "which", "whoami",
     }
 )
 
@@ -433,6 +433,42 @@ def _segment_tier(segment: str) -> tuple[RiskLevel, str]:
     return RiskLevel.HIGH, f"unclassified command ({name})"
 
 
+def _redirect_is_bounded(text: str, settings: Settings) -> bool:
+    """True when every file redirect target is inside a trusted root or /tmp.
+
+    A normal `pytest > /tmp/out` is a MEDIUM write; `echo x > /etc/hosts` is
+    not. The shell tool does not sandbox redirects, so the target is checked
+    explicitly rather than treating every redirect as arbitrary code.
+    """
+    roots = [settings.root.resolve()]
+    roots.extend(settings.resolve(p).resolve() for p in settings.security.allowed_roots)
+    roots.append(settings.resolve(settings.paths.workspaces).resolve())
+    targets: list[str] = []
+    for pattern in (r"(?<![0-9])>{1,2}\s*([^\s;&|]+)", r"(?<![0-9])<\s*([^\s;&|]+)"):
+        targets.extend(re.findall(pattern, text))
+    for raw in targets:
+        target = raw.strip("'\"")
+        if not target or target.startswith("&"):
+            continue  # fd duplication, e.g. 2>&1
+        if "$" in target or "`" in target:
+            return False  # the target is computed at run time
+        path = Path(target).expanduser()
+        if not path.is_absolute():
+            path = settings.root / path
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if resolved == Path("/dev/null"):
+            continue
+        if resolved == Path("/tmp") or Path("/tmp") in resolved.parents:
+            continue
+        if any(resolved == root or root in resolved.parents for root in roots):
+            continue
+        return False
+    return True
+
+
 def assess_command(command: str, settings: Settings) -> tuple[RiskLevel, str]:
     """Return ``(risk, reason)`` for one shell command line."""
     shell = settings.security
@@ -448,8 +484,11 @@ def assess_command(command: str, settings: Settings) -> tuple[RiskLevel, str]:
     denial = _hardline(text)
     if denial:
         return RiskLevel.HIGH, f"hardline blocklist: {denial}"
-    if "$(" in text or "`" in text or _REDIRECT.search(text):
-        return RiskLevel.HIGH, "command substitution or redirection"
+    if "$(" in text or "`" in text:
+        return RiskLevel.HIGH, "command substitution"
+    has_redirect = bool(_REDIRECT.search(text))
+    if has_redirect and not _redirect_is_bounded(text, settings):
+        return RiskLevel.HIGH, "redirection outside allowed roots"
     segments = [part.strip() for part in _SEGMENT_SPLIT.split(text) if part.strip()]
     decision: tuple[RiskLevel, str] = (RiskLevel.LOW, "read-only command line")
     for segment in segments:
@@ -458,4 +497,6 @@ def assess_command(command: str, settings: Settings) -> tuple[RiskLevel, str]:
             return RiskLevel.HIGH, reason
         if tier is RiskLevel.MEDIUM:
             decision = (RiskLevel.MEDIUM, reason)
+    if has_redirect and decision[0] is RiskLevel.LOW:
+        decision = (RiskLevel.MEDIUM, "bounded redirection")
     return decision

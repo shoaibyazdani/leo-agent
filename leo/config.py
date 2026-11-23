@@ -135,6 +135,17 @@ class SecurityConfig(BaseModel):
     # the shipped leo.yaml enables it for chat surfaces.
     wait_for_approval: bool = False
     approval_poll_seconds: float = Field(default=2.0, ge=0.05, le=60.0)
+    # How HIGH-risk calls are handled:
+    #   smart  - allow normal workspace shell under a workspace trust; prompt for
+    #            the rest with once / this-command / trust-workspace options
+    #   manual - always prompt (approval grants are ignored)
+    #   off    - run HIGH-risk calls without ordinary prompts (hardline/deny and
+    #            path rules still apply)
+    approval_mode: Literal["smart", "manual", "off"] = "smart"
+    # How long the "Trust workspace" button authorizes normal shell in one
+    # workspace. The reference tools default to "until revoked"; 30 days is the
+    # shipped middle ground and is configurable.
+    workspace_trust_days: float = Field(default=30.0, ge=0.0, le=3650.0)
     max_tool_calls_per_task: int = 200
     # Server-side ceiling: no caller hint (or configured per-task cap) may
     # exceed this value. 200 matches the legacy default cap.
@@ -527,6 +538,7 @@ class Settings(BaseModel):
             "security": [
                 "workspace_only", "allow_medium_risk", "high_risk_requires_approval",
                 "wait_for_approval", "approval_poll_seconds",
+                "approval_mode", "workspace_trust_days",
                 "max_tool_calls_per_task", "max_tool_calls_ceiling",
             ],
             "automation": ["max_concurrent_tasks", "default_task_timeout_seconds"],
@@ -555,6 +567,12 @@ class Settings(BaseModel):
                             raise ValueError(f"{env_name} must be a number; got {value!r}") from exc
                     elif isinstance(current, Path):
                         value = Path(value)
+                    if field == "approval_mode":
+                        value = str(value).strip().lower()
+                        if value not in {"smart", "manual", "off"}:
+                            raise ValueError(
+                                f"{env_name} must be smart, manual or off; got {value!r}"
+                            )
                     setattr(target, field, value)
         return settings
 
