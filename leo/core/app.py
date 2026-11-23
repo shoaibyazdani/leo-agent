@@ -1862,8 +1862,12 @@ class LeoApp:
             "PREVIEWS: to show a local HTML/text/image file, call preview_local_file with a workspace path, then open the exact URL it returns with browser_navigate (token-bound loopback allowance only for that URL); never use file:// or hand-written 127.0.0.1 URLs; use preview_close or the TTL when done.\n"
             "WEB JSON: to read a value from a web JSON API, call http_json with the URL and dotted path in ONE call and quote its returned value verbatim; never pass remembered JSON as data to json_query or invent a value after a tool failure.\n"
             "LIVE MODEL: mock answers are simulated and blocked in live mode; if no live provider is routable, report the blocked reason instead of answering.\n"
-            "STYLE: Answer directly, in short paragraphs or small lists. Prefer concrete values "
-            "over preamble. Say what you did and what the result was."
+            "STYLE: Lead with the answer in the first line, in plain words, with no heading. Default to "
+            "2-6 short lines and expand only when the user asks for detail. Use a code block only when the "
+            "content IS code or a command the user must run — never for key/value status columns, tables or "
+            "pasted logs. Do not narrate your process or list everything you checked; give the outcome and, "
+            "if it matters, one line of cause. When something failed, say what it means for the user and what "
+            "happens next. Match the user's language. Prefer one clear recommendation over a menu of options."
         )
         identity = self._identity_blocks()
         return f"{base}\n\n{identity}" if identity else base
