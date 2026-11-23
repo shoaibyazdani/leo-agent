@@ -1567,19 +1567,44 @@ def test_a_catalogue_that_builds_nothing_is_still_blocked() -> None:
     assert "missing base_url" in router.status()["reason"]
 
 
-def test_env_token_injects_a_buildable_opencode_go(tmp_path, monkeypatch) -> None:
-    """The env shim needs a real gateway URL, not None.
+def test_env_gateway_url_injects_the_leo_opencode_provider(tmp_path, monkeypatch) -> None:
+    """The shim adopts LEO's inference gateway and its required headers."""
+    cfg = tmp_path / "leo.yaml"
+    cfg.write_text("models:\n  providers: {}\n", encoding="utf-8")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-value")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://opencode.ai/inference/go/anthropic")
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
 
-    It was built from ``ANTHROPIC_BASE_URL`` alone, so a box with only the token
-    exported produced a provider that could never be built — and that single
-    failure blocked every model.
-    """
+    settings = Settings.load(cfg)
+    injected = settings.models.providers["opencode-go"]
+    assert injected.base_url == "https://opencode.ai/inference/go/anthropic"
+    assert injected.api_key_env == "ANTHROPIC_AUTH_TOKEN"
+    assert injected.model == "deepseek-v4.1-flash"
+    assert injected.extra_header_env == {"x-opencode-session": "LEO_OPENCODE_SESSION"}
+    assert injected.extra_headers.get("User-Agent") == "leo-agent-os/0.1.0"
+
+
+def test_env_ide_endpoint_is_not_adopted(tmp_path, monkeypatch) -> None:
+    """The IDE's /zen/go surface must never become LEO's provider."""
+    cfg = tmp_path / "leo.yaml"
+    cfg.write_text("models:\n  providers: {}\n", encoding="utf-8")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-value")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://opencode.ai/zen/go")
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+
+    settings = Settings.load(cfg)
+    assert "opencode-go" not in settings.models.providers
+    assert settings.model_status()["status"] == "blocked"
+
+
+def test_env_token_without_base_url_injects_nothing(tmp_path, monkeypatch) -> None:
+    """A token alone names no endpoint; LEO will not invent one."""
     cfg = tmp_path / "leo.yaml"
     cfg.write_text("models:\n  providers: {}\n", encoding="utf-8")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-value")
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
 
     settings = Settings.load(cfg)
-    injected = settings.models.providers["opencode-go"]
-    assert injected.base_url == "https://opencode.ai/zen/go"
-    assert injected.api_key_env == "ANTHROPIC_AUTH_TOKEN"
+    assert "opencode-go" not in settings.models.providers
+    assert settings.model_status()["status"] == "blocked"

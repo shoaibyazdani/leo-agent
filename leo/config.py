@@ -6,6 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -49,6 +50,27 @@ def _mock_fallback_env_override() -> bool | None:
     if any(value != values[0] for value in values[1:]):
         raise ValueError(f"{_MOCK_FALLBACK_ENV} conflicts with {_MOCK_FALLBACK_MODELS_ENV}")
     return values[0]
+
+
+def _is_opencode_inference_gateway(url: str | None) -> bool:
+    """True only for the OpenCode Go inference endpoint LEO is built against.
+
+    OpenCode exposes several surfaces. The IDE's ``/zen/go`` endpoint is a
+    different product path, and a shared shell often exports it (or another
+    Anthropic-compatible gateway) as ``ANTHROPIC_BASE_URL``. LEO must not adopt
+    that value as its own opencode-go provider: this project's gateway is the
+    ``/inference/go/anthropic`` endpoint, and only that one gets the session
+    header this provider needs.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(str(url))
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").rstrip("/")
+    return host == "opencode.ai" and path == "/inference/go/anthropic"
 
 
 def _validate_env_name(field: str, value: str | None) -> str | None:
@@ -430,27 +452,29 @@ class Settings(BaseModel):
             settings.models.allow_mock_fallback = mock_override
 
         # Environment-sourced provider configuration (values, not secret values).
-        # Only a real environment endpoint or token injects a provider. A bare
-        # environment injects nothing: inventing both endpoint and model gave
-        # every install a provider the operator never configured, and the repair
-        # step below then made it the default — so a fresh install reported
-        # "live" with no credential at all.
+        # The shim exists for env-only deployments of LEO's own OpenCode Go
+        # gateway. It activates only when ANTHROPIC_BASE_URL names that exact
+        # inference endpoint: the IDE's Anthropic surface and any other shared
+        # shell value are ignored, and a token alone never invents an endpoint.
         base_url = os.getenv("ANTHROPIC_BASE_URL")
         model = os.getenv("ANTHROPIC_MODEL")
         token_env = "ANTHROPIC_AUTH_TOKEN" if os.getenv("ANTHROPIC_AUTH_TOKEN") else None
-        if token_env and not base_url:
-            # A token alone is an explicit intent to use this gateway; give it
-            # the known endpoint instead of leaving an unbuildable provider.
-            base_url = "https://opencode.ai/zen/go"
-        if "opencode-go" not in settings.models.providers and (base_url or token_env):
+        if (
+            "opencode-go" not in settings.models.providers
+            and _is_opencode_inference_gateway(base_url)
+        ):
             settings.models.providers["opencode-go"] = ModelProviderConfig(
                 base_url=base_url,
                 api_key_env=token_env,
-                model=model or "hy4-flash-free",
+                model=model or "deepseek-v4.1-flash",
                 # Anthropic-compatible gateways accept image content blocks;
                 # `vision` lets image-bearing turns route here instead of
                 # failing with "no provider satisfies the request".
                 capabilities=["text", "streaming", "tools", "structured", "usage", "vision"],
+                # Mirrors the shipped leo.yaml: this gateway requires a stable
+                # session id and rejects generic library user agents.
+                extra_header_env={"x-opencode-session": "LEO_OPENCODE_SESSION"},
+                extra_headers={"User-Agent": "leo-agent-os/0.1.0"},
             )
         # Automatic mock injection is opt-in only. An explicit ``kind: mock``
         # provider needs no flag; without either, a missing or broken live

@@ -19,6 +19,8 @@ models:
     # DeepSeek V4.1 Flash 1017 - 1,000,000 context - 384,000 output
     opencode-go: &opencode
       kind: anthropic-compatible
+      # LEO's inference gateway. The IDE's /zen/go surface is a different
+      # product path; never point LEO at it.
       base_url: https://opencode.ai/inference/go/anthropic
       api_key_env: ANTHROPIC_AUTH_TOKEN
       model: deepseek-v4.1-flash

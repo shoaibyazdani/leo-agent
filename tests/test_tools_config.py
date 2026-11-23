@@ -24,7 +24,8 @@ from leo.tools.registry import ToolRegistry
 
 NAMES = ["config_get", "config_sources", "config_validate"]
 FAKE_TOKEN = "cred-env-value-9f8e7d6c5b4a3210"
-BASE_URL_VALUE = "https://env-config.invalid/v1"
+# The env shim only adopts LEO's inference gateway (not the IDE endpoint).
+BASE_URL_VALUE = "https://opencode.ai/inference/go/anthropic"
 MODEL_VALUE = "env-model-1"
 REDACTED = "[REDACTED]"
 

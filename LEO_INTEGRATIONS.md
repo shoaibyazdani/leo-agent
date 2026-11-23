@@ -47,11 +47,15 @@ uses declarative adapters only. License attribution is recorded in
 ## Model provider note
 
 The `opencode-go` provider is built from the real environment variables
-(`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `ANTHROPIC_AUTH_TOKEN` by name). One
-earlier live attempt returned HTTP 400 because the gateway requires an
-`x-opencode-session` header. `leo.yaml` now maps that non-secret header to the
-`LEO_OPENCODE_SESSION` env var through `extra_header_env` (alongside a fixed
-`User-Agent`), and supports non-secret `extra_headers` generally.
+(`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `ANTHROPIC_AUTH_TOKEN` by name), but
+only when the base URL is LEO's inference gateway
+(`https://opencode.ai/inference/go/anthropic`). The IDE's Anthropic endpoint is
+a different product surface and is ignored, and a token without a base URL
+injects nothing. One earlier live attempt returned HTTP 400 because the gateway
+requires an `x-opencode-session` header. `leo.yaml` maps that non-secret header
+to the `LEO_OPENCODE_SESSION` env var through `extra_header_env` (alongside a
+fixed `User-Agent`), and the env shim adds the same two headers for env-only
+deployments.
 
 **Honest current status:** the live model gateway is **available when the host
 environment provides the token (`ANTHROPIC_AUTH_TOKEN`) and the session value
