@@ -14,6 +14,7 @@ that can restart without dropping transport — do not depend on the framing.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 from typing import Any
@@ -268,8 +269,59 @@ def create_api(
     return api
 
 
+async def store_inbound_attachments(
+    channel: str,
+    descriptors: list[dict[str, Any]] | None,
+    sink: Any | None,
+) -> list[str]:
+    """Turn provider descriptors into store-issued attachment ids.
+
+    In a split deployment the gateway polls the transport but the worker owns
+    the attachment store. A descriptor (a bare file_id) cannot cross that gap:
+    the worker rejects it as "attachments must reference a stored attachment
+    id" and the photo becomes an empty turn. Download + store here, in the
+    process that holds the adapters, and admit only store-issued ids. A failed
+    download drops the attachment, never the message.
+    """
+    ids: list[str] = []
+    if not descriptors or sink is None:
+        return ids
+    for descriptor in descriptors:
+        try:
+            stored = await sink(channel, descriptor)
+        except Exception:  # one bad attachment must not drop the message
+            stored = None
+        if stored:
+            ids.append(str(stored))
+    return ids
+
+
+async def transcribe_inbound_voice(
+    channel: str,
+    descriptors: list[dict[str, Any]] | None,
+    adapters: dict[str, Any],
+) -> str:
+    """Turn voice/audio descriptors into transcribed text for the turn.
+
+    Voice notes carry no text of their own. They are downloaded through the
+    channel adapter and transcribed through the model gateway, then appended to
+    the message text so the brain sees a real turn instead of an empty one. A
+    failed transcription yields no text but never drops the message.
+    """
+    from ..integrations.transcription import transcribe_channel_voice
+
+    chunks: list[str] = []
+    for descriptor in descriptors or []:
+        if descriptor.get("kind") != "voice":
+            continue
+        text = await transcribe_channel_voice(channel, descriptor, adapters)
+        if text:
+            chunks.append(text)
+    return "\n".join(chunks)
+
+
 async def poll_loop(store: GatewayStore, adapters: dict[str, Any],
-                    interval: float = 2.0) -> None:
+                    interval: float = 2.0, attachment_sink: Any | None = None) -> None:
     """Pull from every credentialed poll channel and queue what arrives."""
     while True:
         for channel in polling_channels():
@@ -289,17 +341,39 @@ async def poll_loop(store: GatewayStore, adapters: dict[str, Any],
                 continue
             await state.beat(note=f"{len(messages)} inbound")
             for message in messages:
+                # Voice notes carry no text: transcribe them into the turn here,
+                # in the polling process that owns the adapters. Other media is
+                # stored as attachments; the worker only understands stored ids.
+                voice_text = await transcribe_inbound_voice(
+                    message.channel, message.attachments, adapters
+                )
+                turn_text = message.text
+                if voice_text:
+                    turn_text = f"{turn_text}\n\n{voice_text}".strip() if turn_text else voice_text
+                elif any(
+                    d.get("kind") == "voice" for d in (message.attachments or [])
+                ):
+                    # A voice note that could not be transcribed must still be a
+                    # real turn: silence here reads to the user as a dead bot.
+                    note = "[voice note could not be transcribed]"
+                    turn_text = f"{turn_text}\n\n{note}".strip() if turn_text else note
+                non_voice = [
+                    d for d in (message.attachments or []) if d.get("kind") != "voice"
+                ]
+                attachment_ids = await store_inbound_attachments(
+                    message.channel, non_voice, attachment_sink
+                )
                 await store.admit(
                     channel=message.channel,
                     subject=message.conversation_ref or message.sender_id,
                     principal=message.sender_id,
                     payload={
-                        "text": message.text,
+                        "text": turn_text,
                         "sender": message.sender,
                         "sender_id": message.sender_id,
                         "conversation_ref": message.conversation_ref,
                         "message_id": message.message_id,
-                        "attachments": message.attachments,
+                        "attachments": attachment_ids,
                     },
                     request_id=message.message_id,
                 )
@@ -355,12 +429,52 @@ def run_gateway(host: str = "127.0.0.1", port: int = 8766) -> None:
         _LOG.warning("callback handler not installed", extra={"error": type(exc).__name__})
     api = create_api(store, token=token, adapters=adapters)
 
+    # Inbound photos arrive on THIS polling process, but the attachment store
+    # lives with the worker. Build a store here and download+store descriptors
+    # before admitting, so a photo reaches the vision path as a stored id
+    # instead of a bare file_id the worker refuses. Mirrors the app's
+    # _store_channel_attachment; self-contained so a failed callback install
+    # cannot leave it undefined.
+    attachment_sink = None
+    try:
+        from ..config import Settings
+        from ..integrations.attachments import AttachmentStore
+
+        _media_settings = Settings.load()
+        _attachments = AttachmentStore(_media_settings)
+
+        async def _store_attachment(channel: str, descriptor: dict[str, Any]) -> str | None:
+            adapter = adapters.get(channel)
+            download = getattr(adapter, "download", None)
+            if download is None:
+                return None
+            try:
+                raw, mime, name = await download(descriptor)
+            except Exception as exc:
+                _LOG.warning("channel attachment download failed",
+                             extra={"channel": channel, "error": str(exc)})
+                return None
+            try:
+                record = await _attachments.save(name, mime, base64.b64encode(raw).decode("ascii"))
+            except Exception as exc:
+                _LOG.warning("channel attachment store failed",
+                             extra={"channel": channel, "error": str(exc)})
+                return None
+            attachment_id = record.get("id") if isinstance(record, dict) else None
+            return str(attachment_id) if attachment_id else None
+
+        attachment_sink = _store_attachment
+    except Exception as exc:  # noqa: BLE001 - a gateway must start without media
+        _LOG.warning("attachment sink not installed", extra={"error": type(exc).__name__})
+
     config = uvicorn.Config(api, host=host, port=port, log_level="info", lifespan="on")
     server = uvicorn.Server(config)
 
     async def _serve() -> None:
         await db.initialize()
-        loop_task = asyncio.create_task(poll_loop(store, adapters), name="gateway-poll")
+        loop_task = asyncio.create_task(
+            poll_loop(store, adapters, attachment_sink=attachment_sink), name="gateway-poll"
+        )
         try:
             await server.serve()
         finally:

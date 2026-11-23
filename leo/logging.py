@@ -58,6 +58,10 @@ class JsonFormatter(logging.Formatter):
         "event",
         "request_id",
         "correlation_id",
+        # Without these a failed poll logs "channel poll failed" and nothing
+        # else, which is indistinguishable from every other channel failure.
+        "channel",
+        "error",
     )
 
     def __init__(self, patterns: Iterable[str] = (), *args: Any, **kwargs: Any) -> None:
