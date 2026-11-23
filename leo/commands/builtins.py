@@ -316,10 +316,10 @@ def _provider_list(providers: Mapping[str, Any], current: str, *, columns: int =
     step = max(1, columns)
     for index in range(0, len(enabled), step):
         cells = [
-            (("* " if name == current else "  ") + name).ljust(width + 2)
+            ("* " if name == current else "  ") + name.ljust(width)
             for name in enabled[index:index + step]
         ]
-        rows.append("".join(cells).rstrip())
+        rows.append(" ".join(cells).rstrip())
     if disabled:
         rows.append("")
         rows.append("hidden: " + ", ".join(disabled))
@@ -327,34 +327,67 @@ def _provider_list(providers: Mapping[str, Any], current: str, *, columns: int =
 
 
 def _model_picker(
-    providers: Mapping[str, Any], current: str, *, columns: int = 2,
+    providers: Mapping[str, Any], current: str, *, page: int = 0,
+    page_size: int = 8, columns: int = 2,
 ) -> dict[str, Any]:
     """Inline keyboard: one button per model, the default marked with a tick.
 
     A tap sends ``/model <name>`` back through the queue, so the switch still
     runs in the process that owns settings — the gateway only relays the tap.
+    Models are paginated (``page_size`` per page) with Back/Next nav buttons
+    whose callback_data is ``mdl:pg:<n>``.
     """
     enabled = [name for name, cfg in sorted(providers.items()) if getattr(cfg, "enabled", True)]
+    total = len(enabled)
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    chunk = enabled[page * page_size:(page + 1) * page_size]
     rows: list[list[dict[str, str]]] = []
     step = max(1, columns)
-    for index in range(0, len(enabled), step):
+    for index in range(0, len(chunk), step):
         row = []
-        for name in enabled[index:index + step]:
+        for name in chunk[index:index + step]:
             label = ("\u2713 " if name == current else "") + name
             row.append({"text": label[:48], "callback_data": f"mdl:{name}"[:64]})
         rows.append(row)
+    nav: list[dict[str, str]] = []
+    if page > 0:
+        nav.append({"text": "\u2190 Back", "callback_data": f"mdl:pg:{page - 1}"})
+    if page < pages - 1:
+        nav.append({"text": "Next \u2192", "callback_data": f"mdl:pg:{page + 1}"})
+    if nav:
+        rows.append(nav)
     return {"inline_keyboard": rows}
 
 
 def _model_listing_message(
-    providers: Mapping[str, Any], current: str, *, columns: int = 3,
+    providers: Mapping[str, Any], current: str, *, page: int = 0,
+    page_size: int = 8, columns: int = 3,
 ) -> str:
     """Bare ``/model`` body: current line, the model grid, one footer line."""
     cfg_current = providers.get(current)
     current_model = str(getattr(cfg_current, "model", "") or current)
-    enabled = sum(1 for cfg in providers.values() if getattr(cfg, "enabled", True))
-    header = f"Current: * {current_model}" + (f"  ({enabled} models)" if enabled else "")
-    return _join_body(header, _provider_list(providers, current, columns=columns))
+    enabled_names = [name for name, cfg in sorted(providers.items())
+                     if getattr(cfg, "enabled", True)]
+    total = len(enabled_names)
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    chunk = enabled_names[page * page_size:(page + 1) * page_size]
+    # Build a providers view restricted to this page so _provider_list only
+    # renders the current page's models.
+    page_providers = {name: providers[name] for name in chunk}
+    header = f"Current: * {current_model}  ({total} models, page {page + 1}/{pages})"
+    body = _provider_list(page_providers, current, columns=columns)
+    # Hidden providers belong to the catalogue, not to the page being shown:
+    # restricting the list to one page must not make them disappear.
+    hidden = [name for name, cfg in sorted(providers.items())
+              if not getattr(cfg, "enabled", True)]
+    footer = "`/model <name>` switch · `/model list <n>` page · `/model status` details"
+    parts = [header, "", body]
+    if hidden:
+        parts += ["", "hidden: " + ", ".join(hidden)]
+    parts += ["", footer]
+    return "\n".join(parts)
 
 
 def _join_body(header: str, body: str) -> str:
@@ -409,6 +442,12 @@ async def model_command(ctx: CommandContext) -> CommandResult:
     current = app.settings.models.default
     sub = ctx.argv[0].lower() if ctx.argv else "status"
     if sub == "list":
+        page = 0
+        if len(ctx.argv) > 1:
+            try:
+                page = int(ctx.argv[1])
+            except (ValueError, TypeError):
+                page = 0
         data = {
             name: {"model": cfg.model, "kind": cfg.kind, "enabled": cfg.enabled,
                    "default": name == current}
@@ -416,8 +455,8 @@ async def model_command(ctx: CommandContext) -> CommandResult:
         }
         return _summary(
             ctx, "model",
-            _model_listing_message(providers, current),
-            {**data, "reply_markup": _model_picker(providers, current)},
+            _model_listing_message(providers, current, page=page),
+            {**data, "reply_markup": _model_picker(providers, current, page=page)},
         )
     if sub == "status":
         data = dict(status)

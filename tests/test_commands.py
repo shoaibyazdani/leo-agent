@@ -695,11 +695,50 @@ def test_model_listing_is_a_scannable_grid() -> None:
 
     text = _model_listing_message(providers, "model-07")
 
-    assert text.splitlines()[0] == "Current: * model-07  (30 models)"
-    assert len(text.splitlines()) <= 16, "30 models must not become 90 lines"
+    # Pages of eight, so one page is short by construction; 30 models must never
+    # become the 90-line wall this fixed.
+    assert text.splitlines()[0] == "Current: * model-07  (30 models, page 1/4)"
+    assert len(text.splitlines()) <= 12, "one page must stay a screenful"
     assert "--provider" not in text
     assert "hidden: off-01" in text
     assert "* model-07" in text
-    for name in ("model-00", "model-12", "model-29"):
-        assert text.count(name) == 1
-    assert text.count("model-07") == 2  # header + grid cell
+    for name in ("model-00", "model-07"):
+        assert text.count(name) == 1 + (1 if name == "model-07" else 0)
+    # the rest of the catalogue is a page away, not lost
+    assert "model-12" not in text and "model-29" not in text
+
+    page_two = _model_listing_message(providers, "model-07", page=1)
+    assert page_two.splitlines()[0] == "Current: * model-07  (30 models, page 2/4)"
+    for name in ("model-08", "model-15"):
+        assert name in page_two
+    assert "model-00" not in page_two
+
+
+def test_the_model_picker_pages_instead_of_flooding_the_keyboard() -> None:
+    """Buttons: eight models and a nav line, never 28 rows in one keyboard."""
+    from leo.commands.builtins import _model_picker
+    from leo.config import ModelProviderConfig
+
+    providers = {
+        f"model-{index:02d}": ModelProviderConfig(
+            kind="openai-compatible", base_url="https://x.test", model=f"model-{index:02d}"
+        )
+        for index in range(30)
+    }
+
+    first = _model_picker(providers, "model-07")["inline_keyboard"]
+    cells = [button for row in first[:-1] for button in row]
+    assert len(cells) == 8
+    assert [b["callback_data"] for b in cells] == [f"mdl:model-0{i}" for i in range(8)]
+    assert cells[7]["text"].startswith("\u2713")  # current model is ticked
+    assert first[-1] == [{"text": "Next \u2192", "callback_data": "mdl:pg:1"}]
+
+    second = _model_picker(providers, "model-07", page=1)["inline_keyboard"]
+    assert [b["text"] for b in second[-1]] == ["\u2190 Back", "Next \u2192"]
+    assert second[-1][0]["callback_data"] == "mdl:pg:0"
+
+    last = _model_picker(providers, "model-07", page=3)["inline_keyboard"]
+    assert [b["text"] for b in last[-1]] == ["\u2190 Back"]
+
+    # an out-of-range page clamps instead of rendering an empty keyboard
+    assert _model_picker(providers, "model-07", page=99)["inline_keyboard"] == last

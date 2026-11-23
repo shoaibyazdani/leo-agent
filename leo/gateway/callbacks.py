@@ -227,12 +227,28 @@ async def _model_tap(
 ) -> dict[str, Any]:
     """Apply a model chosen from the picker keyboard."""
     name = name.strip()
-    if not name:
-        await reply("No model on that button")
-        return {"ok": False, "reason": "empty model"}
+    # The guard belongs here, above every branch: a page tap needs an admission
+    # path just as much as a model tap, and calling None is not a fallback.
     if admit is None:
         await reply("This process cannot switch models; run /model <name>")
         return {"ok": False, "reason": "no admission path"}
+    if name.startswith("pg:"):
+        try:
+            page = int(name[3:])
+        except (ValueError, TypeError):
+            page = 0
+        await admit(f"/model list {page}", channel, chat_id or sender_id)
+        await reply(f"Page {page + 1}")
+        if chat_id and message_id and hasattr(adapter, "edit_message_text"):
+            await adapter.edit_message_text(
+                chat_id, message_id,
+                f"Model picker — page {page + 1}",
+                {"inline_keyboard": []},
+            )
+        return {"ok": True, "page": page}
+    if not name:
+        await reply("No model on that button")
+        return {"ok": False, "reason": "empty model"}
     await admit(f"/model {name}", channel, chat_id or sender_id)
     await reply(f"Switching to {name}")
     if chat_id and message_id and hasattr(adapter, "edit_message_text"):
