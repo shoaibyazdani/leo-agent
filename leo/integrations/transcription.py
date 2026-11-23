@@ -15,10 +15,14 @@ with "content type image_url requires a native Anthropic Messages target" — so
 an ``anthropic-compatible`` provider is mapped to its sibling OpenAI root. No
 endpoint is invented: with no configured provider, transcription is skipped.
 
-The default model is ``mimo-v2.6-flash``: it declares ``audio/ogg`` input (the
-Telegram voice format) and costs $0.14/$0.28 per million tokens. ``gemini-4-argon``
-also works but costs $2/$10 per million, so it is never selected implicitly;
-pin it only with ``LEO_STT_MODEL`` and ``LEO_STT_AUDIO_BLOCK=image_url``.
+Voice transcription is **off by default**: a voice note becomes a clear
+"send text" turn instead of spending model tokens. Set ``LEO_STT_ENABLED=true``
+to opt in. When enabled, the default model is ``mimo-v2.6-flash`` ($0.14/$0.28
+per million); note that the reference gateway only forwards audio to
+``gemini-4-argon`` today, so the cheap model is a configuration target rather
+than a guaranteed working route. ``gemini-4-argon`` is never selected
+implicitly; pin it only with ``LEO_STT_MODEL`` and
+``LEO_STT_AUDIO_BLOCK=image_url``.
 
 Credentials are read by environment-variable *name* at call time; no token value
 is stored or logged. A failed transcription returns ``None`` so the caller can
@@ -40,6 +44,29 @@ _LOG = logging.getLogger(__name__)
 # per million tokens. A premium multimodal model is opt-in via LEO_STT_MODEL.
 DEFAULT_MODEL = "mimo-v2.6-flash"
 AUDIO_BLOCK_ENV = "LEO_STT_AUDIO_BLOCK"
+STT_ENABLED_ENV = "LEO_STT_ENABLED"
+VOICE_UNAVAILABLE_NOTE = (
+    "[voice note received; voice transcription is disabled on this deployment "
+    "— please send text]"
+)
+
+
+def voice_transcription_enabled() -> bool:
+    """Whether this deployment opted into spend on voice transcription.
+
+    Off unless explicitly enabled. An unset or invalid value fails closed:
+    a typo must never start spending on audio it cannot even transcribe.
+    """
+    raw = os.getenv(STT_ENABLED_ENV)
+    if raw is None:
+        return False
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off", ""}:
+        return False
+    _LOG.warning("invalid %s value; voice transcription stays off", STT_ENABLED_ENV)
+    return False
 DEFAULT_PROMPT = (
     "Transcribe this voice note exactly as spoken. Reply with only the spoken "
     "words - no commentary, no quotes, no translation. Preserve the speaker's "
@@ -138,7 +165,13 @@ async def transcribe_audio(
     prompt: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> str | None:
-    """Transcribe audio bytes to text. Returns ``None`` on any failure."""
+    """Transcribe audio bytes to text. Returns ``None`` on any failure.
+
+    Voice transcription is opt-in (``LEO_STT_ENABLED=true``); when it is off
+    this returns before resolving a provider or making any network call.
+    """
+    if not voice_transcription_enabled():
+        return None
     endpoint, token, headers = _transport()
     if base_url:
         endpoint = _openai_root(base_url, "openai-compatible")
