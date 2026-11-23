@@ -49,6 +49,10 @@ async def test_restart_spawns_a_detached_child(monkeypatch):
 
     monkeypatch.setattr(builtins.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(builtins.shutil, "which", lambda _name: "/usr/bin/systemctl")
+    # Hermetic: LEO_SERVICE_UNITS outranks LEO_SERVICE_UNIT, so an ambient copy
+    # (the service env file sets it) would silently override the single unit
+    # this test is about.
+    monkeypatch.delenv("LEO_SERVICE_UNITS", raising=False)
     monkeypatch.setenv("LEO_SERVICE_UNIT", "leo-agent.service")
     monkeypatch.setenv("LEO_RESTART_DELAY_SECONDS", "3")
 
@@ -63,6 +67,44 @@ async def test_restart_spawns_a_detached_child(monkeypatch):
     assert "systemctl restart leo-agent.service" in argv[2]
     # The restart must outlive the process that asked for it.
     assert kwargs["start_new_session"] is True
+
+
+def test_restart_targets_prefers_explicit_multi_unit(monkeypatch):
+    monkeypatch.setenv("LEO_SERVICE_UNITS", "leo-gateway.service, leo-ui.service ,leo-brain.service")
+    monkeypatch.delenv("LEO_SERVICE_UNIT", raising=False)
+
+    units, source = builtins._restart_targets()
+
+    assert units == ["leo-gateway.service", "leo-ui.service", "leo-brain.service"]
+    assert source == "LEO_SERVICE_UNITS"
+
+
+def test_own_units_reads_this_process_cgroup(monkeypatch):
+    monkeypatch.setattr(
+        builtins.Path, "read_text",
+        lambda self: "0::/system.slice/leo-brain.service\n",
+        raising=False,
+    )
+
+    assert builtins._own_units() == ["leo-brain.service"]
+
+
+def test_restart_never_restarts_the_disabled_leftover_by_accident(monkeypatch):
+    """The regression: an unset env used to hardcode leo-agent.service.
+
+    On this host that unit is disabled and cannot bind 8765, so restarting it
+    restarted nothing and started a crash loop instead. Without an explicit
+    setting the targets must come from the units we can actually see.
+    """
+    monkeypatch.delenv("LEO_SERVICE_UNIT", raising=False)
+    monkeypatch.delenv("LEO_SERVICE_UNITS", raising=False)
+    monkeypatch.setattr(builtins, "_active_leo_units", lambda: ["leo-ui.service"])
+    monkeypatch.setattr(builtins, "_own_units", lambda: ["leo-brain.service"])
+
+    units, source = builtins._restart_targets()
+
+    assert source == "auto-detected"
+    assert units == ["leo-brain.service", "leo-ui.service"]
 
 
 async def test_restart_reports_honestly_without_systemctl(monkeypatch):
