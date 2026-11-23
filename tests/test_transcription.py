@@ -89,7 +89,28 @@ def test_unknown_anthropic_gateway_is_not_guessed(monkeypatch) -> None:
     assert token == "tok"
 
 
+def test_voice_transcription_is_off_by_default(monkeypatch) -> None:
+    monkeypatch.delenv(transcription.STT_ENABLED_ENV, raising=False)
+    assert transcription.voice_transcription_enabled() is False
+
+
+async def test_disabled_transcription_never_resolves_a_provider(monkeypatch) -> None:
+    """A voice note must not spend tokens when the operator left STT off."""
+    monkeypatch.delenv(transcription.STT_ENABLED_ENV, raising=False)
+    calls: list[bool] = []
+
+    def transport():
+        calls.append(True)
+        return ("https://gw.example", "tok", {})
+
+    monkeypatch.setattr(transcription, "_transport", transport)
+
+    assert await transcription.transcribe_audio(b"x", "audio/ogg", "v.ogg") is None
+    assert calls == []
+
+
 async def test_no_provider_or_token_skips_transcription(monkeypatch) -> None:
+    monkeypatch.setenv(transcription.STT_ENABLED_ENV, "1")
     _pin_settings(monkeypatch, Settings())
     monkeypatch.delenv("TEST_STT_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
@@ -121,6 +142,7 @@ class _Client:
 
 
 async def test_transcribe_audio_uses_chat_completions_and_extracts_text(monkeypatch) -> None:
+    monkeypatch.setenv(transcription.STT_ENABLED_ENV, "1")
     monkeypatch.setattr(
         transcription,
         "_transport",
@@ -153,6 +175,7 @@ def test_default_model_is_the_cheap_audio_model() -> None:
 
 async def test_image_url_audio_block_is_opt_in(monkeypatch) -> None:
     """The legacy data-URL shape is available, but only when asked for."""
+    monkeypatch.setenv(transcription.STT_ENABLED_ENV, "1")
     monkeypatch.setenv(transcription.AUDIO_BLOCK_ENV, "image_url")
     monkeypatch.setattr(
         transcription,
@@ -173,6 +196,7 @@ async def test_image_url_audio_block_is_opt_in(monkeypatch) -> None:
 
 
 async def test_transcribe_audio_failures_return_none(monkeypatch) -> None:
+    monkeypatch.setenv(transcription.STT_ENABLED_ENV, "1")
     monkeypatch.setattr(
         transcription,
         "_transport",

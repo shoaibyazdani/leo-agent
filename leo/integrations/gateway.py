@@ -334,8 +334,10 @@ class Gateway:
                     # A voice note with no words would otherwise become a blank
                     # turn: the brain is asked to answer nothing. Say what
                     # happened so the operator gets a reply instead of silence.
+                    from .transcription import VOICE_UNAVAILABLE_NOTE
+
                     message = message.model_copy(
-                        update={"text": "[voice note received but could not be transcribed]"}
+                        update={"text": VOICE_UNAVAILABLE_NOTE}
                     )
             prepared.append(
                 _Prepared(

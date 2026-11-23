@@ -30,6 +30,7 @@ DELIVERY_TIMEOUT_SECONDS = 45.0
 from ..integrations.channels import default_adapters, polling_channels
 from ..integrations.messaging import implements_polling
 from ..integrations.secrets import credential
+from ..integrations.transcription import VOICE_UNAVAILABLE_NOTE
 from ..integrations.transport_state import TransportState
 from .sessions import SessionStore
 from .store import GatewayStore
@@ -355,7 +356,7 @@ async def poll_loop(store: GatewayStore, adapters: dict[str, Any],
                 ):
                     # A voice note that could not be transcribed must still be a
                     # real turn: silence here reads to the user as a dead bot.
-                    note = "[voice note could not be transcribed]"
+                    note = VOICE_UNAVAILABLE_NOTE
                     turn_text = f"{turn_text}\n\n{note}".strip() if turn_text else note
                 non_voice = [
                     d for d in (message.attachments or []) if d.get("kind") != "voice"
