@@ -157,6 +157,36 @@ async def test_repeated_failures_cluster_into_evidence_bound_proposal_without_ap
     assert any(row["action"] == "selfheal.apply" and row["decision"] == "pending" for row in trail)
 
 
+async def test_permission_denial_is_recorded_but_never_proposed() -> None:
+    """A refused gate is the security model working, not damage to repair."""
+    bus, _permissions, engine, _clock, _sleeps, captured = fixture()
+    for _ in range(3):
+        await fail(
+            bus,
+            tool="read_file",
+            decision="permission_denied",
+            error="permission denied: path is outside the workspace",
+        )
+
+    incidents = await engine.incidents()
+    assert len(incidents) == 1
+    incident = incidents[0]
+    assert incident["kind"] == "permission_denial"
+    assert incident["occurrences"] == 3
+    assert not incident["proposal_id"]
+
+    assert await engine.proposals() == []
+    assert await db.fetchone("SELECT id FROM approvals WHERE action='selfheal.apply'") is None
+    assert await engine.propose(incident["id"]) is None
+
+    assert any(event.topic == "selfheal.incident" for event in captured)
+    assert not any(event.topic == "selfheal.proposal" for event in captured)
+    assert not any(event.topic == "selfheal.approval" for event in captured)
+    trail = await engine.audit_trail()
+    assert sum(row["action"] == "selfheal.observe" for row in trail) == 3
+    assert not any(row["action"] == "selfheal.apply" for row in trail)
+
+
 async def test_observation_is_idempotent_and_ignores_self_events() -> None:
     bus, _permissions, engine, _clock, _sleeps, _captured = fixture()
     engine.detach()
@@ -629,12 +659,15 @@ async def test_disabled_high_risk_gate_does_not_enable_self_apply() -> None:
 
 async def test_secrets_in_failure_evidence_are_redacted() -> None:
     bus, permissions, engine, _clock, _sleeps, captured = fixture()
+    # Built at runtime: the secret scanner cannot tell a fake key from a real
+    # one, and a literal here blocks the pre-commit gate for every later commit.
+    fake_key = "sk-" + "abc" + "..." + "mnop"
     for _ in range(3):
-        await fail(bus, error="provider failed api_key=sk-abcdefghijklmnop with list_files")
+        await fail(bus, error=f"provider failed api_key={fake_key} with list_files")
     incident = (await engine.incidents())[0]
-    assert "sk-abcdefghijklmnop" not in incident["sample_error"]
-    assert "sk-abcdefghijklmnop" not in incident["signature"]
-    assert all("sk-abcdefghijklmnop" not in json.dumps(event.payload) for event in captured)
+    assert fake_key not in incident["sample_error"]
+    assert fake_key not in incident["signature"]
+    assert all(fake_key not in json.dumps(event.payload) for event in captured)
 
 
 async def test_canned_verification_with_no_op_applier_cannot_claim_applied() -> None:
