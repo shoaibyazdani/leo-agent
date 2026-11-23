@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import socket
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -65,12 +66,13 @@ class GatewayClient:
         return response.json().get("admission")
 
     async def complete(self, admission_id: str, answer: str,
-                       conversation_id: str = "") -> dict[str, Any]:
-        response = await self._http().post(
-            "/v1/complete",
-            json={"admission_id": admission_id, "answer": answer,
-                  "conversation_id": conversation_id},
-        )
+                       conversation_id: str = "",
+                       reply_markup: dict[str, Any] | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {"admission_id": admission_id, "answer": answer,
+                                "conversation_id": conversation_id}
+        if reply_markup:
+            body["reply_markup"] = reply_markup
+        response = await self._http().post("/v1/complete", json=body)
         if response.status_code != 200:
             raise GatewayClientError(f"complete failed: HTTP {response.status_code}")
         return response.json()
@@ -168,6 +170,18 @@ async def _keep_lease(
             await client.renew(admission_id, worker, lease_seconds)
         except (httpx.HTTPError, GatewayClientError):
             continue  # a transient gateway blip must not abort the turn
+
+
+def _answer_markup(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The inline keyboard a slash command attached to its answer, if any."""
+    command_result = result.get("command_result")
+    if not isinstance(command_result, Mapping):
+        return None
+    data = command_result.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    markup = data.get("reply_markup")
+    return dict(markup) if isinstance(markup, Mapping) else None
 
 
 async def _abandon_turn(
@@ -279,7 +293,8 @@ async def _claim_loop(
                 except (httpx.HTTPError, GatewayClientError):
                     pass
             await client.complete(admission_id, answer,
-                                  str(result.get("conversation_id") or ""))
+                                  str(result.get("conversation_id") or ""),
+                                  reply_markup=_answer_markup(result))
             answered += 1
         except asyncio.CancelledError:
             raise

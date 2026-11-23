@@ -54,6 +54,9 @@ class CompleteRequest(BaseModel):
     admission_id: str
     answer: str = ""
     conversation_id: str = ""
+    # An inline keyboard the answer carries (the model picker). Optional: a
+    # channel that cannot render one simply ignores it.
+    reply_markup: dict[str, Any] | None = None
 
 
 class FailRequest(BaseModel):
@@ -179,8 +182,11 @@ def create_api(
                     # A hung platform call must not keep the turn (and its typing
                     # pulse) alive forever: the worker renews the lease until this
                     # returns, so an unbounded send is an endless "still typing".
+                    # Only pass the keyboard when the answer has one, so a
+                    # text-only adapter keeps its own send() signature.
+                    extra = {"reply_markup": request.reply_markup} if request.reply_markup else {}
                     await asyncio.wait_for(
-                        adapter.send(admission["subject"], request.answer),
+                        adapter.send(admission["subject"], request.answer, **extra),
                         timeout=DELIVERY_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
@@ -325,7 +331,26 @@ def run_gateway(host: str = "127.0.0.1", port: int = 8766) -> None:
 
         _settings = Settings.load()
         _permissions = PermissionManagerImpl(_settings)
-        install_callbacks(_settings, _permissions, adapters)
+
+        async def _admit_command(text: str, channel: str, subject: str) -> None:
+            """Queue a slash command as if the operator had typed it.
+
+            A model tap must not edit config from this process: the brain owns
+            settings and re-reads the default per turn, so the tap travels as
+            normal work. The nonce keeps two taps of the same model distinct —
+            admissions are de-duplicated by payload digest.
+            """
+            from ..contracts import new_id
+
+            nonce = new_id("cb")
+            await store.admit(
+                channel=channel, subject=subject,
+                payload={"text": text, "sender_id": "operator-button",
+                         "message_id": nonce, "conversation_ref": subject},
+                principal=subject, request_id=nonce,
+            )
+
+        install_callbacks(_settings, _permissions, adapters, admit=_admit_command)
     except Exception as exc:  # noqa: BLE001 - a gateway must start even if taps cannot
         _LOG.warning("callback handler not installed", extra={"error": type(exc).__name__})
     api = create_api(store, token=token, adapters=adapters)
