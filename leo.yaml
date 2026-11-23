@@ -316,6 +316,11 @@ security:
   approval_mode: smart
   # "Trust workspace" button lifetime; the reference tools use until-revoked.
   workspace_trust_days: 30
+  # In smart mode, a cheap model reviews an otherwise-uncovered HIGH shell call
+  # before a human is asked. Destructive/credential/arbitrary-code calls skip it.
+  reviewer_enabled: true
+  reviewer_model: ""          # empty = the configured default chat model
+  reviewer_timeout_seconds: 20
   # Smart shell policy. smart auto-runs read-only/test commands, asks
   # for risky or unknown ones, and always denies the hardline blocklist.
   # manual asks for every command; off runs everything except hardline.
