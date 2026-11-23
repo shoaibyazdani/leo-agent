@@ -383,7 +383,11 @@ class Settings(BaseModel):
             settings.models.allow_mock_fallback = mock_override
 
         # Environment-sourced provider configuration (values, not secret values).
-        base_url = os.getenv("ANTHROPIC_BASE_URL")
+        # The gateway URL is not optional: a provider whose base_url is None can
+        # never be built, and one unbuildable provider used to black out every
+        # other model. Default to the same endpoint Hermes uses for opencode-go
+        # (the OpenAI-compatible client appends /v1/chat/completions).
+        base_url = os.getenv("ANTHROPIC_BASE_URL") or "https://opencode.ai/zen/go"
         model = os.getenv("ANTHROPIC_MODEL")
         token_env = "ANTHROPIC_AUTH_TOKEN" if os.getenv("ANTHROPIC_AUTH_TOKEN") else None
         if "opencode-go" not in settings.models.providers and (base_url or token_env):
