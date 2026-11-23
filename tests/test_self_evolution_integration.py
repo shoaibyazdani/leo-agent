@@ -15,7 +15,7 @@ from leo import db
 from leo.config import ModelConfig, ModelProviderConfig, Settings
 from leo.core import LeoApp
 from leo.core.app import _EVOLUTION_PENDING_LIMIT, _EVOLUTION_TRANSLATED_ID_SUFFIX
-from leo.learning import LearningEngine
+from leo.learning import AutoNotePolicy, LearningEngine
 from leo.selfheal import SelfHealingEngine
 
 
@@ -90,7 +90,9 @@ async def test_initialize_wires_real_engines_and_truthful_capabilities(app: LeoA
     assert evolution["hooks_attached"] is True
     assert "tool.failed" in evolution["healing"]["governance"]["watched_topics"]
     assert evolution["healing"]["governance"]["self_edits_source"] is False
-    assert evolution["learning"]["governance"]["auto_notes_enabled"] is False
+    assert evolution["learning"]["governance"]["auto_notes_enabled"] is True
+    assert evolution["learning"]["governance"]["unattended_auto_writes"] is True
+    assert evolution["learning"]["governance"]["auto_high_risk_categories"] is True
     assert evolution["healing"]["applied_remediations"] == 0
     assert evolution["healing"]["active_fixes"] == 0
     assert evolution["learning"]["accepted_notes"] == 0
@@ -170,15 +172,14 @@ async def test_run_failed_hook_translates_and_redacts_uncatalogued_failures(app:
     assert secret not in _dump(await app.health())
 
 
-async def test_chat_completed_hook_proposes_notes_without_writing_memory(app: LeoApp) -> None:
+async def test_chat_completed_hook_writes_notes_without_an_approval(app: LeoApp) -> None:
     before = await app.memory.list(limit=100)
     result = await app.ask(
         "Remember that the release checklist lives in docs/release.md", channel="chat"
     )
     assert result["conversation_id"]
     assert app._evolution_hooks["chat_completed"] == 1
-    # One turn only queues a hint: the scan is throttled, so no approval is
-    # requested until the batch is flushed.
+    # One turn only queues a hint: the scan is throttled.
     assert len(app._evolution_learning_pending) == 1
     assert await app.learning.proposals() == []
 
@@ -187,40 +188,62 @@ async def test_chat_completed_hook_proposes_notes_without_writing_memory(app: Le
     matching = [p for p in proposals if "release checklist" in p["draft"]["content"]]
     assert len(matching) == 1
     proposal = matching[0]
-    assert "digest" in proposal["draft"]["tags"]
-    assert proposal["status"] == "awaiting_approval"
-    # The note is low-risk by category, but the write itself still needs a
-    # HIGH-risk approval; that is the gate that keeps it proposal-only.
-    assert proposal["risk"] == "low"
-    assert proposal["policy"] == "approval"
-    assert proposal["approval_id"]
+    # The shipped policy writes an eligible note directly: no approval row and
+    # no digest round-trip. It keeps the real source kind and its evidence.
+    assert proposal["status"] == "accepted"
+    assert proposal["policy"] == "auto"
+    assert proposal["unattended"] is True
+    assert proposal["approval_id"] is None
+
+    notes = await app.memory.list(limit=100)
+    assert len(notes) == len(before) + 1
+    assert any("release checklist" in str(getattr(n, "content", "") or "") for n in notes)
+    assert await _learning_approval_count() == 0
+
+    health = await app.health()
+    assert health["self_evolution"]["learning"]["accepted_notes"] == 1
+    assert health["self_evolution"]["learning"]["auto_writes"] == 1
+
+
+async def test_personal_fact_is_learned_without_an_approval(app: LeoApp) -> None:
+    before = await app.memory.list(limit=100)
+    await app.ask("My name is Alice Example", channel="chat")
+    await app._scan_learning_batch()
+
+    accepted = [
+        p for p in await app.learning.proposals()
+        if p["status"] == "accepted" and "Alice Example" in p["draft"]["content"]
+    ]
+    assert len(accepted) == 1
+    assert accepted[0]["draft"]["category"] == "personal"
+    assert accepted[0]["risk"] == "high"
+    assert accepted[0]["approval_id"] is None
+    assert len(await app.memory.list(limit=100)) == len(before) + 1
+    assert await _learning_approval_count() == 0
+
+
+async def test_disabling_auto_notes_restores_the_approval_gate(app: LeoApp) -> None:
+    """The kill switch puts every note back behind a HIGH-risk approval."""
+    app.learning.auto_policy = AutoNotePolicy(enabled=False)
+    before = await app.memory.list(limit=100)
+
+    await app.ask(
+        "Remember that the release checklist lives in docs/release.md", channel="chat"
+    )
+    await app._scan_learning_batch()
+
+    proposals = [
+        p for p in await app.learning.proposals()
+        if "release checklist" in p["draft"]["content"]
+    ]
+    assert len(proposals) == 1
+    assert proposals[0]["status"] == "awaiting_approval"
+    assert proposals[0]["policy"] == "approval"
+    assert proposals[0]["approval_id"]
 
     approval = await _approval("learning.note")
-    assert approval["risk"] == "high"
-    assert approval["actor"] == "learning:engine"
     assert approval["status"] == "pending"
-
-    # Observation only: no memory note is created until an operator approves.
     assert len(await app.memory.list(limit=100)) == len(before)
-    health = await app.health()
-    assert health["self_evolution"]["learning"]["accepted_notes"] == 0
-    assert health["self_evolution"]["remediation_mode"] == "proposal-only"
-
-    with pytest.raises(PermissionError, match="chat actors"):
-        await app.permissions.resolve_approval(approval["id"], True, "chat:attacker")
-
-    await app.operator_resolve_approval(approval["id"], True)
-    assert len(await app.memory.list(limit=100)) == len(before)
-
-    # The explicit, human-approved accept is the only path that writes memory.
-    from leo.learning import ApprovalRequired
-
-    with pytest.raises(ApprovalRequired):
-        await app.learning.accept(proposal["id"])
-    saved = await app.learning.accept(proposal["id"], approval["id"])
-    assert saved["content"] == proposal["draft"]["content"]
-    assert len(await app.memory.list(limit=100)) == len(before) + 1
-    assert (await app.health())["self_evolution"]["learning"]["accepted_notes"] == 1
 
 
 async def test_run_finished_hook_only_learns_from_successful_runs(app: LeoApp) -> None:
@@ -505,6 +528,9 @@ async def test_400_real_completions_are_throttled_into_few_digest_approvals(
     app: LeoApp,
 ) -> None:
     """Real traffic yields a bounded number of batched, approval-gated notes."""
+    # This pins the approval-throttling path. The autonomous default is covered
+    # by the chat-completed test above, so disable it here explicitly.
+    app.learning.auto_policy = AutoNotePolicy(enabled=False)
     app._evolution_learning_scans = 0
     app._evolution_hooks["learning_scans"] = 0
     app._evolution_proposals_batched = 0
@@ -559,8 +585,11 @@ async def test_explicit_opt_in_allows_harness_learning(app: LeoApp, monkeypatch)
         app, 100, channel="observer", conversation_id="observer-opt-in",
     )
     proposals = await app.learning.proposals()
-    assert len(proposals) == 1
-    assert "digest" in proposals[0]["draft"]["tags"]
+    # Autonomous policy: one proposal per idea (no digest, no approval row).
+    assert proposals
+    assert all(item["policy"] == "auto" for item in proposals)
+    assert any(item["status"] == "accepted" for item in proposals)
+    assert await _learning_approval_count() == 0
     evolution = (await app.health())["self_evolution"]
     assert evolution["learning"]["harness_proposals_enabled"] is True
     assert evolution["learning"]["harness_events_suppressed"] == 0

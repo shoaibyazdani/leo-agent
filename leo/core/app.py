@@ -231,6 +231,7 @@ class LeoApp:
         self._evolution_proposals_suppressed = 0
         self._evolution_proposals_batched = 0
         self._evolution_learning_digest_proposals = 0
+        self._evolution_learning_auto_writes = 0
 
     def _start_run(self, run_id: str, conversation_id: str) -> None:
         self._runs[run_id] = {
@@ -971,8 +972,12 @@ class LeoApp:
         else:
             try:
                 try:
+                    # Learning writes are autonomous by default: the policy is
+                    # config-owned (leo.yaml → learning.auto_notes), so an
+                    # operator can restore the approval gate with one key.
                     self.learning = LearningEngine(
                         self.memory, self.events, self.permissions, self.settings,
+                        auto_policy=self.settings.learning.auto_notes.model_dump(),
                     )
                 except TypeError:  # tolerate a narrower public constructor
                     self.learning = LearningEngine()
@@ -1297,7 +1302,13 @@ class LeoApp:
             _LOG.warning("learning seen-marker update failed", extra={"error": str(exc)})
 
     async def _scan_learning_batch(self) -> dict[str, int]:
-        """At most one digest proposal per scan, regardless of turn volume."""
+        """Learn from the pending turns.
+
+        With unattended auto-notes enabled (the default) each eligible idea is
+        written on its own, so no approval is created. With the policy off, one
+        digest proposal is created per scan regardless of turn volume, which
+        keeps the approval surface to one row instead of one per turn.
+        """
         engine = self.learning
         if engine is None:
             return {"batched": 0, "proposals": 0}
@@ -1336,6 +1347,44 @@ class LeoApp:
             if not fresh:
                 return {"batched": 0, "proposals": 0}
 
+            policy = getattr(engine, "auto_policy", None)
+            unattended = bool(
+                policy is not None
+                and getattr(policy, "enabled", False)
+                and getattr(policy, "allow_unattended_writes", False)
+            )
+            if unattended:
+                # No approval is created for an eligible note, so the digest
+                # exists only to collapse approval noise. Without approvals,
+                # propose each idea on its own: that keeps its real source kind
+                # (user / tool / run) and its own evidence and category, instead
+                # of laundering everything through an "external" aggregate.
+                created = 0
+                learned = 0
+                for draft in fresh:
+                    try:
+                        proposal = await engine.propose(draft)
+                    except Exception as exc:  # noqa: BLE001 - one idea cannot stop the scan
+                        _LOG.warning("learning proposal failed", extra={"error": str(exc)})
+                        continue
+                    status = str(proposal.get("status") or "")
+                    if status == "awaiting_approval" and proposal.get("approval_id"):
+                        created += 1
+                        continue
+                    if status != "proposed" or proposal.get("policy") != "auto":
+                        continue
+                    try:
+                        await engine.accept(str(proposal.get("id") or ""))
+                        learned += 1
+                    except Exception as exc:  # noqa: BLE001 - learning never blocks a reply
+                        _LOG.warning("learning auto-write failed", extra={"error": str(exc)})
+                self._evolution_proposals_batched += len(fresh)
+                self._evolution_hooks["learning_batched"] += len(fresh)
+                self._evolution_learning_digest_proposals += created
+                self._evolution_learning_auto_writes += learned
+                await self._mark_learning_evidence_seen(fresh)
+                return {"batched": len(fresh), "proposals": created, "learned": learned}
+
             try:
                 proposal = await engine.propose(self._digest_note(fresh, pending))
             except Exception as exc:  # noqa: BLE001 - learning never blocks a reply
@@ -1365,7 +1414,10 @@ class LeoApp:
             try:
                 # The same one-digest-per-scan path serves startup replay and
                 # the periodic scheduler backstop: no raw per-turn proposals.
-                counts["learning"] = (await self._scan_learning_batch()).get("proposals", 0)
+                outcome = await self._scan_learning_batch()
+                counts["learning"] = int(outcome.get("proposals", 0)) + int(
+                    outcome.get("learned", 0)
+                )
             except Exception as exc:  # noqa: BLE001 - catch-up is best effort
                 _LOG.warning("learning catch-up failed", extra={"error": str(exc)})
         self._evolution_hooks["catchup"] += 1
@@ -1480,6 +1532,7 @@ class LeoApp:
                     "proposals_batched": self._evolution_proposals_batched,
                     "batched": self._evolution_proposals_batched,
                     "digest_proposals": self._evolution_learning_digest_proposals,
+                    "auto_writes": self._evolution_learning_auto_writes,
                     "scans": self._evolution_learning_scans,
                     "scan_interval": _EVOLUTION_SCAN_EVERY,
                     "pending_hints": len(self._evolution_learning_pending),

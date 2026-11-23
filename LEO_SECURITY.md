@@ -37,6 +37,14 @@ scoping would require a schema/identity migration and is not implemented.
   `sed -i`, `git push`, …) and path arguments outside allowed roots. It is a
   command policy, not an OS sandbox; `security.allowed_executables` is an
   explicit operator opt-in.
+- **Learning**: notes are derived only from LEO's own durable transcripts
+  (explicit operator statements, bounded tool/run trajectories) and source text
+  that fails the secret or instruction-shape sanitizer never becomes a note.
+  Every note carries evidence hashes and is deduplicated before the write.
+  `external`/chat-injected sources are ineligible; chat text is never promoted
+  to `FACT`; superseding an existing memory is always approval-bound. The
+  shipped policy writes eligible notes unattended, and
+  `learning.auto_notes.enabled: false` restores the HIGH-risk approval gate.
 - **Integrations**: new integrations start with minimum permissions; the
   factory refuses unknown licenses/unsafe execution primitives pending review.
 - **Agent isolation**: parallel coding agents use Git worktrees and changes are

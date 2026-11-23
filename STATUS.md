@@ -18,6 +18,12 @@ narrative changelog.
   context budget. The transcript is never rewritten.
 - Vision: image attachments route to providers that declare the `vision`
   capability and reach the model as image content blocks.
+- Autonomous memory learning: notes derived from the operator's own durable
+  history (explicit statements, bounded tool/run trajectories) are written with
+  evidence hashes after the secret/injection sanitizer; `learning.auto_notes`
+  in `leo.yaml` controls source kinds and categories, and setting
+  `learning.auto_notes.enabled: false` restores a HIGH-risk approval for every
+  note. Superseding an existing memory always requires an approval.
 - Local-first security model: loopback bind by default, `LEO_API_TOKEN`
   required for any non-loopback bind, HIGH-risk actions gated by approvals.
 
