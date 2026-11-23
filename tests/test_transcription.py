@@ -126,6 +126,7 @@ async def test_transcribe_audio_uses_chat_completions_and_extracts_text(monkeypa
         "_transport",
         lambda: ("https://gw.example", "tok", {"Authorization": "Bearer tok"}),
     )
+    monkeypatch.delenv(transcription.AUDIO_BLOCK_ENV, raising=False)
     client = _Client(
         _Response(payload={"choices": [{"message": {"content": " hello "}}]})
     )
@@ -138,10 +139,37 @@ async def test_transcribe_audio_uses_chat_completions_and_extracts_text(monkeypa
     url, payload, headers = client.calls[0]
     assert url == "https://gw.example/v1/chat/completions"
     assert payload["model"] == transcription.DEFAULT_MODEL
-    assert payload["messages"][0]["content"][1]["image_url"]["url"].startswith(
-        "data:audio/wav;base64,"
-    )
+    block = payload["messages"][0]["content"][1]
+    assert block["type"] == "input_audio"
+    assert block["input_audio"]["format"] == "wav"
+    assert block["input_audio"]["data"] == "YXVkaW8tYnl0ZXM="
     assert headers["Authorization"] == "Bearer tok"
+
+
+def test_default_model_is_the_cheap_audio_model() -> None:
+    """Never default to a premium multimodal model for a voice note."""
+    assert transcription.DEFAULT_MODEL == "mimo-v2.6-flash"
+
+
+async def test_image_url_audio_block_is_opt_in(monkeypatch) -> None:
+    """The legacy data-URL shape is available, but only when asked for."""
+    monkeypatch.setenv(transcription.AUDIO_BLOCK_ENV, "image_url")
+    monkeypatch.setattr(
+        transcription,
+        "_transport",
+        lambda: ("https://gw.example", "tok", {}),
+    )
+    client = _Client(
+        _Response(payload={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    await transcription.transcribe_audio(
+        b"audio-bytes", "audio/ogg", "voice.ogg", client=client
+    )
+
+    block = client.calls[0][1]["messages"][0]["content"][1]
+    assert block["type"] == "image_url"
+    assert block["image_url"]["url"].startswith("data:audio/ogg;base64,")
 
 
 async def test_transcribe_audio_failures_return_none(monkeypatch) -> None:

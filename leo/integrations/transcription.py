@@ -3,18 +3,22 @@
 Telegram voice notes arrive as an opaque audio file with no text. This module
 turns the downloaded bytes into text through the same model gateway LEO
 already uses for chat, so no separate STT service or local model is required.
-The audio is sent as a base64 data URL in an ``image_url`` content block: that
-is the portable shape the gateway accepts for audio-bearing models (the
-dedicated ``input_audio``/``audio`` block types are rejected there).
+The audio is sent as the standard OpenAI ``input_audio`` content block, which
+the gateway's Chat Completions surface accepts for audio-capable models. A
+provider that only accepts the older data-URL workaround (for example a
+``gemini`` model) can be selected with ``LEO_STT_AUDIO_BLOCK=image_url``.
 
 LEO's gateway exposes two surfaces on one base: Anthropic Messages at
-``/anthropic`` and OpenAI Chat Completions at the gateway root. The audio data
-URL is only accepted by the OpenAI surface — the Anthropic path rejects it with
-"content type image_url requires a native Anthropic Messages target" — so an
-``anthropic-compatible`` provider is mapped to its sibling OpenAI root. No
+``/anthropic`` and OpenAI Chat Completions at the gateway root. Audio is only
+accepted by the OpenAI surface — the Anthropic path rejects an audio data URL
+with "content type image_url requires a native Anthropic Messages target" — so
+an ``anthropic-compatible`` provider is mapped to its sibling OpenAI root. No
 endpoint is invented: with no configured provider, transcription is skipped.
-The model defaults to ``gemini-4-argon``; set ``LEO_STT_MODEL`` to pin another
-audio-capable model.
+
+The default model is ``mimo-v2.6-flash``: it declares ``audio/ogg`` input (the
+Telegram voice format) and costs $0.14/$0.28 per million tokens. ``gemini-4-argon``
+also works but costs $2/$10 per million, so it is never selected implicitly;
+pin it only with ``LEO_STT_MODEL`` and ``LEO_STT_AUDIO_BLOCK=image_url``.
 
 Credentials are read by environment-variable *name* at call time; no token value
 is stored or logged. A failed transcription returns ``None`` so the caller can
@@ -32,7 +36,10 @@ import httpx
 
 _LOG = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-4-argon"
+# Cheap and audio-capable (ogg/mp3/wav/flac/mp4): $0.14 input / $0.28 output
+# per million tokens. A premium multimodal model is opt-in via LEO_STT_MODEL.
+DEFAULT_MODEL = "mimo-v2.6-flash"
+AUDIO_BLOCK_ENV = "LEO_STT_AUDIO_BLOCK"
 DEFAULT_PROMPT = (
     "Transcribe this voice note exactly as spoken. Reply with only the spoken "
     "words - no commentary, no quotes, no translation. Preserve the speaker's "
@@ -141,14 +148,28 @@ async def transcribe_audio(
         _LOG.warning("voice transcription skipped: no usable OpenAI-compatible provider")
         return None
     model = model or os.getenv("LEO_STT_MODEL") or DEFAULT_MODEL
-    data_url = f"data:audio/{_audio_format(mime, name)};base64,{base64.b64encode(raw).decode('ascii')}"
+    audio_format = _audio_format(mime, name)
+    encoded = base64.b64encode(raw).decode("ascii")
+    # OpenAI's standard audio block. Some providers only accept the older
+    # data-URL workaround; that is an explicit operator choice, never a default.
+    block_mode = (os.getenv(AUDIO_BLOCK_ENV) or "input_audio").strip().lower()
+    if block_mode == "image_url":
+        audio_block: dict[str, Any] = {
+            "type": "image_url",
+            "image_url": {"url": f"data:audio/{audio_format};base64,{encoded}"},
+        }
+    else:
+        audio_block = {
+            "type": "input_audio",
+            "input_audio": {"data": encoded, "format": audio_format},
+        }
     payload = {
         "model": model,
         "messages": [{
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt or DEFAULT_PROMPT},
-                {"type": "image_url", "image_url": {"url": data_url}},
+                audio_block,
             ],
         }],
     }
