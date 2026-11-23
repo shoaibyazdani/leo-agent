@@ -71,12 +71,26 @@ def test_smart_risk_classification() -> None:
         "git status", "git diff --stat", "pytest -q", "python -m pytest -q",
         "npm test", "ls -la", "grep -n foo file.txt", "git status | head",
         "pytest && git diff",
+        # read-only inspection that used to escalate on every occurrence
+        "journalctl -u leo-brain --since 09:00", "systemctl status leo-brain",
+        "sqlite3 db 'SELECT count(*) FROM kv'", "ps aux", "ss -lntp",
+        "curl -s https://127.0.0.1:8765/health", "find leo -name '*.py'",
+        "sed -n '1,20p' leo/core/app.py", "rg -n selfheal leo",
     ):
         assert risk("shell", {"command": command}, settings) is RiskLevel.LOW, command
     for command in (
-        "rm -rf build", "touch marker", "python -c 'print(1)'", "node -e '1'",
-        "git push origin main", "git branch -D old", "git add .", "curl https://x",
-        "unknown-binary --x", "echo x > file", "pytest; rm -rf build",
+        # bounded, audited writes: they run, and the audit row says why
+        "touch marker", "mkdir -p build", "git add .", "git commit -m 'x'",
+        "systemctl restart leo-brain", "sqlite3 db 'DELETE FROM kv'",
+        "cp a b", "curl -o out.html https://x",
+    ):
+        assert risk("shell", {"command": command}, settings) is RiskLevel.MEDIUM, command
+    for command in (
+        # destructive, arbitrary-code or unreversible: still ask
+        "rm -rf build", "python -c 'print(1)'", "node -e '1'",
+        "git reset --hard", "git clean -fd", "git push --force origin main",
+        "git branch -D old", "unknown-binary --x", "echo x > file",
+        "pytest; rm -rf build", "chmod -R 777 .",
     ):
         assert risk("shell", {"command": command}, settings) is RiskLevel.HIGH, command
 
@@ -111,12 +125,22 @@ async def test_shell_tool_smart_off_manual_and_hardline(shell_env) -> None:
     assert not hardline.success and hardline.decision == "denied"
     assert "hardline" in (hardline.error or "")
 
+    # A bounded write runs under MEDIUM: recorded, no human tap.
+    bounded = await env.executor.execute(ToolCall(
+        name="shell", arguments={"command": "touch marker", "cwd": str(env.tmp_path)},
+        actor="tester",
+    ))
+    assert bounded.success and (env.tmp_path / "marker").exists()
+    assert bounded.risk is RiskLevel.MEDIUM
+
+    # A destructive command still asks, and nothing runs before the approval.
+    (env.tmp_path / "keep.txt").write_text("x", encoding="utf-8")
     with pytest.raises(ApprovalRequired):
         await env.executor.execute(ToolCall(
-            name="shell", arguments={"command": "touch marker", "cwd": str(env.tmp_path)},
+            name="shell", arguments={"command": "rm -rf keep.txt", "cwd": str(env.tmp_path)},
             actor="tester",
         ))
-    assert not (env.tmp_path / "marker").exists()
+    assert (env.tmp_path / "keep.txt").exists()
 
     env.settings.security.shell_mode = "manual"
     with pytest.raises(ApprovalRequired):

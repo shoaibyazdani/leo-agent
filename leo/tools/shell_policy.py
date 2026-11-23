@@ -126,20 +126,10 @@ def preflight(tool_name: str, arguments: dict[str, object], settings: Settings) 
 
 
 def risk(tool_name: str, arguments: dict[str, object], settings: Settings) -> RiskLevel:
-    """Per-command risk used by the executor's approval gate."""
+    """Per-command risk used by the executor's approval gate (thin wrapper)."""
     if tool_name != SHELL_TOOL:
         return RiskLevel.LOW
-    shell = settings.security
-    if not shell.shell_enabled:
-        return RiskLevel.HIGH
-    command = str(arguments.get("command") or "")
-    if preflight(tool_name, arguments, settings):
-        return RiskLevel.HIGH
-    if shell.shell_mode == "off":
-        return RiskLevel.LOW
-    if shell.shell_mode == "manual":
-        return RiskLevel.HIGH
-    return RiskLevel.LOW if _smart_safe(command) else RiskLevel.HIGH
+    return assess_command(str(arguments.get("command") or ""), settings)[0]
 
 
 def _smart_safe(command: str) -> bool:
@@ -275,3 +265,197 @@ def _git_safe(args: list[str]) -> bool:
     if sub == "reflog":
         return not rest or rest[0] in {"show", "exists"}
     return True
+
+
+# ---------------------------------------------------------------------------
+# Three-tier assessment (LOW runs · MEDIUM runs and is audited · HIGH asks)
+#
+# The boolean classifier above answered one question: "is this exactly a known
+# read-only command?" Everything else escalated. In practice that asked a human
+# about `journalctl -u leo-brain`, `sqlite3 db "SELECT …"` and `systemctl status`,
+# so approvals said more about the allowlist's coverage than about risk.
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_COMMANDS = frozenset(
+    {
+        "base64", "column", "comm", "env", "free", "hostname",
+        "id", "jq", "journalctl", "md5sum", "pgrep", "printenv", "ps", "sha1sum",
+        "sha256sum", "ss", "type", "uname", "uptime", "xargs", "zgrep",
+    }
+)
+
+_MUTATING_COMMANDS = frozenset(
+    {
+        "chgrp", "chmod", "cp", "install", "ln", "mkdir", "mkfifo", "mv",
+        "pip", "pip3", "printf", "tee", "touch", "unzip", "zip", "tar",
+    }
+)
+
+_DESTRUCTIVE_COMMANDS = frozenset(
+    {
+        "chown", "dd", "kill", "killall", "mkfs", "mount", "pkill", "reboot",
+        "rm", "rmdir", "shred", "shutdown", "swapoff", "swapon", "truncate",
+        "umount", "useradd", "userdel", "usermod",
+    }
+)
+
+_READ_ONLY_SYSTEMCTL = frozenset(
+    {
+        "cat", "is-active", "is-enabled", "is-failed", "list-jobs", "list-sockets",
+        "list-timers", "list-unit-files", "list-units", "show", "status",
+    }
+)
+_MUTATING_SYSTEMCTL = frozenset(
+    {"daemon-reload", "disable", "enable", "reload", "reset-failed", "restart", "start", "stop", "try-restart"}
+)
+_DESTRUCTIVE_SYSTEMCTL = frozenset({"halt", "kexec", "mask", "poweroff", "reboot", "rescue", "suspend", "unmask"})
+
+_SQL_WRITE = re.compile(r"(?i)\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|VACUUM|REINDEX)\b")
+_HTTP_WRITE_FLAGS = ("-o", "-O", "-d", "-F", "-T", "-X", "--data", "--upload-file", "--output", "--form")
+_AWK_EXEC = re.compile(r"(?i)\bsystem\s*\(|\bENVIRON\b|\|")
+
+
+def _systemctl_tier(args: list[str]) -> tuple[RiskLevel, str]:
+    words = [arg for arg in args if not arg.startswith("-")]
+    sub = words[0] if words else ""
+    if sub in _DESTRUCTIVE_SYSTEMCTL:
+        return RiskLevel.HIGH, f"systemctl {sub} changes host power/unit policy"
+    if sub in _MUTATING_SYSTEMCTL:
+        return RiskLevel.MEDIUM, f"systemctl {sub} restarts a service"
+    if sub in _READ_ONLY_SYSTEMCTL or not sub:
+        return RiskLevel.LOW, "systemctl status read-out"
+    return RiskLevel.HIGH, f"unclassified systemctl verb ({sub})"
+
+
+def _sqlite_tier(args: list[str]) -> tuple[RiskLevel, str]:
+    statement = " ".join(args[1:]) if len(args) > 1 else ""
+    if _SQL_WRITE.search(statement):
+        return RiskLevel.MEDIUM, "sqlite write statement"
+    if statement.strip() or len(args) >= 2:
+        return RiskLevel.LOW, "sqlite read-only query"
+    return RiskLevel.HIGH, "interactive sqlite shell"
+
+
+def _http_tier(name: str, args: list[str]) -> tuple[RiskLevel, str]:
+    if any(arg == flag or arg.startswith(flag + "=") for arg in args for flag in _HTTP_WRITE_FLAGS):
+        return RiskLevel.MEDIUM, f"{name} downloads or posts"
+    return RiskLevel.LOW, f"{name} fetch"
+
+
+def _awk_tier(args: list[str]) -> tuple[RiskLevel, str]:
+    program = " ".join(args)
+    if _AWK_EXEC.search(program):
+        return RiskLevel.HIGH, "awk can execute or pipe into a shell"
+    return RiskLevel.MEDIUM, "awk program is evaluated, not inspected"
+
+
+_TIER_HANDLERS = {
+    "systemctl": _systemctl_tier,
+    "service": _systemctl_tier,
+    "sqlite3": _sqlite_tier,
+    "curl": lambda args: _http_tier("curl", args),
+    "wget": lambda args: _http_tier("wget", args),
+    "awk": _awk_tier,
+    "gawk": _awk_tier,
+    "journalctl": lambda _args: (RiskLevel.LOW, "journal read-out"),
+}
+
+
+_INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "bash", "sh", "zsh", "php"})
+
+
+def _write_tier(name: str, args: list[str]) -> tuple[RiskLevel, str]:
+    if name in _INTERPRETERS:
+        return RiskLevel.HIGH, f"{name} runs arbitrary code"
+    if name == "git":
+        joined = " ".join(args)
+        destructive = (
+            "--force" in args
+            or "-f" in args
+            or args[:1] == ["clean"]
+            or ("reset" in args and "--hard" in args)
+            or ("push" in args and any(arg.startswith("--force") for arg in args))
+        )
+        if "branch" in args and any(arg in {"-d", "-D", "--delete"} for arg in args):
+            return RiskLevel.HIGH, "git branch deletion can lose commits"
+        if destructive:
+            return RiskLevel.HIGH, "git history or remote rewrite"
+        return RiskLevel.MEDIUM, "git write operation"
+    if name in {"pip", "pip3"} and args[:1] in (["uninstall"],):
+        return RiskLevel.HIGH, "removes an installed package"
+    if name == "chmod" and any(arg in {"-R", "--recursive"} for arg in args):
+        return RiskLevel.HIGH, "recursive permission change"
+    return RiskLevel.MEDIUM, f"{name} writes"
+
+
+def _segment_tier(segment: str) -> tuple[RiskLevel, str]:
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return RiskLevel.HIGH, "unparseable command"
+    if not tokens:
+        return RiskLevel.LOW, "empty segment"
+    while tokens and _ENV_ASSIGN.match(tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return RiskLevel.LOW, "environment assignment only"
+    if tokens[0] == "env":
+        tokens.pop(0)
+        while tokens and (_ENV_ASSIGN.match(tokens[0]) or tokens[0] == "-i"):
+            tokens.pop(0)
+        if not tokens:
+            return RiskLevel.LOW, "environment read-out"
+    if tokens[0] in {"command", "builtin"}:
+        tokens.pop(0)
+        if tokens and tokens[0] in {"-v", "-V"}:
+            return RiskLevel.LOW, "command lookup"
+        if not tokens:
+            return RiskLevel.LOW, "command lookup"
+    if tokens[0] in {"sudo", "doas", "su", "eval", "exec"}:
+        return RiskLevel.HIGH, f"{tokens[0]} escalates privileges"
+    name = PurePath(tokens[0]).name
+    args = tokens[1:]
+    if name in _SAFE_COMMANDS:
+        return RiskLevel.LOW, f"{name} is read-only"
+    if name in _SAFE_REINTERPRETED:
+        if _reinterpreted_safe(name, args):
+            return RiskLevel.LOW, f"{name} read-only form"
+        return _write_tier(name, args)
+    handler = _TIER_HANDLERS.get(name)
+    if handler is not None:
+        return handler(args)
+    if name in _MUTATING_COMMANDS:
+        return _write_tier(name, args)
+    if name in _READ_ONLY_COMMANDS:
+        return RiskLevel.LOW, f"{name} is read-only"
+    if name in _DESTRUCTIVE_COMMANDS:
+        return RiskLevel.HIGH, f"{name} is destructive"
+    return RiskLevel.HIGH, f"unclassified command ({name})"
+
+
+def assess_command(command: str, settings: Settings) -> tuple[RiskLevel, str]:
+    """Return ``(risk, reason)`` for one shell command line."""
+    shell = settings.security
+    if not shell.shell_enabled:
+        return RiskLevel.HIGH, "shell disabled by security.shell_enabled"
+    if shell.shell_mode == "off":
+        return RiskLevel.LOW, "shell policy off"
+    if shell.shell_mode == "manual":
+        return RiskLevel.HIGH, "shell policy manual: every command asks"
+    text = _DEVNULL_REDIRECT.sub("", str(command or ""))
+    if not text.strip():
+        return RiskLevel.LOW, "empty command"
+    denial = _hardline(text)
+    if denial:
+        return RiskLevel.HIGH, f"hardline blocklist: {denial}"
+    if "$(" in text or "`" in text or _REDIRECT.search(text):
+        return RiskLevel.HIGH, "command substitution or redirection"
+    segments = [part.strip() for part in _SEGMENT_SPLIT.split(text) if part.strip()]
+    decision: tuple[RiskLevel, str] = (RiskLevel.LOW, "read-only command line")
+    for segment in segments:
+        tier, reason = _segment_tier(segment)
+        if tier is RiskLevel.HIGH:
+            return RiskLevel.HIGH, reason
+        if tier is RiskLevel.MEDIUM:
+            decision = (RiskLevel.MEDIUM, reason)
+    return decision

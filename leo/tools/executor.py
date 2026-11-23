@@ -19,8 +19,9 @@ from ..contracts import RiskLevel, ToolCall, ToolResult, new_id, utcnow
 from ..events import Event, EventBus
 from ..logging import get_logger
 from ..security.permissions import ApprovalRequired, PermissionManagerImpl, arguments_digest
+from ..security.risk_policy import assess_call
 from .registry import ToolRegistration, ToolRegistry, _validate_value
-from .shell_policy import preflight as shell_preflight, risk as shell_risk
+from .shell_policy import preflight as shell_preflight
 
 _LOG = get_logger("tools")
 
@@ -552,15 +553,16 @@ class ToolExecutorImpl:
         effective_grants = self._caller_grants(call, grants, granted_permissions)
         registration = self.registry.get(call.name)
         risk = registration.spec.risk if registration else RiskLevel.LOW
-        if registration is not None and call.name == "shell":
-            # Per-command policy: safe commands are LOW, risky or
-            # unknown commands are HIGH (approval), and mode: off is LOW.
-            risk = shell_risk(call.name, call.arguments, self.settings)
+        risk_reason = "registered tool tier"
+        if registration is not None:
+            # Per-call policy: read-only work and bounded writes do not need a
+            # human tap; destructive, credential and self-modifying work does.
+            risk, risk_reason = assess_call(call.name, call.arguments, risk, self.settings)
         task_key = self._quota_key(call)
         decision = "not_evaluated"
         error: str | None = None
         output: Any = None
-        metadata: dict[str, Any] = {}
+        metadata: dict[str, Any] = {"risk_reason": risk_reason}
         success = False
         raised: BaseException | None = None
         resource: str | None = None
