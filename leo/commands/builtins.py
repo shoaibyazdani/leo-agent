@@ -838,6 +838,18 @@ async def restart_command(ctx: CommandContext) -> CommandResult:
             f"Restart the process that runs 'leo serve' manually (targets: {', '.join(units)}).",
             {"units": units, "scheduled": False},
         )
+    # Whoever asked gets told when the process is actually back.
+    from ..core.restart_notice import mark_restart_pending
+
+    target = None
+    if ctx.conversation_id:
+        target = await db.fetchone(
+            "SELECT channel, subject FROM conversations WHERE id=?", (ctx.conversation_id,)
+        )
+    if target is not None:
+        await mark_restart_pending(
+            str(target["channel"] or ""), str(target["subject"] or ""), units=units
+        )
     if not _spawn_restart(units, delay):
         return _summary(
             ctx, "restart",

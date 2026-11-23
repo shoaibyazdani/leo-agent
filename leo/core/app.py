@@ -548,6 +548,23 @@ class LeoApp:
         self._evolution_last_catchup = asyncio.get_running_loop().time()
         await self.events.emit("app.initialized", version="0.1.0")
         self.initialized = True
+        # A requested restart answers for itself: /restart replies before it
+        # dies, so the boot that comes back is the only proof it worked. Adapters
+        # register after this point, so the notice waits for one instead of
+        # blocking boot or dropping the message.
+        from .restart_notice import (
+            _previous_boot_was_recent,
+            announce_restart_if_pending,
+            record_boot,
+        )
+
+        # Read the previous stamp before overwriting it, so "this boot followed
+        # one minutes ago" is a fact rather than a race with the notice task.
+        restarted = await _previous_boot_was_recent()
+        await record_boot()
+        asyncio.create_task(
+            announce_restart_if_pending(self, wait_seconds=120, restarted=restarted)
+        )
         _LOG.info("LEO initialized", extra={"db": str(self.settings.db_path)})
         return self
 
