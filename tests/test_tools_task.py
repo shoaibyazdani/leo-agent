@@ -16,7 +16,7 @@ from leo.tasks.engine import DurableTaskEngine
 from leo.tools import ToolExecutorImpl, ToolRegistry
 from leo.tools import task_tools
 
-EXPECTED = ["task_create", "task_list", "task_status", "task_cancel", "task_result"]
+EXPECTED = ["task_create", "task_list", "task_status", "task_progress", "task_cancel", "task_result"]
 
 
 @pytest.fixture
@@ -65,8 +65,8 @@ async def test_register_typed_specs(env):
     risks = {spec.name: spec.risk for spec in env.registry.list_specs()}
     assert risks == {
         "task_create": RiskLevel.MEDIUM, "task_list": RiskLevel.LOW,
-        "task_status": RiskLevel.LOW, "task_cancel": RiskLevel.MEDIUM,
-        "task_result": RiskLevel.LOW,
+        "task_status": RiskLevel.LOW, "task_progress": RiskLevel.LOW,
+        "task_cancel": RiskLevel.MEDIUM, "task_result": RiskLevel.LOW,
     }
     for name in ("task_status", "task_cancel", "task_result"):
         schema = env.registry.get(name).spec.input_schema

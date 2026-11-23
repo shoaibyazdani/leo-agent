@@ -654,7 +654,13 @@ class DurableTaskEngine:
         return task
 
     async def progress(self, task_id: str, note: str, **details: Any) -> TaskRecord:
-        """Record progress in task history and emit ``task.progress``."""
+        """Record progress in task history and emit ``task.progress``.
+
+        Iteration facts (``iteration``, ``max_iterations``) travel on the event
+        too, not only into history: the chat bridge renders `iter 3/10` from
+        them. Unknown detail keys stay history-only — the event stays small and
+        the renderer never invents a place for them.
+        """
         task = await self._load(task_id)
         self._ensure_mutable(task, "record progress on")
         step = details.pop("step", details.pop("current_step", None))
@@ -662,7 +668,14 @@ class DurableTaskEngine:
             task.current_step = int(step)
         _history(task, "progress", note=note, **details)
         await self._save(task)
-        await self._emit("task.progress", task, note=note, current_step=task.current_step)
+        event_details = {
+            key: details[key]
+            for key in ("iteration", "max_iterations")
+            if details.get(key) is not None
+        }
+        await self._emit(
+            "task.progress", task, note=note, current_step=task.current_step, **event_details
+        )
         return task
 
     async def checkpoint(self, task_id: str, state: dict[str, Any]) -> TaskRecord:
@@ -1177,6 +1190,7 @@ class DurableTaskEngine:
             "task_id": task.id,
             "objective": task.objective,
             "owner_agent": task.owner_agent,
+            "status": task.status.value,
             "schedule_payload": dict(payload) if isinstance(payload, Mapping) else None,
             "notify_targets": dict(targets),
             "delivery_targets": dict(targets),

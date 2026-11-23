@@ -290,6 +290,14 @@ class ProgressConfig(BaseModel):
             "git_*", "browser_navigate",
         ]
     )
+    # A background task is silent by nature: the operator walked away. This is
+    # the ceiling on that silence, measured from the last real step. It is a
+    # heartbeat, not fake progress: the message refreshes elapsed time and the
+    # steps already done, and never invents a percentage.
+    task_heartbeat_seconds: float = Field(default=45.0, ge=30.0, le=60.0)
+    # How many finished steps a task report keeps on screen. A task can run for
+    # hours; the tail is what the reader wants, not the whole history.
+    task_max_steps: int = Field(default=6, ge=1, le=20)
 
 
 class Settings(BaseModel):

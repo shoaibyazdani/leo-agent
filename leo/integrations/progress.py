@@ -215,6 +215,8 @@ class ProgressReporter:
         self._significant_seen = False
         self._active = True
         self._last_flush = 0.0
+        self._loop_iteration = None
+        self._loop_max = None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # no running loop: report on the next explicit flush
@@ -278,6 +280,28 @@ class ProgressReporter:
             # whole interval. Later steps must respect the throttle: forcing a
             # flush per step is what produced a progress message per tool call.
             self._last_flush = 0.0
+
+    def set_iteration(self, iteration: int, *, max_iterations: int | None = None) -> None:
+        """Declare an iterative execution context, e.g. `iter 3/10`.
+
+        Iteration numbers are facts the caller already has; a percentage would
+        be invented, because most objectives have no measurable completion
+        metric. ``iteration`` without a maximum still renders (`iter 3`), which
+        stays truthful.
+        """
+        self._loop_iteration = max(0, int(iteration))
+        if max_iterations is not None:
+            self._loop_max = max(0, int(max_iterations))
+
+    def _iteration_line(self) -> str:
+        """`iter 3/10 · ` appended to the status line, or ''."""
+        current = getattr(self, "_loop_iteration", None)
+        if current is None:
+            return ""
+        limit = getattr(self, "_loop_max", None)
+        if limit:
+            return f"iter {current}/{limit} · "
+        return f"iter {current} · "
 
     # -- rendering --------------------------------------------------------
     def _duration(self) -> str:
@@ -346,12 +370,19 @@ class ProgressReporter:
         done = not self._active
         failed = str(getattr(self, "_verdict", "done")) not in {"done", ""}
         counted = f"{count} step{'s' if count != 1 else ''}" if count else ""
+        loop = self._iteration_line()
         if done:
             icon = "⚠️" if failed else "✅"
             verb = "stopped" if failed else "done"
-            tail = f" · {counted}" if counted else ""
+            # Iteration stays visible on completion: "iter 7/10" in a done
+            # line tells the operator exactly how far the loop got.
+            tail = (f" · {loop}{counted}" if counted else f" · {loop.rstrip(' ·')}") if loop else (
+                f" · {counted}" if counted else ""
+            )
             return f"{icon} **{verb} in {elapsed}**{tail}"
-        tail = f" · {counted}" if counted else ""
+        tail = (f" · {loop}{counted}" if counted else f" · {loop.rstrip(' ·')}") if loop else (
+            f" · {counted}" if counted else ""
+        )
         return f"⏳ **{elapsed}**{tail}"
 
     async def _flush(self, *, force: bool = False) -> None:

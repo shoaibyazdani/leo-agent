@@ -198,6 +198,10 @@ class LeoApp:
         self.tool_roster: dict[str, list[str]] = {}
         self.attachments = AttachmentStore(self.settings)
         self._cancelled_runs: set[str] = set()
+        # Origin chat of the turn in flight: {channel, target, conversation_id}.
+        # Used by task_create(background=true) so progress reaches the chat
+        # that asked, and cleared when the turn ends.
+        self._turn_origin: dict[str, str] = {}
         self._runs: dict[str, dict[str, Any]] = {}  # live run registry for truthful cancellation
         self._active_conversations: set[str] = set()  # one live stream per conversation
         self._durable_events: dict[str, list[dict[str, Any]]] = {}
@@ -446,6 +450,11 @@ class LeoApp:
         self.compaction.memory = self.memory
         self.tasks = DurableTaskEngine(self.settings, self.events)
         self.scheduler = Scheduler(self.tasks, self.settings, self.events)
+        # Bridge task-engine events to the chat that asked for the work: one
+        # edited message per running task, exactly like the chat-turn reporter.
+        from ..tasks.reporting import TaskProgressHub
+
+        self.task_reporting = TaskProgressHub(self.gateway, self.settings, self.events)
         self.agent_registry = AgentRegistry()
         self.agent_engine = AgentEngine(
             self.agent_registry, self.tasks, self.router, self.executor, self.events, self.settings
@@ -505,6 +514,8 @@ class LeoApp:
         # Live progress on the channel that asked: one message, edited in place.
         self.progress = ProgressReporter(self.gateway, self.settings)
         services.update(progress=self.progress)
+        # Task → chat reporting subscribes once the adapters exist. Idempotent.
+        await self.task_reporting.start()
         # Only now is the adapter registry populated with enrolled channels.
         self.approval_notifier.start()
         # A pending approval that outlived its timeout is a decision nobody can
@@ -691,11 +702,58 @@ class LeoApp:
 
     async def _channel_delivery(self, task: Any, channel: str, target: Any, context: dict[str, Any]) -> Any:
         """Deliver a terminal task result to a channel target via the gateway."""
-        result = getattr(task, "result", None)
-        text = result if isinstance(result, str) else json.dumps(result, default=str)
+        status = str(context.get("status") or getattr(task, "status", "") or "")
+        # Close the live progress report first, so the finished line does not
+        # linger under the answer it was describing.
+        await self.task_reporting.on_terminal(task, status)
         return await self.gateway.send(
-            str(channel), str(target), text[:8000], subject=f"task:{getattr(task, 'id', '')}"
+            str(channel), str(target), self._task_summary(task, status),
+            subject=f"task:{getattr(task, 'id', '')}",
         )
+
+    @staticmethod
+    def _task_summary(task: Any, status: str) -> str:
+        """A completion report a human can read, not the raw result JSON.
+
+        The operator asked for work and walked away; what they need on return is
+        what happened, what it cost in time, and whether anything is left open —
+        not a serialized dict. The full result stays durable on the task row.
+        """
+        result = getattr(task, "result", None)
+        objective = str(getattr(task, "objective", "") or "").strip()
+        task_id = str(getattr(task, "id", "") or "")
+        icon = {"completed": "✅", "cancelled": "⏹", "failed": "❌"}.get(status, "•")
+        verb = {"completed": "Completed", "cancelled": "Cancelled", "failed": "Failed"}.get(
+            status, status or "Finished"
+        )
+        lines = [f"{icon} **{verb}** · `{task_id}`"]
+        if objective:
+            lines.append(f"Objective: {objective[:300]}")
+
+        # A plain string result is already the answer; a dict is summarized.
+        if isinstance(result, str) and result.strip():
+            lines.append(result.strip()[:1200])
+        elif isinstance(result, dict):
+            answer = result.get("content") or result.get("summary") or result.get("result")
+            if isinstance(answer, str) and answer.strip():
+                lines.append(answer.strip()[:1200])
+            files = result.get("files") or result.get("files_modified")
+            if isinstance(files, list) and files:
+                shown = ", ".join(str(item) for item in files[:10])
+                lines.append(f"Files: {shown}")
+            tests = result.get("tests") or result.get("tests_run")
+            if tests is not None:
+                lines.append(f"Tests: {tests}")
+
+        errors = list(getattr(task, "errors", None) or [])
+        if errors:
+            last = errors[-1]
+            detail = last.get("error") if isinstance(last, dict) else last
+            lines.append(f"Blocker: {str(detail)[:400]}")
+        evidence = getattr(task, "evidence", None) or []
+        if evidence:
+            lines.append(f"Evidence: {len(evidence)} item(s)")
+        return "\n".join(lines)[:4000]
 
     # -- approval buttons --------------------------------------------------
     def _approval_senders(self, channel: str) -> list[str]:
@@ -2029,6 +2087,12 @@ class LeoApp:
         # Live progress only where a human is watching; a CLI turn has no adapter
         # and begin() declines quietly.
         await self.progress.begin(channel, str(subject or ""), self.round_budget)
+        # The origin chat of THIS turn: a background task created inside it
+        # reports its progress here. Cleared at the end of the turn.
+        self._turn_origin = {
+            "channel": str(channel or ""), "target": str(subject or ""),
+            "conversation_id": conversation_id,
+        }
         # A stop only counts if it arrives during THIS turn: clear any leftover
         # request first, then remember when the turn started.
         await self._clear_turn_stop(conversation_id)
@@ -2356,6 +2420,11 @@ class LeoApp:
         run_id = new_id("run")
         conversation_id = conversation_id or new_id("conv")
         await self.progress.begin(channel, str(subject or ""), self.round_budget)
+        # Same origin fact for the streaming path as for ask().
+        self._turn_origin = {
+            "channel": str(channel or ""), "target": str(subject or ""),
+            "conversation_id": conversation_id,
+        }
         # A stop only counts if it arrives during THIS turn: clear any leftover
         # request first, then remember when the turn started.
         await self._clear_turn_stop(conversation_id)

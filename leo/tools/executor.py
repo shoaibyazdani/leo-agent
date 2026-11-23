@@ -460,6 +460,13 @@ class ToolExecutorImpl:
         # mapping is omitted so registration-time service injection still works.
         if self.services:
             ctx["services"] = dict(self.services)
+            # The origin chat of the turn in flight, when one is known: a
+            # background task created in this turn reports its progress there.
+            # Read once here so a tool can never mutate the app's copy.
+            app = self.services.get("app")
+            origin = getattr(app, "_turn_origin", None)
+            if isinstance(origin, dict) and origin:
+                ctx["origin_context"] = dict(origin)
         return ctx
 
     @staticmethod

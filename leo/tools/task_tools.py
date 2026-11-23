@@ -135,15 +135,54 @@ def _engine(ctx: dict[str, Any], registered_services: Any = None) -> Any:
 
 async def _create(args: dict[str, Any], ctx: dict[str, Any], services: Any = None) -> Any:
     engine = _engine(ctx, services)
+    metadata = dict(args.get("metadata") or {})
+    if args.get("background"):
+        # The chat that asked for background work is where progress belongs.
+        # The executor injects the live conversation/channel under
+        # ``origin_context``; writing it into metadata gives the progress hub,
+        # the delivery path and post-restart recovery the same origin fact.
+        origin = dict(ctx.get("origin_context") or {})
+        if origin:
+            metadata.setdefault("origin", {
+                "channel": str(origin.get("channel") or ""),
+                "target": str(origin.get("target") or ""),
+                "conversation_id": str(origin.get("conversation_id") or ""),
+            })
     task = await engine.create(
         objective=args["objective"],
         plan=list(args.get("plan") or []),
         dependencies=list(args.get("dependencies") or []),
         owner_agent=args.get("owner_agent"),
         resource_limits=dict(args.get("resource_limits") or {}),
-        metadata=dict(args.get("metadata") or {}),
+        metadata=metadata,
         idempotency_key=args.get("idempotency_key"),
     )
+    return _task_view(task)
+
+
+async def _task_progress(
+    args: dict[str, Any], ctx: dict[str, Any], services: Any = None
+) -> Any:
+    """Record a progress note from inside a running task.
+
+    The model (or a worker) uses this to say what it is about to do; the hub
+    relays it to the origin chat and the engine keeps it in durable history.
+    Iteration facts must be real: pass ``iteration`` only when the work is
+    actually iterative, and ``max_iterations`` only when the bound is known.
+    """
+    engine = _engine(ctx, services)
+    note = str(args["note"]).strip()
+    details: dict[str, Any] = {}
+    iteration = args.get("iteration")
+    if iteration is not None:
+        details["iteration"] = max(0, int(iteration))
+    maximum = args.get("max_iterations")
+    if maximum is not None:
+        details["max_iterations"] = max(0, int(maximum))
+    step = args.get("step")
+    if step is not None:
+        details["step"] = int(step)
+    task = await engine.progress(args["task_id"], note, **details)
     return _task_view(task)
 
 
@@ -242,6 +281,12 @@ _TOOL_DEFS: list[tuple[ToolSpec, Any]] = [
             input_schema=_schema(
                 {
                     "objective": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "background": {
+                        "type": "boolean",
+                        "description": (
+                            "Run in the background and report live progress to this chat."
+                        ),
+                    },
                     "plan": _PLAN_ARRAY,
                     "dependencies": _PLAN_ARRAY,
                     "owner_agent": {"type": "string", "minLength": 1},
@@ -292,6 +337,31 @@ _TOOL_DEFS: list[tuple[ToolSpec, Any]] = [
             resource_field="",
         ),
         _status,
+    ),
+    (
+        ToolSpec(
+            name="task_progress",
+            description=(
+                "Record a progress note on a running task: what is about to happen, or the "
+                "iteration reached. Pass iteration/max_iterations only for genuinely "
+                "iterative work; never invent a percentage."
+            ),
+            category="tasks",
+            risk=RiskLevel.LOW,
+            permissions=["tasks:write"],
+            input_schema=_schema(
+                {
+                    "task_id": _TASK_ID,
+                    "note": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "iteration": {"type": "integer", "minimum": 0},
+                    "max_iterations": {"type": "integer", "minimum": 1},
+                    "step": {"type": "integer", "minimum": 0},
+                },
+                ["task_id", "note"],
+            ),
+            resource_field="",
+        ),
+        _task_progress,
     ),
     (
         ToolSpec(
