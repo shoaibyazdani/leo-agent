@@ -673,10 +673,13 @@ class AnthropicProvider(BaseHTTPProvider):
     def _messages(self, request: ModelRequest) -> tuple[str | None, list[dict[str, Any]]]:
         system_parts: list[str] = []
         messages: list[dict[str, Any]] = []
+        declared: set[str] = set()
         for message in request.messages:
             if message.role == "system":
                 system_parts.append(message.content)
                 continue
+            if message.role == "assistant":
+                declared = _declared_tool_ids(message)
             if message.role == "assistant" and message.tool_calls:
                 content: list[dict[str, Any]] = []
                 if message.content:
@@ -692,14 +695,24 @@ class AnthropicProvider(BaseHTTPProvider):
                     )
                 messages.append({"role": "assistant", "content": content})
             elif message.role == "tool":
-                content = [
-                    {
+                tool_id = str(message.tool_call_id or "")
+                if tool_id and tool_id in declared:
+                    declared.discard(tool_id)  # one result per declaration
+                    messages.append({"role": "user", "content": [{
                         "type": "tool_result",
-                        "tool_use_id": str(message.tool_call_id or ""),
+                        "tool_use_id": tool_id,
                         "content": message.content,
-                    }
-                ]
-                messages.append({"role": "user", "content": content})
+                    }]})
+                else:
+                    # A strict upstream rejects the whole request when a
+                    # tool_result has no tool_use above it: "messages[9] is a
+                    # tool result, but it does not follow an assistant message
+                    # with 'tool_calls'". That surfaced as an empty turn. The
+                    # evidence still matters, so it travels as plain text.
+                    messages.append({"role": "user", "content": [
+                        {"type": "text",
+                         "text": UNPAIRED_TOOL_PREFIX + str(message.content or "")},
+                    ]})
             else:
                 if message.role == "user" and message.images:
                     content: list[dict[str, Any]] = []
@@ -864,6 +877,14 @@ class AnthropicProvider(BaseHTTPProvider):
         )
 
 
+UNPAIRED_TOOL_PREFIX = "[Unpaired tool result; kept as data, not as a tool result] "
+
+
+def _declared_tool_ids(message: Any) -> set[str]:
+    """Ids an assistant turn actually declared, so its results can be matched."""
+    return {str(call.get("id") or "") for call in (getattr(message, "tool_calls", None) or [])}
+
+
 class OpenAIProvider(BaseHTTPProvider):
     """Adapter for ``POST {base_url}/v1/chat/completions`` (Chat Completions shape)."""
 
@@ -879,7 +900,19 @@ class OpenAIProvider(BaseHTTPProvider):
 
     def _messages(self, request: ModelRequest) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
+        declared: set[str] = set()
         for message in request.messages:
+            if message.role == "assistant":
+                declared = _declared_tool_ids(message)
+            if message.role == "tool":
+                tool_id = str(message.tool_call_id or "")
+                if not tool_id or tool_id not in declared:
+                    messages.append({
+                        "role": "user",
+                        "content": UNPAIRED_TOOL_PREFIX + str(message.content or ""),
+                    })
+                    continue
+                declared.discard(tool_id)
             item: dict[str, Any] = {"role": message.role, "content": message.content}
             if message.name:
                 item["name"] = message.name
