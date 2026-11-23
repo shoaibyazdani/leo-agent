@@ -753,13 +753,19 @@ class TelegramAdapter(MessagingAdapter):
         self, target: str, message_id: str, text: str,
         reply_markup: dict[str, Any] | None = None,
     ) -> bool:
-        """Replace the text of a sent message (best effort)."""
+        """Replace the text of a sent message (best effort).
+
+        ``parse_mode`` is required here too, not only on the first send. Without
+        it the initial message renders markdown and every later edit shows the
+        raw markup, so a progress line ends up displaying its own ``**``.
+        """
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token or not message_id:
             return False
         url = f"{self.API_BASE}/bot{token}/editMessageText"
         payload: dict[str, Any] = {
             "chat_id": str(target), "message_id": str(message_id), "text": str(text),
+            "parse_mode": TELEGRAM_PARSE_MODE,
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
@@ -779,6 +785,27 @@ class TelegramAdapter(MessagingAdapter):
             description = ""
         if "not modified" in description.lower():
             return True
+        if response.status_code == 400 and _is_entity_error(response):
+            # An unbalanced `**` or stray `<` must not freeze the update at its
+            # last good text. Drop the formatting and show the text as written.
+            payload.pop("parse_mode", None)
+            try:
+                retry = await self._http().post(url, json=payload, timeout=self.timeout)
+            except httpx.HTTPError:
+                return False
+            if retry.status_code < 400:
+                return True
+            try:
+                retry_body = str((retry.json() or {}).get("description") or "")
+            except ValueError:
+                retry_body = ""
+            if "not modified" in retry_body.lower():
+                # The plain text is already there; the caller wanted this state.
+                return True
+            _LOG.debug("edit retry failed", extra={
+                "channel": self.channel, "status": retry.status_code,
+                "description": retry_body[:120]})
+            return False
         _LOG.debug("edit failed", extra={
             "channel": self.channel, "status": response.status_code,
             "description": description[:120]})

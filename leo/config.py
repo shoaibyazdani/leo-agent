@@ -280,6 +280,16 @@ class ProgressConfig(BaseModel):
     min_interval_seconds: float = Field(default=4.0, ge=0.5, le=60.0)
     max_steps: int = Field(default=6, ge=1, le=20)
     idle_seconds: float = Field(default=45.0, ge=5.0, le=600.0)
+    # A report is only worth opening for real work. A turn that answers from
+    # memory in one call must stay silent: a "done" footer under every reply
+    # reads as noise, not as progress.
+    min_steps: int = Field(default=6, ge=1, le=20)
+    significant_tools: list[str] = Field(
+        default_factory=lambda: [
+            "shell", "terminal", "patch", "write_file", "file_move", "file_copy",
+            "git_*", "browser_navigate",
+        ]
+    )
 
 
 class Settings(BaseModel):
