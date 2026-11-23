@@ -84,9 +84,8 @@ def test_keyboard_offers_approve_always_and_reject() -> None:
 
 
 def test_keyboard_omits_always_when_the_grant_cannot_be_scoped() -> None:
-    """A grant is keyed on (action, resource). With no resource, or an action
-    whose authority is in its arguments (shell), "Always" would cover every
-    future call, so the button must not be offered."""
+    """Without a resource (path tools) or an arguments digest (shell), the
+    grant would cover every future call, so the button must not be offered."""
     for keyboard in (
         build_keyboard("apr_123", "tool:shell"),
         build_keyboard("apr_123", "tool:shell", resource=None),
@@ -100,6 +99,16 @@ def test_keyboard_omits_always_when_the_grant_cannot_be_scoped() -> None:
         assert not any("Always" in text for text in labels), labels
         assert any("Approve" in text for text in labels)
         assert any("Reject" in text for text in labels)
+
+
+def test_keyboard_offers_always_for_a_shell_approval_with_a_digest() -> None:
+    """A shell approval with its exact arguments digest is safely scopable."""
+    for action in ("tool:shell", "tool:terminal"):
+        keyboard = build_keyboard(
+            "apr_123", action, resource="/project", arguments_digest="a" * 64
+        )
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        assert any("Always" in text for text in labels), labels
 
 
 def test_session_decision_survives_the_round_trip() -> None:
@@ -236,13 +245,40 @@ async def test_an_expired_grant_is_ignored(env) -> None:
 
 
 async def test_an_unscoped_grant_cannot_be_created(env) -> None:
-    """A shell call has no path resource; "Always" must not become "all shell"."""
-    with pytest.raises(ValueError, match="needs a resource"):
+    """Shell needs a digest; path tools need a resource. Neither may be NULL."""
+    with pytest.raises(ValueError, match="digest"):
         await env.permissions.grant_session("tool:shell", None, 600, OWNER)
-    with pytest.raises(ValueError, match="needs a resource"):
+    with pytest.raises(ValueError, match="digest"):
         await env.permissions.grant_session("tool:shell", "  ", 600, OWNER)
+    with pytest.raises(ValueError, match="needs a resource"):
+        await env.permissions.grant_session("tool:file_write", None, 600, OWNER)
     rows = await db.fetchall("SELECT action FROM approval_grants")
     assert rows == []
+
+
+async def test_a_shell_grant_is_scoped_to_the_exact_arguments_digest(env) -> None:
+    """Always on a shell command covers that command, not every shell call."""
+    first = await env.permissions.authorize(
+        "operator", "tool:shell", None, RiskLevel.HIGH,
+        arguments_digest="digest-one",
+    )
+    assert first.requires_approval is True
+
+    await env.permissions.grant_session(
+        "tool:shell", None, 600, OWNER, arguments_digest="digest-one",
+    )
+
+    same = await env.permissions.authorize(
+        "operator", "tool:shell", None, RiskLevel.HIGH,
+        arguments_digest="digest-one",
+    )
+    assert same.allowed is True and same.reason == "session grant"
+
+    other = await env.permissions.authorize(
+        "operator", "tool:shell", None, RiskLevel.HIGH,
+        arguments_digest="digest-two",
+    )
+    assert other.allowed is False and other.requires_approval is True
 
 
 async def test_a_legacy_unscoped_grant_never_authorizes(env) -> None:

@@ -198,9 +198,10 @@ class ApprovalNotifier:
             keyboard = build_keyboard(
                 str(payload.get("approval_id") or ""),
                 action,
-                # No resource means nothing to scope an "Always" grant to, so
-                # the button is not offered at all.
+                # Path approvals scope Always by resource; shell/terminal scope
+                # it by the exact arguments digest. Either must be present.
                 resource=payload.get("resource"),
+                arguments_digest=payload.get("arguments_digest"),
             )
             try:
                 await adapter.send(target, text, reply_markup=keyboard)
