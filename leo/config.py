@@ -146,6 +146,15 @@ class SecurityConfig(BaseModel):
     # workspace. The reference tools default to "until revoked"; 30 days is the
     # shipped middle ground and is configurable.
     workspace_trust_days: float = Field(default=30.0, ge=0.0, le=3650.0)
+    # In smart mode, ask a cheap model to review a HIGH shell call that no
+    # grant covers before bothering a human: allow once, deny with a reason, or
+    # ask. Destructive/credential/privilege/arbitrary-code reasons are never
+    # sent to the reviewer; they still require a human.
+    reviewer_enabled: bool = True
+    # Empty means the configured default chat model; set a provider key or model
+    # id to pin a cheaper reviewer.
+    reviewer_model: str = ""
+    reviewer_timeout_seconds: float = Field(default=20.0, ge=1.0, le=120.0)
     max_tool_calls_per_task: int = 200
     # Server-side ceiling: no caller hint (or configured per-task cap) may
     # exceed this value. 200 matches the legacy default cap.
@@ -539,6 +548,7 @@ class Settings(BaseModel):
                 "workspace_only", "allow_medium_risk", "high_risk_requires_approval",
                 "wait_for_approval", "approval_poll_seconds",
                 "approval_mode", "workspace_trust_days",
+                "reviewer_enabled", "reviewer_timeout_seconds",
                 "max_tool_calls_per_task", "max_tool_calls_ceiling",
             ],
             "automation": ["max_concurrent_tasks", "default_task_timeout_seconds"],
