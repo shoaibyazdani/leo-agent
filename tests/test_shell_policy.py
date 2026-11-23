@@ -96,6 +96,29 @@ def test_smart_risk_classification() -> None:
         assert risk("shell", {"command": command}, settings) is RiskLevel.HIGH, command
 
 
+def test_quoted_shell_operators_are_data_not_syntax() -> None:
+    """A quoted ``|``, ``;`` or ``>`` must not split the command or look like a write."""
+    settings = _settings("smart")
+    for command in (
+        'rg -n "MAX_MODEL_TOOL_ROUNDS|register_worker" tests/',
+        'grep -n "a;b" file | head',
+        "sqlite3 db \"select a||' | '||b from t where x between '1' and '2'\"",
+        'echo "a > b"',
+        "echo '$(id)'",
+        "ls 2>&1",
+        "git status 2>/dev/null",
+    ):
+        assert risk("shell", {"command": command}, settings) is RiskLevel.LOW, command
+    for command in (
+        'git commit -m "fix: use a|b separator"',
+        'git commit -m "docs: explain a > b"',
+    ):
+        assert risk("shell", {"command": command}, settings) is RiskLevel.MEDIUM, command
+    # Real substitution, pipes and redirects still escalate.
+    for command in ('echo "$(id)"', 'grep foo file | rm -rf build', "echo x > /etc/leo-probe"):
+        assert risk("shell", {"command": command}, settings) is RiskLevel.HIGH, command
+
+
 def test_manual_and_off_modes() -> None:
     manual = _settings("manual")
     assert risk("shell", {"command": "ls"}, manual) is RiskLevel.HIGH

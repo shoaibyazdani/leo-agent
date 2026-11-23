@@ -93,10 +93,141 @@ _SAFE_REINTERPRETED = {
     "prettier", "ruff",
 }
 
-_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 _REDIRECT = re.compile(r"(?<![0-9])>{1,2}|<")
 _DEVNULL_REDIRECT = re.compile(r"\s*(?:[0-9]?>>?|<)\s*/dev/null")
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+
+
+def _mask_quoted(text: str, *, mask_double: bool = True) -> str:
+    """Blank quoted spans in place so operators inside strings are not syntax.
+
+    A quoted ``|``, ``;`` or ``>`` is data (SQL concatenation, a regex
+    alternation, a commit message), not a pipe or redirect. Escaped characters
+    are data too. Positions are preserved, so matches here can be cut out of
+    the original string. With ``mask_double=False`` only single-quoted spans
+    and escapes are blanked, because ``$(...)`` and backticks still run inside
+    double quotes.
+    """
+    chars = list(text)
+    quote = ""
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if quote == "'":
+            chars[index] = " "
+            if char == "'":
+                quote = ""
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\" and index + 1 < length:
+                chars[index] = chars[index + 1] = " "
+                index += 2
+                continue
+            chars[index] = " "
+            if char == '"':
+                quote = ""
+            index += 1
+            continue
+        if char == "\\" and index + 1 < length:
+            chars[index] = chars[index + 1] = " "
+            index += 2
+            continue
+        if char == "'" or (char == '"' and mask_double):
+            quote = char
+            chars[index] = " "
+        index += 1
+    return "".join(chars)
+
+
+def _split_segments(text: str) -> list[str]:
+    """Split on unquoted ``&&``, ``||``, ``;`` and ``|`` only."""
+    masked = _mask_quoted(text)
+    segments: list[str] = []
+    start = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        if masked[index : index + 2] in {"&&", "||"}:
+            segments.append(text[start:index].strip())
+            index += 2
+            start = index
+            continue
+        if masked[index] in {"|", ";"}:
+            segments.append(text[start:index].strip())
+            index += 1
+            start = index
+            continue
+        index += 1
+    segments.append(text[start:].strip())
+    return [segment for segment in segments if segment]
+
+
+def _strip_devnull(text: str) -> str:
+    """Drop unquoted ``>/dev/null`` noise (quoted text is not a redirect)."""
+    masked = _mask_quoted(text)
+    pieces: list[str] = []
+    last = 0
+    for match in _DEVNULL_REDIRECT.finditer(masked):
+        pieces.append(text[last : match.start()])
+        last = match.end()
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+def _has_substitution(text: str) -> bool:
+    masked = _mask_quoted(text, mask_double=False)
+    return "$(" in masked or "`" in masked
+
+
+def _has_redirect(text: str) -> bool:
+    return bool(_REDIRECT.search(_mask_quoted(text)))
+
+
+def _redirect_targets(text: str) -> list[str]:
+    """File targets of unquoted redirects, with fd duplication skipped."""
+    masked = _mask_quoted(text)
+    targets: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if masked[index] not in "<>":
+            index += 1
+            continue
+        cursor = index + 1
+        while cursor < length and masked[cursor] in "<>":
+            cursor += 1
+        if cursor < length and masked[cursor] == "&":
+            index = cursor + 1
+            continue
+        while cursor < length and text[cursor].isspace():
+            cursor += 1
+        if cursor >= length:
+            break
+        if text[cursor] in {"'", '"'}:
+            quote = text[cursor]
+            end = cursor + 1
+            while end < length:
+                if quote == '"' and text[end] == "\\":
+                    end += 2
+                    continue
+                if text[end] == quote:
+                    break
+                end += 1
+            targets.append(text[cursor + 1 : end])
+            index = end + 1
+        else:
+            end = cursor
+            while (
+                end < length
+                and not text[end].isspace()
+                and masked[end] not in ";&|<>"
+            ):
+                end += 1
+            targets.append(text[cursor:end])
+            index = end
+    return targets
 
 
 def _hardline(command: str) -> str | None:
@@ -133,14 +264,15 @@ def risk(tool_name: str, arguments: dict[str, object], settings: Settings) -> Ri
 
 
 def _smart_safe(command: str) -> bool:
-    text = _DEVNULL_REDIRECT.sub("", command)
+    text = _strip_devnull(command)
     if not text.strip():
         return True
     # Command substitution and redirections can execute or overwrite outside
-    # the visible command; escalate them rather than guessing.
-    if "$(" in text or "`" in text or _REDIRECT.search(text):
+    # the visible command; escalate them rather than guessing. Quoted operators
+    # are data, not syntax.
+    if _has_substitution(text) or _has_redirect(text):
         return False
-    segments = [part.strip() for part in _SEGMENT_SPLIT.split(text) if part.strip()]
+    segments = _split_segments(text)
     if not segments:
         return True
     return all(_segment_safe(segment) for segment in segments)
@@ -443,10 +575,7 @@ def _redirect_is_bounded(text: str, settings: Settings) -> bool:
     roots = [settings.root.resolve()]
     roots.extend(settings.resolve(p).resolve() for p in settings.security.allowed_roots)
     roots.append(settings.resolve(settings.paths.workspaces).resolve())
-    targets: list[str] = []
-    for pattern in (r"(?<![0-9])>{1,2}\s*([^\s;&|]+)", r"(?<![0-9])<\s*([^\s;&|]+)"):
-        targets.extend(re.findall(pattern, text))
-    for raw in targets:
+    for raw in _redirect_targets(text):
         target = raw.strip("'\"")
         if not target or target.startswith("&"):
             continue  # fd duplication, e.g. 2>&1
@@ -461,7 +590,8 @@ def _redirect_is_bounded(text: str, settings: Settings) -> bool:
             return False
         if resolved == Path("/dev/null"):
             continue
-        if resolved == Path("/tmp") or Path("/tmp") in resolved.parents:
+        tmp_root = Path("/tmp").resolve()
+        if resolved == tmp_root or tmp_root in resolved.parents:
             continue
         if any(resolved == root or root in resolved.parents for root in roots):
             continue
@@ -478,18 +608,18 @@ def assess_command(command: str, settings: Settings) -> tuple[RiskLevel, str]:
         return RiskLevel.LOW, "shell policy off"
     if shell.shell_mode == "manual":
         return RiskLevel.HIGH, "shell policy manual: every command asks"
-    text = _DEVNULL_REDIRECT.sub("", str(command or ""))
+    text = _strip_devnull(str(command or ""))
     if not text.strip():
         return RiskLevel.LOW, "empty command"
     denial = _hardline(text)
     if denial:
         return RiskLevel.HIGH, f"hardline blocklist: {denial}"
-    if "$(" in text or "`" in text:
+    if _has_substitution(text):
         return RiskLevel.HIGH, "command substitution"
-    has_redirect = bool(_REDIRECT.search(text))
+    has_redirect = _has_redirect(text)
     if has_redirect and not _redirect_is_bounded(text, settings):
         return RiskLevel.HIGH, "redirection outside allowed roots"
-    segments = [part.strip() for part in _SEGMENT_SPLIT.split(text) if part.strip()]
+    segments = _split_segments(text)
     decision: tuple[RiskLevel, str] = (RiskLevel.LOW, "read-only command line")
     for segment in segments:
         tier, reason = _segment_tier(segment)
