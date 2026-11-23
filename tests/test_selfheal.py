@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -20,7 +22,13 @@ from leo.security.permissions import PermissionManagerImpl, arguments_digest
 from leo.selfheal import ACTOR, SelfHealingEngine, classify_failure
 
 
-def fixture(*, min_occurrences: int = 3, max_attempts: int = 3, settings: Settings | None = None):
+def fixture(
+    *,
+    min_occurrences: int = 3,
+    max_attempts: int = 3,
+    settings: Settings | None = None,
+    task_engine: Any = None,
+):
     settings = settings or Settings()
     bus = EventBus()
     permissions = PermissionManagerImpl(settings, bus)
@@ -43,6 +51,7 @@ def fixture(*, min_occurrences: int = 3, max_attempts: int = 3, settings: Settin
         max_backoff_seconds=10.0,
         sleep=sleep,
         now=lambda: clock[0],
+        task_engine=task_engine,
     )
     return bus, permissions, engine, clock, sleeps, captured
 
@@ -185,6 +194,104 @@ async def test_permission_denial_is_recorded_but_never_proposed() -> None:
     trail = await engine.audit_trail()
     assert sum(row["action"] == "selfheal.observe" for row in trail) == 3
     assert not any(row["action"] == "selfheal.apply" for row in trail)
+
+
+async def test_repair_is_dispatched_as_a_task_and_never_asks_for_approval() -> None:
+    """Shipped path: the repair becomes a durable task the agent fixes in a turn."""
+    tasks = StubTaskEngine()
+    bus, _permissions, engine, _clock, _sleeps, captured = fixture(task_engine=tasks)
+    for _ in range(3):
+        await fail(bus)
+
+    proposal = (await engine.proposals())[0]
+    assert proposal["status"] == "dispatched"
+    assert proposal["task_id"]
+    assert proposal["approval_id"] is None
+
+    assert len(tasks.created) == 1
+    task = tasks.created[0]
+    assert task["id"] == proposal["task_id"]
+    assert task["idempotency_key"].startswith("selfheal:")
+    assert "list_files" in task["objective"]
+    assert "invalid arguments" in task["objective"]
+    assert "patch/write_file" in task["objective"]
+    assert task["metadata"]["selfheal"]["proposal_id"] == proposal["id"]
+    # Present so the task engine treats it as dispatchable without an owner agent.
+    assert task["metadata"]["schedule_payload"] == {"source": "selfheal"}
+
+    # The whole point: no selfheal.apply approval exists to approve into a void.
+    assert await db.fetchone("SELECT id FROM approvals WHERE action='selfheal.apply'") is None
+    assert not any(event.topic == "selfheal.approval" for event in captured)
+    assert any(event.topic == "selfheal.dispatched" and event.payload["task_id"] for event in captured)
+    trail = await engine.audit_trail()
+    assert any(row["action"] == "selfheal.task" and row["decision"] == "dispatched" for row in trail)
+
+
+async def test_the_same_failure_never_queues_a_second_repair_task() -> None:
+    tasks = StubTaskEngine()
+    bus, _permissions, engine, _clock, _sleeps, _captured = fixture(task_engine=tasks)
+    for _ in range(3):
+        await fail(bus)
+    first = tasks.created[0]["idempotency_key"]
+
+    # A restarted process re-observes the same signature; the durable incident
+    # already carries a proposal, and the idempotency key is the fingerprint.
+    bus2, _p2, engine2, _c2, _s2, _cap2 = fixture(task_engine=tasks)
+    for _ in range(3):
+        await fail(bus2)
+
+    assert len(tasks.created) == 1
+    assert tasks.created[0]["idempotency_key"] == first
+    assert [p["task_id"] for p in await engine2.proposals()] == [tasks.created[0]["id"]]
+
+
+async def test_a_permission_denial_dispatches_no_repair_task() -> None:
+    tasks = StubTaskEngine()
+    bus, _permissions, engine, _clock, _sleeps, _captured = fixture(task_engine=tasks)
+    for _ in range(3):
+        await fail(
+            bus,
+            tool="read_file",
+            decision="permission_denied",
+            error="permission denied: path is outside the workspace",
+        )
+    assert tasks.calls == 0
+    assert tasks.created == []
+    assert await engine.proposals() == []
+
+
+class StubTaskEngine:
+    """Records queued repairs and dedupes like the durable task engine does."""
+
+    def __init__(self) -> None:
+        self.created: list[dict[str, Any]] = []
+        self.calls = 0
+        self._by_key: dict[str, str] = {}
+
+    async def create(
+        self,
+        objective: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        **_: Any,
+    ) -> Any:
+        self.calls += 1
+        key = str(idempotency_key or "")
+        if key and key in self._by_key:
+            return SimpleNamespace(id=self._by_key[key])
+        task_id = new_id("task")
+        if key:
+            self._by_key[key] = task_id
+        self.created.append(
+            {
+                "id": task_id,
+                "objective": objective,
+                "metadata": dict(metadata or {}),
+                "idempotency_key": key,
+            }
+        )
+        return SimpleNamespace(id=task_id)
 
 
 async def test_observation_is_idempotent_and_ignores_self_events() -> None:

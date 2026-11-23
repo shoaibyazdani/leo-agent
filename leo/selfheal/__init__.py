@@ -12,6 +12,7 @@ Public entry point: :class:`leo.selfheal.engine.SelfHealingEngine`.
 from .engine import (
     ACTION_APPLY,
     ACTION_ROLLBACK,
+    ACTION_TASK,
     ACTOR,
     NO_PROPOSAL_KINDS,
     RETRYABLE_KINDS,
@@ -27,6 +28,7 @@ from .engine import (
 __all__ = [
     "ACTION_APPLY",
     "ACTION_ROLLBACK",
+    "ACTION_TASK",
     "ACTOR",
     "NO_PROPOSAL_KINDS",
     "RETRYABLE_KINDS",
