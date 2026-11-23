@@ -14,9 +14,14 @@ from leo.config import Settings
 from leo.contracts import RiskLevel, ToolCall
 from leo.events import EventBus
 from leo.security.permissions import ApprovalRequired, PermissionManagerImpl
-from leo.security.risk_policy import assess_call
+from leo.security.risk_policy import (
+    BOUNDED_WRITE_TOOLS,
+    READ_TOOLS,
+    SELF_MODIFY_TOOLS,
+    assess_call,
+)
 from leo.tools import ToolExecutorImpl, ToolRegistry
-from leo.tools import edit_tools
+from leo.tools import edit_tools, memory_tools
 
 
 def _settings() -> Settings:
@@ -55,9 +60,9 @@ def _settings() -> Settings:
         # outbound: a reply is free, a stranger is not
         ("channel_send", {"target": "525083981", "subject": "525083981", "text": "hi"}, RiskLevel.LOW),
         ("channel_send", {"target": "999000111", "subject": "525083981", "text": "hi"}, RiskLevel.HIGH),
-        # memory and learning: bounded, audited
-        ("memory_forget", {"key": "x"}, RiskLevel.MEDIUM),
-        ("learning.note", {"text": "x"}, RiskLevel.MEDIUM),
+        # memory: adding is bounded, deleting is not (no undelete on the surface)
+        ("memory_add", {"text": "x"}, RiskLevel.MEDIUM),
+        ("memory_forget", {"id": "mem_1"}, RiskLevel.HIGH),
         # self-modification stays behind the gate
         ("model_add", {"model": "x"}, RiskLevel.HIGH),
         ("apply_improvement", {"id": "x"}, RiskLevel.HIGH),
@@ -67,6 +72,61 @@ def test_tier_per_call(tool: str, arguments: dict, expected: RiskLevel) -> None:
     risk, reason = assess_call(tool, arguments, RiskLevel.LOW, _settings())
     assert risk is expected, f"{tool} {arguments} -> {risk} ({reason})"
     assert reason, "every tier carries a reason for the audit row"
+
+
+async def _registered_tool_names() -> set[str]:
+    from leo.tools import register_all_toolsets
+
+    registry = ToolRegistry()
+    register_all_toolsets(registry, {"settings": _settings()})
+    return {spec.name for spec in registry.list_specs()}
+
+
+async def test_every_policy_name_is_a_registered_tool() -> None:
+    """A tier written for a tool that does not exist is a claim nobody can test.
+
+    The first version of this module was written from another agent's tool
+    vocabulary: nine read-tool names, a ``learning.note`` branch and four skill
+    names matched nothing — and ``memory_forget`` was downgraded while its spec,
+    docstring and tests still promised an approval.
+    """
+    names = await _registered_tool_names()
+    for label, group in (
+        ("READ_TOOLS", READ_TOOLS),
+        ("BOUNDED_WRITE_TOOLS", BOUNDED_WRITE_TOOLS),
+        ("SELF_MODIFY_TOOLS", SELF_MODIFY_TOOLS),
+    ):
+        unknown = sorted(name for name in group if name not in names)
+        assert unknown == [], f"{label} names tools that are not registered: {unknown}"
+
+
+async def test_memory_forget_asks_before_it_deletes(tmp_path, monkeypatch) -> None:
+    """The policy must not remove the gate the tool's own contract promises."""
+    monkeypatch.chdir(tmp_path)
+    db.set_db_path(tmp_path / "test.db")
+    await db.initialize()
+    settings = _settings()
+    settings.security.allowed_roots = [tmp_path]
+    events = EventBus()
+    permissions = PermissionManagerImpl(settings, events)
+    registry = ToolRegistry()
+    memory_tools.register(registry, {"settings": settings})
+    executor = ToolExecutorImpl(registry, permissions, events, settings)
+
+    added = await executor.execute(ToolCall(
+        name="memory_add", arguments={"content": "a fact worth keeping"}, actor="tester",
+    ))
+    assert added.success
+    row = await db.fetchone("SELECT id FROM memory_items ORDER BY rowid DESC LIMIT 1")
+    memory_id = str(row["id"])
+    assert memory_id
+
+    with pytest.raises(ApprovalRequired):
+        await executor.execute(ToolCall(
+            name="memory_forget", arguments={"id": memory_id}, actor="tester",
+        ))
+    row = await db.fetchone("SELECT id FROM memory_items WHERE id=?", (memory_id,))
+    assert row is not None, "the memory was deleted without an approval"
 
 
 def test_unknown_tool_keeps_its_registered_tier() -> None:
