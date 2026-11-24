@@ -61,21 +61,21 @@ async def app(monkeypatch: pytest.MonkeyPatch) -> LeoApp:
 async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     names = [spec.name for spec in app.registry.list_specs()]
     assert names and len(names) == len(set(names)), "duplicate tool names"
-    # 25 non-operator registrar modules advertise 82 specs (this roster count
+    # 26 non-operator registrar modules advertise 83 specs (this roster count
     # still includes json_query); the operator registrar adds 9 and builtins add
     # another 10, for 101 advertised names. json_query is deliberately withdrawn
     # from the model-callable catalogue because its caller-supplied data/default
     # arguments let a model feed invented numbers back as evidence, leaving 100
     # unique live names. preview_tools, http_tools, conversation_tools and
     # edit_tools are all part of the shipped roster, not optional extras.
-    assert len(app.tool_roster) == 26, (
-        "expected the live 26-module tool roster including preview_tools, "
-        f"http_tools, conversation_tools and edit_tools; got {sorted(app.tool_roster)}"
+    assert len(app.tool_roster) == 27, (
+        "expected the live 27-module tool roster including preview_tools, "
+        f"http_tools, conversation_tools, edit_tools and vision_tools; got {sorted(app.tool_roster)}"
     )
     registrars = {key: value for key, value in app.tool_roster.items() if key != "operator_tools"}
-    assert len(registrars) == 25, sorted(registrars)
-    assert {"preview_tools", "http_tools", "conversation_tools", "edit_tools"} <= set(registrars)
-    assert sum(len(value) for value in registrars.values()) == 82
+    assert len(registrars) == 26, sorted(registrars)
+    assert {"preview_tools", "http_tools", "conversation_tools", "edit_tools", "vision_tools"} <= set(registrars)
+    assert sum(len(value) for value in registrars.values()) == 83
     # The operator registrar declares 9 specs, but four of them drive the macOS
     # desktop through osascript/screencapture/pbcopy and are only registered on
     # darwin - on any other platform they would be advertised and then fail at
@@ -84,7 +84,7 @@ async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     # computer tools can actually run.
     operator_specs = 9 if sys.platform == "darwin" else 5
     assert len(app.tool_roster["operator_tools"]) == operator_specs
-    assert len(names) == 91 + operator_specs
+    assert len(names) == 92 + operator_specs
     assert "json_query" not in names  # operator/offline only, never model-callable
     assert all(app.tool_roster.values())
     for roster_names in app.tool_roster.values():
@@ -188,6 +188,21 @@ async def test_every_toolset_executes_through_real_executor(
          "2026-01-01T00:00:00+00:00"),
     )
 
+    # A tiny real PNG: the tool sniffs bytes, so a text file renamed .png would
+    # be refused before any reader runs.
+    # Inside the allowed root: the executor confines any path-shaped argument.
+    vision_probe = Path(app.settings.root) / "vision-probe.png"
+    vision_probe.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+    async def _stub_describe(blocks, *, question=None):
+        assert blocks and blocks[0]["source"]["media_type"] == "image/png"
+        return "a probe image"
+
+    # Patch the instance the tool receives through services: a real vision call
+    # would make this coverage matrix depend on the public gateway.
+    app.vision.slot = lambda: "glm-5.3-flash"
+    app.vision.describe = _stub_describe
+
     calls: list[tuple[str, dict]] = [
         ("agent_tools", "agent_list", {}),
         ("approval_tools", "approval_list", {}),
@@ -218,6 +233,7 @@ async def test_every_toolset_executes_through_real_executor(
         ("search_tools", "search_all", {"query": "integration"}),
         ("skill_tools", "skill_list", {}),
         ("task_tools", "task_list", {}),
+        ("vision_tools", "vision_analyze", {"path": str(vision_probe)}),
         ("webhook_tools", "webhook_routes", {}),
         ("model_config_tools", "model_add", {
             "name": "probe", "preset": "openrouter", "model": "probe/model",
@@ -246,7 +262,7 @@ async def test_every_toolset_executes_through_real_executor(
         outputs[module] = result.output
         seen_modules.add(module)
     app.settings.security.high_risk_requires_approval = high_risk_backup
-    assert len(seen_modules) == 26
+    assert len(seen_modules) == 27
     # The added toolsets really ran: a value decoded from the fetched HTTP
     # response, the process-local preview table's close handler, and a real
     # page read from the seeded durable conversation.

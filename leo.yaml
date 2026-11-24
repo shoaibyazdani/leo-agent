@@ -15,6 +15,13 @@ models:
   allow_mock_fallback: false
   # 0 = one attempt only. Raise to opt into cross-model escalation.
   escalation_limit: 0
+  # Images are read by their own slot: the chat model is chosen for reasoning and
+  # need not be multimodal, so a photo goes here and the turn gets the description.
+  # `mode: native` sends pixels to the chat model instead (only if it declares vision),
+  # `auto` does that when the chat model declares vision and describes otherwise.
+  vision:
+    mode: describe
+    provider: glm-5.3-flash
   providers:
     # DeepSeek V4.1 Flash 1017 - 1,000,000 context - 384,000 output
     opencode-go: &opencode
