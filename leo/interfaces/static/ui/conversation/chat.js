@@ -1599,6 +1599,38 @@
       .slice(0, SLASH_PALETTE_LIMIT);
   }
 
+  // Once a command name is typed, offer the fixed choices its first argument
+  // declares (e.g. /think -> none, minimal, low, medium, high, xhigh, max).
+  // Only the token under the cursor is completed; free-form commands return
+  // null and keep the normal command-name palette behaviour.
+  function argumentQuery(value) {
+    const raw = String(value ?? '');
+    const match = /^\s*\/([A-Za-z0-9_-]+)\s+(.*)$/.exec(raw);
+    if (!match) return null;
+    const tokenMatch = /(?:^|\s)([A-Za-z0-9_-]*)$/.exec(match[2]);
+    if (!tokenMatch) return null;
+    const catalog = Array.isArray(state.commands) ? state.commands : [];
+    const cmd = catalog.find((c) => {
+      if (!c || c.allowed_for_caller === false) return false;
+      const names = [c.name, ...(Array.isArray(c.aliases) ? c.aliases : [])];
+      return names.some((n) => String(n).toLowerCase() === match[1].toLowerCase());
+    });
+    if (!cmd) return null;
+    const args = Array.isArray(cmd.arguments) ? cmd.arguments : [];
+    const spec = args.find((a) => a && Array.isArray(a.choices) && a.choices.length);
+    if (!spec) return null;
+    return { token: tokenMatch[1].toLowerCase(), choices: spec.choices, hint: cmd.args_hint || '' };
+  }
+
+  function argumentMatches(aq) {
+    return aq.choices
+      .filter((choice) => String(choice).toLowerCase().startsWith(aq.token))
+      .slice(0, SLASH_PALETTE_LIMIT)
+      .map((choice) => ({
+        _option: true, name: String(choice), description: aq.hint,
+      }));
+  }
+
   function hideCommandPalette() {
     const palette = $('command-palette');
     if (!palette) return;
@@ -1637,9 +1669,9 @@
     head.className = 'chat-palette__head';
     const name = document.createElement('span');
     name.className = 'chat-palette__name';
-    name.textContent = `/${cmd.name}`;
+    name.textContent = cmd._option ? cmd.name : `/${cmd.name}`;
     head.appendChild(name);
-    if (cmd.args_hint) {
+    if (!cmd._option && cmd.args_hint) {
       const args = document.createElement('span');
       args.className = 'chat-palette__args';
       args.textContent = cmd.args_hint;
@@ -1647,7 +1679,7 @@
     }
     const help = document.createElement('span');
     help.className = 'chat-palette__help';
-    help.textContent = cmd.help || '';
+    help.textContent = cmd._option ? (cmd.description || '') : (cmd.help || '');
     item.append(head, help);
     // mousedown would blur the textarea and close the list before click lands.
     item.addEventListener('mousedown', (event) => event.preventDefault());
@@ -1660,13 +1692,14 @@
     const palette = $('command-palette');
     if (!palette || !input) return;
     const query = slashQuery(input.value);
-    if (query === null) { hideCommandPalette(); return; }
+    const aq = query === null ? argumentQuery(input.value) : null;
+    if (query === null && aq === null) { hideCommandPalette(); return; }
     if (!Array.isArray(state.commands)) {
       hideCommandPalette();
       loadCommandCatalog();
       return;
     }
-    const matches = commandMatches(query);
+    const matches = aq ? argumentMatches(aq) : commandMatches(query);
     if (!matches.length) { hideCommandPalette(); return; }
     state.paletteMatches = matches;
     if (state.paletteIndex >= matches.length) state.paletteIndex = 0;
@@ -1689,7 +1722,15 @@
     const cmd = state.paletteMatches[index];
     if (!cmd) return false;
     const input = $('message');
-    input.value = `/${cmd.name} `;
+    if (cmd._option) {
+      // Replace only the token under the cursor, preserving the command name
+      // and any earlier arguments already typed.
+      const raw = String(input.value ?? '');
+      const parts = /^(.*?)([A-Za-z0-9_-]*)$/.exec(raw);
+      input.value = `${parts[1]}${cmd.name} `;
+    } else {
+      input.value = `/${cmd.name} `;
+    }
     hideCommandPalette();
     autosize();
     input.focus();

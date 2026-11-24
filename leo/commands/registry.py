@@ -95,11 +95,15 @@ class ArgumentSpec:
     description: str = ""
     required: bool = False
     variadic: bool = False
+    # Fixed set of accepted tokens, exposed to clients for Tab completion.
+    # Empty means free-form (no suggestions offered).
+    choices: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name, "description": self.description,
             "required": self.required, "variadic": self.variadic,
+            "choices": list(self.choices),
         }
 
 

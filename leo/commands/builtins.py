@@ -2085,10 +2085,16 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
         "model", "Show model status/providers; runtime switching is not supported",
         model_command, aliases=("models",), args_hint="[status|list|<name>]", category="models",
     ))
+    from ..models.reasoning import EFFORT_LADDER
+    reasoning_choices = tuple(EFFORT_LADDER) + (
+        "show", "hide", "full", "clamp", "reset", "--global",
+    )
     registry.register(_spec(
         "reasoning", "Set/show reasoning effort and thinking display (session or --global)",
         reasoning_command, aliases=("think", "thinking", "t"),
         args_hint="[level|show|hide|full|clamp|reset] [--global]", category="models",
+        args=(ArgumentSpec("level", "effort level or display toggle", variadic=True,
+                           choices=reasoning_choices),),
     ))
     registry.register(_spec(
         "usage", "Show recorded model token/cost usage (read-only)",
