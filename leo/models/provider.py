@@ -12,8 +12,11 @@ import asyncio
 import json
 import math
 import os
+import random
 import time
-from typing import Any, AsyncIterator, Iterable, Mapping
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, AsyncIterator, Callable, Iterable, Mapping
 
 import httpx
 
@@ -34,7 +37,8 @@ log = get_logger("models.provider")
 #: it is used only when a provider does not report token counts.
 CHARS_PER_TOKEN = 4
 ANTHROPIC_VERSION = "2023-06-01"
-RETRYABLE_STATUSES = frozenset({408, 409, 429})
+RETRYABLE_STATUSES = frozenset({408, 409, 425, 429})
+MAX_RETRY_AFTER_SECONDS = 600.0
 
 # Provider fields that carry chain-of-thought / thinking text. Naming varies
 # across OpenAI-compatible gateways; all of them are untrusted *data*.
@@ -160,10 +164,29 @@ class ModelUnsupportedError(ModelValidationError):
 class ModelHTTPError(ModelError):
     """An HTTP error from a configured provider endpoint."""
 
-    def __init__(self, status_code: int, message: str, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        retryable: bool = False,
+        *,
+        retry_after: float | None = None,
+        throttle_scope: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+        # Seconds the provider asked us to wait, when it said so. Never a secret.
+        self.retry_after = retry_after
+        # "key" (this credential/window is throttled) or "upstream" (the
+        # provider behind a healthy key is throttled). Internal only.
+        self.throttle_scope = throttle_scope
+        if status_code == 429:
+            self.code = "model_rate_limited"
+        elif status_code in {408, 409, 425}:
+            self.code = "model_transient"
+        elif status_code >= 500:
+            self.code = "model_upstream_error"
 
 
 class ModelTimeoutError(ModelError):
@@ -392,6 +415,8 @@ class BaseHTTPProvider:
         client: httpx.AsyncClient | None = None,
         backoff_base: float = 0.25,
         backoff_cap: float = 2.0,
+        sleep: Callable[[float], Any] | None = None,
+        rand: Callable[[], float] | None = None,
     ) -> None:
         self.config = config
         self.name = name or config.model or self.style
@@ -402,6 +427,12 @@ class BaseHTTPProvider:
         self.timeout = config.timeout_seconds
         self.backoff_base = max(0.0, backoff_base)
         self.backoff_cap = max(0.0, backoff_cap)
+        self._sleep = sleep or asyncio.sleep
+        self._rand = rand or random.random
+        self.retry_jitter = bool(getattr(config, "retry_jitter", True))
+        self.max_retry_after = float(
+            getattr(config, "max_retry_after_seconds", 60.0) or 0.0
+        )
         self.last_usage: Usage | None = None
         self.last_finish_reason: str | None = None
         self.last_tool_calls: list[dict[str, Any]] = []
@@ -534,12 +565,78 @@ class BaseHTTPProvider:
         detail = detail or response.text[:200]
         return self._redact(f"{self.name} HTTP {response.status_code} for {self.path}: {detail[:300]}")
 
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float | None:
+        """Provider-requested wait, in seconds, capped at ten minutes."""
+        raw = response.headers.get("retry-after") or response.headers.get(
+            "x-ratelimit-reset-after"
+        )
+        seconds: float | None = None
+        if raw:
+            try:
+                seconds = float(str(raw).strip())
+            except (TypeError, ValueError):
+                try:
+                    when = parsedate_to_datetime(str(raw))
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    seconds = (when - datetime.now(timezone.utc)).total_seconds()
+                except (TypeError, ValueError, OverflowError):
+                    seconds = None
+        if seconds is None:
+            reset = response.headers.get("x-ratelimit-reset")
+            try:
+                value = float(str(reset))
+                # Epoch seconds vs a relative duration.
+                seconds = (
+                    max(0.0, value - time.time()) if value > 1_000_000 else max(0.0, value)
+                )
+            except (TypeError, ValueError):
+                seconds = None
+        if seconds is None:
+            return None
+        return max(0.0, min(float(seconds), MAX_RETRY_AFTER_SECONDS))
+
+    @staticmethod
+    def _throttle_scope(response: httpx.Response, detail: str) -> str:
+        """'upstream' when the provider behind a healthy key is throttled."""
+        text = " ".join(
+            [detail or ""]
+            + [
+                f"{key}: {value}"
+                for key, value in response.headers.items()
+                if key.lower() in {"x-upstream-provider", "x-provider", "x-gateway"}
+            ]
+        ).lower()
+        if "upstream" in text or "concurrency limit" in text:
+            return "upstream"
+        return "key"
+
     def _raise_for_status(self, response: httpx.Response) -> None:
         if response.status_code < 400:
             return
-        retry_header = response.headers.get("x-should-retry", "").lower() == "true"
-        retryable = response.status_code in RETRYABLE_STATUSES or response.status_code >= 500 or retry_header
-        raise ModelHTTPError(response.status_code, self._error_message(response), retryable=retryable)
+        header = response.headers.get("x-should-retry", "").lower()
+        retry_after = self._retry_after_seconds(response)
+        retryable = (
+            response.status_code in RETRYABLE_STATUSES
+            or response.status_code >= 500
+            or header == "true"
+            or retry_after is not None
+        )
+        if header == "false" and retry_after is None:
+            retryable = False
+        scope = (
+            self._throttle_scope(response, self._error_message(response))
+            if response.status_code == 429
+            else None
+        )
+        raise ModelHTTPError(
+            response.status_code,
+            self._error_message(response),
+            retryable=retryable,
+            retry_after=retry_after,
+            throttle_scope=scope,
+        )
 
     @staticmethod
     def _is_retryable(exc: BaseException) -> bool:
@@ -549,10 +646,17 @@ class BaseHTTPProvider:
             return exc.retryable
         return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
 
-    async def _backoff(self, attempt: int) -> None:
-        delay = min(self.backoff_base * (2**attempt), self.backoff_cap)
+    async def _backoff(self, attempt: int, retry_after: float | None = None) -> None:
+        if retry_after is not None:
+            # An explicit provider wait wins; the provider cap is applied by the
+            # retry loop before we ever sleep.
+            delay = min(max(0.0, float(retry_after)), MAX_RETRY_AFTER_SECONDS)
+        else:
+            delay = min(self.backoff_base * (2**attempt), self.backoff_cap)
+            if self.retry_jitter:
+                delay *= self._rand()
         if delay > 0:
-            await asyncio.sleep(delay)
+            await self._sleep(delay)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         """Send one completion request with bounded retries and backoff."""
@@ -602,13 +706,21 @@ class BaseHTTPProvider:
                 error.__cause__ = exc
             except (httpx.HTTPError, ModelHTTPError, ModelTimeoutError) as exc:
                 error = exc if isinstance(exc, ModelError) else ModelError(self._redact(str(exc)))
+            retry_after = getattr(error, "retry_after", None)
+            if (
+                retry_after is not None
+                and self.max_retry_after > 0
+                and retry_after > self.max_retry_after
+            ):
+                # Too long to wait interactively: let the router fail over now.
+                raise error
             if not self._is_retryable(error) or attempt >= self.max_retries:
                 raise error
             log.warning(
                 "model request retry",
                 extra={"provider": self.name, "attempt": attempt + 1, "error": self._redact(str(error))[:200]},
             )
-            await self._backoff(attempt)
+            await self._backoff(attempt, retry_after)
         raise ModelError(f"{self.name}: retries exhausted")
 
     async def stream_events(self, request: ModelRequest) -> AsyncIterator[StreamChunk]:
@@ -664,14 +776,20 @@ class BaseHTTPProvider:
                     extra={"provider": self.name, "task_id": request.task_id, "attempt": attempt + 1},
                 )
                 return
-            if emitted or not self._is_retryable(error) or attempt >= self.max_retries:
+            retry_after = getattr(error, "retry_after", None)
+            too_long = (
+                retry_after is not None
+                and self.max_retry_after > 0
+                and retry_after > self.max_retry_after
+            )
+            if too_long or emitted or not self._is_retryable(error) or attempt >= self.max_retries:
                 self._record_stream_state(state, request, (time.perf_counter() - started) * 1000)
                 raise error
             log.warning(
                 "model stream retry",
                 extra={"provider": self.name, "attempt": attempt + 1, "error": self._redact(str(error))[:200]},
             )
-            await self._backoff(attempt)
+            await self._backoff(attempt, retry_after)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[str]:
         """Stream answer text only, as plain strings (backward compatible)."""
