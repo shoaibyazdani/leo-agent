@@ -15,6 +15,7 @@ import pytest
 
 from leo import db
 from leo.core.restart_notice import (
+    LAST_BOOT_KEY,
     RESTART_ANNOUNCEMENT,
     RESTART_MARKER_KEY,
     announce_restart_if_pending,
@@ -130,7 +131,12 @@ async def test_the_notice_waits_for_an_adapter_that_registers_late(notice_db) ->
 async def test_a_restart_without_a_request_still_reports(notice_db) -> None:
     """systemd bouncing the unit is a restart too — the operator wants to know."""
     adapter = _Adapter()
-    await record_boot()  # previous boot stamp
+    # a previous boot two minutes ago: this boot is a restart, not a cold start
+    await db.execute(
+        "INSERT INTO kv(key, value, updated_at) VALUES(?,?,?)",
+        (LAST_BOOT_KEY, (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+         datetime.now(timezone.utc).isoformat()),
+    )
     await db.execute(
         "INSERT INTO conversations(id, channel, subject, created_at, updated_at) "
         "VALUES(?,?,?,?,?)",
@@ -148,4 +154,46 @@ async def test_a_restart_without_a_request_still_reports(notice_db) -> None:
 async def test_a_cold_boot_without_a_marker_or_history_is_silent(notice_db) -> None:
     adapter = _Adapter()
     assert await announce_restart_if_pending(_app(adapter), restarted=False) is None
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_every_start_reports_when_there_is_a_chat(notice_db) -> None:
+    """The operator restarts LEO from the shell too, not only with /restart."""
+    adapter = _Adapter()
+    await db.execute(
+        "INSERT INTO conversations(id, channel, subject, created_at, updated_at) "
+        "VALUES(?,?,?,?,?)",
+        ("conv_t2", "telegram", "525083981",
+         datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+    )
+    await db.execute(
+        "INSERT INTO kv(key, value, updated_at) VALUES(?,?,?)",
+        (LAST_BOOT_KEY, (datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat(),
+         datetime.now(timezone.utc).isoformat()),
+    )
+
+    text = await announce_restart_if_pending(_app(adapter))
+
+    assert text == RESTART_ANNOUNCEMENT
+    assert adapter.sent == [("525083981", RESTART_ANNOUNCEMENT)]
+
+
+@pytest.mark.asyncio
+async def test_a_crash_loop_second_start_stays_quiet(notice_db) -> None:
+    """Two boots inside a minute is a loop, not news — one notice is enough."""
+    adapter = _Adapter()
+    await db.execute(
+        "INSERT INTO conversations(id, channel, subject, created_at, updated_at) "
+        "VALUES(?,?,?,?,?)",
+        ("conv_t3", "telegram", "525083981",
+         datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+    )
+    await db.execute(
+        "INSERT INTO kv(key, value, updated_at) VALUES(?,?,?)",
+        (LAST_BOOT_KEY, (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+         datetime.now(timezone.utc).isoformat()),
+    )
+
+    assert await announce_restart_if_pending(_app(adapter)) is None
     assert adapter.sent == []
