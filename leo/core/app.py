@@ -155,6 +155,18 @@ class _PinnedModelProvider:
         return await self._router.complete(pinned)
 
 
+def _task_is_shutting_down() -> bool:
+    """True only when the task running this code is itself being cancelled.
+
+    A turn that hits the turn cap cancels its own work; that CancelledError must
+    not be confused with shutdown, or the outbox consumer exits and the agent
+    silently stops answering.
+    """
+    task = asyncio.current_task()
+    cancelling = getattr(task, "cancelling", None)
+    return bool(task is not None and callable(cancelling) and cancelling() > 0)
+
+
 class LeoApp:
     """One LEO instance. All engines are reachable from here, never from globals."""
 
@@ -644,12 +656,30 @@ class LeoApp:
             await asyncio.sleep(max(0.05, float(self.settings.automation.tick_seconds)))
 
     async def _gateway_loop(self) -> None:
-        """Drain admitted channel turns promptly, without blocking scheduling."""
+        """Drain admitted channel turns promptly, without blocking scheduling.
+
+        This loop is the only consumer of the channel outbox: if it exits, every
+        message the operator sends lands in ``pending`` and is never answered —
+        the agent looks dead while the process is healthy. It therefore survives
+        anything a single turn can throw at it, including a ``CancelledError``
+        raised inside a turn (the turn cap cancels turns), which is not a reason
+        to stop consuming.
+        """
+        sweeps = 0
         while True:
             try:
                 await self.gateway.drain_outbox(limit=10)
+                # Rows stranded by a consumer that died mid-turn are invisible to
+                # the claim query; sweep them back to ``pending`` periodically.
+                sweeps += 1
+                if sweeps % 60 == 0:
+                    recovered = await self.gateway.recover_stale_outbox()
+                    if recovered:
+                        _LOG.info("stale outbox rows recovered", extra={"rows": recovered})
             except asyncio.CancelledError:
-                raise
+                if _task_is_shutting_down():
+                    raise
+                _LOG.warning("gateway outbox drain cancelled mid-turn; continuing")
             except Exception as exc:
                 _LOG.warning("gateway outbox drain failed", extra={"error": str(exc)})
             await asyncio.sleep(0.5)
