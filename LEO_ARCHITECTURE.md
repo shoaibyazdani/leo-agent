@@ -16,6 +16,7 @@ tools/        registry, validation, execution, permission enforcement
 tasks/        durable task engine, checkpoints, recovery, scheduler, webhooks
 agents/       12 specialists, delegation, isolation, verification
 skills/       native skill registry, lifecycle, compatibility adapters
+review/       bounded post-turn review: transcript, prompts, artifact, audit
 integrations/ Telegram/Discord/WhatsApp/browser/computer/HTTP adapters
 security/     permissions, approvals, audit, redaction
 ```
@@ -33,7 +34,8 @@ security/     permissions, approvals, audit, redaction
 
 SQLite tables: `tasks`, `task_checkpoints`, `memory_items`, `memory_links`,
 `memory_versions`, `model_usage`, `conversations`, `messages`, `agents`,
-`agent_runs`, `skills`, `skill_history`, `tool_calls`, `schedules`,
+`agent_runs`, `skills`, `skill_history`, `skill_files`, `skill_usage`,
+`tool_calls`, `schedules`,
 `integrations`, `approvals`, `audit_log`, `events`, `metrics`, `kv`.
 
 ## Provider independence

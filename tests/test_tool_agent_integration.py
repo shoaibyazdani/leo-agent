@@ -61,21 +61,26 @@ async def app(monkeypatch: pytest.MonkeyPatch) -> LeoApp:
 async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     names = [spec.name for spec in app.registry.list_specs()]
     assert names and len(names) == len(set(names)), "duplicate tool names"
-    # 26 non-operator registrar modules advertise 83 specs (this roster count
+    # 28 non-operator registrar modules advertise 85 specs (this roster count
     # still includes json_query); the operator registrar adds 9 and builtins add
-    # another 10, for 101 advertised names. json_query is deliberately withdrawn
+    # another 10, for 103 advertised names. json_query is deliberately withdrawn
     # from the model-callable catalogue because its caller-supplied data/default
-    # arguments let a model feed invented numbers back as evidence, leaving 100
-    # unique live names. preview_tools, http_tools, conversation_tools and
-    # edit_tools are all part of the shipped roster, not optional extras.
-    assert len(app.tool_roster) == 27, (
-        "expected the live 27-module tool roster including preview_tools, "
-        f"http_tools, conversation_tools, edit_tools and vision_tools; got {sorted(app.tool_roster)}"
+    # arguments let a model feed invented numbers back as evidence, leaving 103
+    # unique live names. preview_tools, http_tools, conversation_tools,
+    # edit_tools, vision_tools, memory_propose_tools and skill_manage_tools are
+    # all part of the shipped roster.
+    assert len(app.tool_roster) == 29, (
+        "expected the live 29-module tool roster including preview_tools, "
+        f"http_tools, conversation_tools, edit_tools, vision_tools and "
+        f"skill_manage_tools; got {sorted(app.tool_roster)}"
     )
     registrars = {key: value for key, value in app.tool_roster.items() if key != "operator_tools"}
-    assert len(registrars) == 26, sorted(registrars)
-    assert {"preview_tools", "http_tools", "conversation_tools", "edit_tools", "vision_tools"} <= set(registrars)
-    assert sum(len(value) for value in registrars.values()) == 83
+    assert len(registrars) == 28, sorted(registrars)
+    assert {
+        "preview_tools", "http_tools", "conversation_tools", "edit_tools",
+        "vision_tools", "memory_propose_tools", "skill_manage_tools",
+    } <= set(registrars)
+    assert sum(len(value) for value in registrars.values()) == 85
     # The operator registrar declares 9 specs, but four of them drive the macOS
     # desktop through osascript/screencapture/pbcopy and are only registered on
     # darwin - on any other platform they would be advertised and then fail at
@@ -84,7 +89,7 @@ async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     # computer tools can actually run.
     operator_specs = 9 if sys.platform == "darwin" else 5
     assert len(app.tool_roster["operator_tools"]) == operator_specs
-    assert len(names) == 92 + operator_specs
+    assert len(names) == 94 + operator_specs
     assert "json_query" not in names  # operator/offline only, never model-callable
     assert all(app.tool_roster.values())
     for roster_names in app.tool_roster.values():
@@ -232,6 +237,14 @@ async def test_every_toolset_executes_through_real_executor(
         ("run_tools", "run_list", {}),
         ("search_tools", "search_all", {"query": "integration"}),
         ("skill_tools", "skill_list", {}),
+        ("memory_propose_tools", "memory_propose", {"content": "Integration probe fact."}),
+        ("skill_manage_tools", "skill_manage", {
+            "action": "create",
+            "name": "integration-probe",
+            "description": "Use when proving the authored skill path.",
+            "category": "probe",
+            "content": "# Integration Probe\n\nProves the authored skill write path.\n",
+        }),
         ("task_tools", "task_list", {}),
         ("vision_tools", "vision_analyze", {"path": str(vision_probe)}),
         ("webhook_tools", "webhook_routes", {}),
@@ -262,7 +275,7 @@ async def test_every_toolset_executes_through_real_executor(
         outputs[module] = result.output
         seen_modules.add(module)
     app.settings.security.high_risk_requires_approval = high_risk_backup
-    assert len(seen_modules) == 27
+    assert len(seen_modules) == 29
     # The added toolsets really ran: a value decoded from the fetched HTTP
     # response, the process-local preview table's close handler, and a real
     # page read from the seeded durable conversation.
@@ -808,3 +821,16 @@ async def test_event_durability_handlers_and_routes(app: LeoApp) -> None:
         drained = await client.post("/events/durability/drain")
         assert drained.status_code == 200
         assert {"outbox", "replay", "deliveries"} <= set(drained.json())
+
+
+async def test_post_turn_review_is_attached_and_reported(app: LeoApp) -> None:
+    """The composition root wires the review engine and reports its state."""
+    assert app.review is not None
+    assert app.services["review"] is app.review
+    health = await app._evolution_health()
+    assert health["review"]["enabled"] is True
+    assert health["review"]["interval_turns"] == 5
+    assert health["review"]["running_conversations"] == 0
+    assert app.curator is not None
+    assert health["curator"]["enabled"] is True
+    assert health["curator"]["stale_after_days"] == 14

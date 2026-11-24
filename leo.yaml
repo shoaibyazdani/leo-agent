@@ -315,6 +315,48 @@ learning:
     # Never promote unattended chat text to a FACT; notes stay UNVERIFIED.
     promote_facts: false
 
+  # Post-turn skill review. After a few completed turns LEO replays a bounded
+  # transcript through a small tool scope and may patch or author a
+  # documentation-only skill (or propose a memory note). Authored skills never
+  # execute; every write is validated, read-before-write gated and audited.
+  review:
+    enabled: true
+    interval_turns: 5
+    max_tool_rounds: 12
+    max_input_tokens: 48000
+    timeout_seconds: 120
+    min_transcript_chars: 200
+    model: ""                 # empty = the configured default chat model
+    capture_memory: true
+    # Background skill writes wait for /skills approve. Interactive writes are
+    # unaffected. Set false for fully unattended authoring.
+    write_approval: true
+    # /learn gathers sources with read-only file tools and http_get, then
+    # authors directly because the user asked for the skill.
+    learn_enabled: true
+    learn_max_tool_rounds: 24
+    learn_max_input_tokens: 96000
+    learn_allow_network: true
+    max_messages: 80
+    max_transcript_chars: 60000
+    tool_preview_chars: 500
+
+skills:
+  # Deterministic lifecycle for agent-authored skills. Stale/archive are
+  # reversible state transitions; content is never rewritten or deleted.
+  curator:
+    enabled: true
+    interval_hours: 168          # one pass per week
+    min_idle_hours: 2            # only while the profile is quiet
+    stale_after_days: 14
+    archive_after_days: 30
+    # Opt-in LLM consolidation: it only stages a multi-operation plan for
+    # /skills approve; native skills never enter a group and nothing is
+    # rewritten automatically.
+    consolidate: false
+    max_groups: 3
+    model: ""                    # empty = the configured default chat model
+
 security:
   # Hold a chat turn while a HIGH-risk approval is pending. The same tool call
   # resumes automatically when the operator taps Approve/Always; deny, expiry

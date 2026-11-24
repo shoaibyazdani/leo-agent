@@ -10,6 +10,7 @@ published as ``skill.*`` events.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -18,6 +19,7 @@ import re
 import subprocess
 import time
 from collections import Counter
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator
 
@@ -28,9 +30,20 @@ from ..contracts import RiskLevel, SkillManifest, utcnow
 from ..events import EventBus
 from ..logging import get_logger
 from ..security.permissions import ApprovalRequired
+from . import snapshots as skill_snapshots
 from .gates import bounded_preview, evaluate_gates, execution_block
+from .sanitize import (
+    MAX_FILE_BYTES,
+    safe_description,
+    scan_text,
+    validate_relative_path,
+)
 
 _LOG = get_logger("skills")
+
+# A rollback replays the normal write path; these writes must not snapshot
+# themselves (an endless chain of before-states).
+_RESTORING: ContextVar[bool] = ContextVar("skill_restoring", default=False)
 
 Handler = Callable[[dict[str, Any], dict[str, Any] | None], Any]
 
@@ -839,6 +852,9 @@ class SkillRegistry:
         self.gate_context = gate_context
         self._skills: dict[str, SkillRecord] = {}
         self._handlers: dict[str, Handler] = {}
+        # Usage/lifecycle telemetry, loaded once with the durable skills and
+        # kept in memory so the synchronous prompt index can read it.
+        self._usage: dict[str, dict[str, Any]] = {}
         self._seeded = False
         if auto_seed:
             for manifest, handler in native_skills():
@@ -865,6 +881,14 @@ class SkillRegistry:
         except Exception as exc:
             _LOG.warning("could not load persisted skills: %s", exc)
             rows = []
+        self._usage = {}
+        try:
+            usage_rows = await db.fetchall("SELECT * FROM skill_usage")
+        except Exception as exc:
+            _LOG.warning("could not load skill usage: %s", exc)
+            usage_rows = []
+        for row in usage_rows:
+            self._usage[str(row["skill_name"])] = dict(row)
         loaded: set[str] = set()
         for row in rows:
             name = row["name"]
@@ -889,13 +913,14 @@ class SkillRegistry:
         now = utcnow()
         await db.execute(
             "INSERT OR REPLACE INTO skills(name,description,version,author,category,permissions,"
-            "input_schema,output_schema,entrypoint,status,health,source,manifest,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "input_schema,output_schema,entrypoint,status,health,source,manifest,created_by,"
+            "created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 record.name, record.description, record.version, record.author, record.category,
                 json.dumps(record.permissions), json.dumps(record.input_schema),
                 json.dumps(record.output_schema), record.entrypoint, record.status, record.health,
-                record.source, record.model_dump_json(), now, now,
+                record.source, record.model_dump_json(), record.created_by, now, now,
             ),
         )
 
@@ -915,9 +940,16 @@ class SkillRegistry:
         lifecycle = {"status", "health", "enabled", "registered_at", "has_handler"}
         data = {key: value for key, value in manifest.items() if key not in lifecycle}
         base = SkillManifest.model_validate(data)
+        try:
+            # The dedicated column is authoritative; older rows predate it and
+            # the manifest/``native`` default remains correct for them.
+            created_by = str(row["created_by"] or "native")
+        except (IndexError, KeyError):
+            created_by = base.created_by
+        data = {**base.model_dump(), "created_by": created_by}
         return SkillRecord(
-            **base.model_dump(), status=row["status"], health=row["health"] or "available",
-            enabled=row["status"] != "disabled",
+            **data, status=row["status"], health=row["health"] or "available",
+            enabled=row["status"] not in {"disabled", "archived"},
         )
 
     # -- validation / health -------------------------------------------------
@@ -971,6 +1003,8 @@ class SkillRegistry:
 
     def _health_status(self, record: SkillRecord) -> str:
         """Derive health from live registry state, not a stored snapshot."""
+        if str((self._usage.get(record.name) or {}).get("state") or "active") == "archived":
+            return "archived"
         for dep in record.dependencies:
             dependency = self._skills.get(dep)
             if dependency is None or not dependency.enabled or dependency.status == "disabled":
@@ -987,6 +1021,11 @@ class SkillRegistry:
         record = self._skills.get(name)
         if record is None:
             return HealthReport(name=name, healthy=False, status="unavailable", detail="skill is not registered")
+        if str((self._usage.get(name) or {}).get("state") or "active") == "archived":
+            return HealthReport(
+                name=name, healthy=False, status="archived",
+                detail="skill is archived; restore it before use",
+            )
         missing = [dep for dep in record.dependencies if dep not in self._skills]
         disabled = [
             dep for dep in record.dependencies
@@ -1028,6 +1067,12 @@ class SkillRegistry:
     ) -> SkillRecord:
         if isinstance(manifest, dict):
             manifest = SkillManifest.model_validate(manifest)
+        elif isinstance(manifest, SkillRecord):
+            # Lifecycle fields live in dedicated columns; keeping them on the
+            # manifest would collide with the explicit kwargs below.
+            manifest = SkillManifest(
+                **manifest.model_dump(include=set(SkillManifest.model_fields))
+            )
         result = self.validate(manifest)
         if not result.valid:
             raise ValueError("invalid skill manifest: " + "; ".join(result.errors))
@@ -1049,21 +1094,33 @@ class SkillRegistry:
         # skill or drop its local handler (F-26). Preserve lifecycle state
         # from the previous record unless an explicit override is supplied.
         previous = self._skills.get(manifest.name)
+        if replace and previous is not None:
+            await self._snapshot_skill(previous.name, "before.version")
         status = previous.status if replace and previous is not None else "registered"
         enabled = previous.enabled if replace and previous is not None else True
         record = SkillRecord(
             **manifest.model_dump(), status=status, health=health, enabled=enabled
         )
+        # A version bump that omits provenance must not relabel an authored
+        # skill as a shipped native one. Only an explicit non-native value can
+        # change the origin after creation.
+        if replace and previous is not None and manifest.created_by == "native":
+            record.created_by = previous.created_by
+            record.origin = dict(previous.origin or {})
         await self._write_row(record)
         if handler is not None:
             self._handlers[manifest.name] = handler
         # With replace=True and no new handler, the existing local handler
         # (if any) is deliberately kept so rollback stays executable.
         self._skills[manifest.name] = record
+        if replace:
+            await self.bump_usage(manifest.name, "patches")
+        else:
+            await self.record_created(manifest.name, record.created_by)
         action = "version.changed" if replace else "registered"
         await self._history(manifest.name, manifest.version, action, {
             "source": manifest.source, "health": health, "missing_dependencies": missing,
-            "has_handler": handler is not None,
+            "has_handler": handler is not None, "created_by": record.created_by,
             "provenance": {
                 "source_path": bounded_preview(manifest.provenance.get("source_path"), 160),
                 "content_hash": manifest.provenance.get("content_hash"),
@@ -1183,11 +1240,18 @@ class SkillRegistry:
 
     async def unregister(self, name: str) -> None:
         await self._ensure_seeded()
-        record = self._skills.pop(name, None)
+        record = self._skills.get(name)
         if record is None:
             raise KeyError(f"unknown skill: {name}")
+        # Snapshot while the record and its files are still addressable.
+        if record.created_by == "agent":
+            await self._snapshot_skill(name, "before.delete")
+        self._skills.pop(name, None)
         self._handlers.pop(name, None)
+        self._usage.pop(name, None)
         await db.execute("DELETE FROM skills WHERE name=?", (name,))
+        await db.execute("DELETE FROM skill_files WHERE skill_name=?", (name,))
+        await db.execute("DELETE FROM skill_usage WHERE skill_name=?", (name,))
         await self._history(name, record.version, "unregistered", {})
         await self._emit("skill.unregistered", name=name, version=record.version)
 
@@ -1196,6 +1260,16 @@ class SkillRegistry:
         if copy.model_extra is None:
             copy.model_extra = {}
         copy.model_extra["has_handler"] = record.name in self._handlers
+        usage = self._usage.get(record.name) or {}
+        # Lifecycle fields live in the usage table; overlay them so every
+        # caller sees the same state without a second query.
+        copy.model_extra["state"] = str(usage.get("state") or "active")
+        copy.model_extra["pinned"] = bool(usage.get("pinned", 0))
+        copy.model_extra["locked"] = bool(usage.get("locked", 0))
+        copy.model_extra["views"] = int(usage.get("views") or 0)
+        copy.model_extra["invocations"] = int(usage.get("invocations") or 0)
+        copy.model_extra["patches"] = int(usage.get("patches") or 0)
+        copy.model_extra["last_used_at"] = usage.get("last_used_at")
         # Stored health goes stale when a skill is disabled or a dependency is
         # unregistered; derive it from live state instead (same as health_check).
         copy.health = self._health_status(record)
@@ -1278,6 +1352,7 @@ class SkillRegistry:
         except Exception as exc:
             error = f"handler failed: {type(exc).__name__}: {bounded_preview(exc, 120)}"
             result = SkillRunResult(skill=name, success=False, error=error, validation_errors=validation_errors)
+            await self.bump_usage(name, "failures")
             await self._history(name, record.version, "run.failed", {"error": error})
             await self._emit("skill.run.failed", name=name, error=error)
             return result
@@ -1290,6 +1365,7 @@ class SkillRegistry:
             result = SkillRunResult(
                 skill=name, success=False, output=output, error=error, validation_errors=output_errors,
             )
+            await self.bump_usage(name, "failures")
             await self._history(name, record.version, "run.failed", {"error": error})
             await self._emit("skill.run.failed", name=name, error=error)
             return result
@@ -1298,6 +1374,7 @@ class SkillRegistry:
             skill=name, success=True, output=output, validation_errors=validation_errors,
             duration_ms=round((time.perf_counter() - started) * 1000, 3),
         )
+        await self.bump_usage(name, "invocations")
         await self._history(name, record.version, "run", {"success": True})
         await self._emit("skill.run", name=name, version=record.version, success=True)
         return result
@@ -1311,3 +1388,338 @@ class SkillRegistry:
         else:
             rows = await db.fetchall("SELECT * FROM skill_history ORDER BY id DESC LIMIT ?", (limit,))
         return [dict(row) for row in rows]
+
+    # -- usage / lifecycle ---------------------------------------------------
+
+    async def ready(self) -> None:
+        """Load durable skills once; the synchronous prompt index reads this."""
+        await self._ensure_seeded()
+
+    @staticmethod
+    def _usage_default(name: str, created_by: str = "native") -> dict[str, Any]:
+        return {
+            "skill_name": name, "created_by": created_by, "views": 0,
+            "invocations": 0, "failures": 0, "patches": 0,
+            "last_viewed_at": None, "last_used_at": None, "last_patched_at": None,
+            "state": "active", "pinned": 0, "locked": 0, "updated_at": utcnow(),
+        }
+
+    async def record_created(self, name: str, created_by: str) -> None:
+        """Create the usage row once; a re-register never resets counters."""
+        if name in self._usage:
+            return
+        origin = created_by if created_by in {"native", "agent", "user"} else "native"
+        now = utcnow()
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO skill_usage(skill_name,created_by,state,updated_at) "
+                "VALUES(?,?,?,?)",
+                (name, origin, "active", now),
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry never fails a write
+            _LOG.warning("could not create skill usage row: %s", exc)
+        self._usage[name] = self._usage_default(name, origin)
+
+    async def bump_usage(self, name: str, kind: str) -> None:
+        """Increment one telemetry counter, durably and in the in-memory view."""
+        columns = {
+            "views": ("views", "last_viewed_at"),
+            "invocations": ("invocations", "last_used_at"),
+            "failures": ("failures", "last_used_at"),
+            "patches": ("patches", "last_patched_at"),
+        }
+        if kind not in columns:
+            raise ValueError(f"unknown usage kind: {kind!r}")
+        record = self._skills.get(name)
+        created_by = record.created_by if record is not None else "native"
+        await self.record_created(name, created_by)
+        column, timestamp = columns[kind]
+        now = utcnow()
+        try:
+            await db.execute(
+                f"UPDATE skill_usage SET {column}={column}+1, {timestamp}=?, updated_at=? "
+                "WHERE skill_name=?",
+                (now, now, name),
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry never fails a run
+            _LOG.warning("could not update skill usage: %s", exc)
+        row = self._usage.setdefault(name, self._usage_default(name, created_by))
+        row[column] = int(row.get(column) or 0) + 1
+        row[timestamp] = now
+        row["updated_at"] = now
+
+    async def usage(self, name: str) -> dict[str, Any]:
+        await self._ensure_seeded()
+        return dict(self._usage.get(name) or self._usage_default(name))
+
+    async def usage_list(self) -> list[dict[str, Any]]:
+        await self._ensure_seeded()
+        return [dict(row) for row in self._usage.values()]
+
+    async def set_state(self, name: str, state: str) -> dict[str, Any]:
+        """Lifecycle state transition (active/stale/archived); never deletes."""
+        if state not in {"active", "stale", "archived"}:
+            raise ValueError(f"unknown skill state: {state!r}")
+        await self._ensure_seeded()
+        if name not in self._skills:
+            raise KeyError(f"unknown skill: {name}")
+        record = self._skills[name]
+        current = str((self._usage.get(name) or {}).get("state") or "active")
+        if current == "archived" and state != "active":
+            raise ValueError("an archived skill must be restored to active first")
+        await self.record_created(name, record.created_by)
+        now = utcnow()
+        await db.execute(
+            "UPDATE skill_usage SET state=?, updated_at=? WHERE skill_name=?",
+            (state, now, name),
+        )
+        if state == "archived":
+            # Archived skills are not selectable and not executable, but their
+            # manifest, files and history remain for restore/inspection.
+            record.status, record.enabled = "archived", False
+        elif record.status == "archived" and state == "active":
+            record.status, record.enabled = "registered", True
+        await self._write_row(record)
+        row = self._usage.setdefault(name, self._usage_default(name, record.created_by))
+        row["state"], row["updated_at"] = state, now
+        await self._history(name, record.version, f"state.{state}", {"state": state})
+        await self._emit(f"skill.{state}", name=name, version=record.version)
+        return self._with_handler_flag(record)
+
+    async def set_pinned(self, name: str, pinned: bool) -> dict[str, Any]:
+        return await self._set_usage_flag(name, "pinned", pinned)
+
+    async def set_locked(self, name: str, locked: bool) -> dict[str, Any]:
+        return await self._set_usage_flag(name, "locked", locked)
+
+    async def _set_usage_flag(self, name: str, field: str, value: bool) -> dict[str, Any]:
+        await self._ensure_seeded()
+        record = self._skills.get(name)
+        if record is None:
+            raise KeyError(f"unknown skill: {name}")
+        await self.record_created(name, record.created_by)
+        now = utcnow()
+        await db.execute(
+            f"UPDATE skill_usage SET {field}=?, updated_at=? WHERE skill_name=?",
+            (1 if value else 0, now, name),
+        )
+        row = self._usage.setdefault(name, self._usage_default(name, record.created_by))
+        row[field], row["updated_at"] = 1 if value else 0, now
+        await self._history(name, record.version, f"{field}.{'on' if value else 'off'}", {})
+        return self._with_handler_flag(record)
+
+    # -- supporting files ----------------------------------------------------
+
+    async def files(self, name: str) -> list[dict[str, Any]]:
+        await self._ensure_seeded()
+        if name not in self._skills:
+            raise KeyError(f"unknown skill: {name}")
+        rows = await db.fetchall(
+            "SELECT path, bytes, sha256, updated_at FROM skill_files "
+            "WHERE skill_name=? ORDER BY path",
+            (name,),
+        )
+        return [dict(row) for row in rows]
+
+    async def read_file(self, name: str, file_path: str) -> str | None:
+        await self._ensure_seeded()
+        if name not in self._skills:
+            raise KeyError(f"unknown skill: {name}")
+        normalized, error = validate_relative_path(file_path)
+        if error:
+            raise ValueError(error)
+        row = await db.fetchone(
+            "SELECT content FROM skill_files WHERE skill_name=? AND path=?",
+            (name, normalized),
+        )
+        return str(row["content"]) if row is not None else None
+
+    async def write_file(self, name: str, file_path: str, content: str) -> dict[str, Any]:
+        """Store one supporting file after path, size and content hygiene checks."""
+        await self._ensure_seeded()
+        record = self._skills.get(name)
+        if record is None:
+            raise KeyError(f"unknown skill: {name}")
+        normalized, error = validate_relative_path(file_path)
+        if error:
+            raise ValueError(error)
+        if not isinstance(content, str):
+            raise ValueError("file content must be a string")
+        clean, errors, warnings = scan_text(content, field=normalized)
+        if errors:
+            raise ValueError("; ".join(errors))
+        # Hash and size are measured on the text that is actually stored, not
+        # on the pre-sanitization input.
+        encoded = clean.encode("utf-8")
+        if len(encoded) > MAX_FILE_BYTES:
+            raise ValueError(
+                f"file content is {len(encoded):,} bytes (limit: {MAX_FILE_BYTES:,})"
+            )
+        digest = hashlib.sha256(encoded).hexdigest()
+        existing = await self.read_file(name, normalized)
+        if existing is not None:
+            await self._snapshot_file(name, normalized, existing)
+        now = utcnow()
+        await db.execute(
+            "INSERT OR REPLACE INTO skill_files(skill_name,path,content,sha256,bytes,updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (name, normalized, clean, digest, len(encoded), now),
+        )
+        await self._history(name, record.version, "file.written", {
+            "path": normalized, "sha256": digest, "bytes": len(encoded),
+            "warnings": warnings,
+        })
+        await self._emit("skill.file.written", name=name, path=normalized, bytes=len(encoded))
+        return {
+            "path": normalized, "bytes": len(encoded), "sha256": digest,
+            "warnings": warnings,
+        }
+
+    async def remove_file(self, name: str, file_path: str) -> bool:
+        await self._ensure_seeded()
+        record = self._skills.get(name)
+        if record is None:
+            raise KeyError(f"unknown skill: {name}")
+        normalized, error = validate_relative_path(file_path)
+        if error:
+            raise ValueError(error)
+        existing = await self.read_file(name, normalized)
+        if existing is not None:
+            await self._snapshot_file(name, normalized, existing, "before.remove")
+        cursor = await db.execute(
+            "DELETE FROM skill_files WHERE skill_name=? AND path=?",
+            (name, normalized),
+        )
+        removed = bool(getattr(cursor, "rowcount", 0))
+        if removed:
+            await self._history(name, record.version, "file.removed", {"path": normalized})
+            await self._emit("skill.file.removed", name=name, path=normalized)
+        return removed
+
+    # -- snapshots / rollback ------------------------------------------------
+
+    async def _snapshot_skill(self, name: str, action: str) -> None:
+        """Record a full before-state for an authored skill (best effort)."""
+        if _RESTORING.get():
+            return
+        record = self._skills.get(name)
+        if record is None or record.created_by != "agent":
+            return
+        try:
+            files = []
+            for item in await self.files(name):
+                content = await self.read_file(name, str(item["path"]))
+                if content is not None:
+                    files.append({"path": item["path"], "content": content})
+            await skill_snapshots.save(name, {
+                "kind": "skill",
+                "action": action,
+                "manifest": record.model_dump(include=set(SkillManifest.model_fields)),
+                "files": files,
+            })
+        except Exception as exc:  # noqa: BLE001 - a snapshot must not block the write
+            _LOG.warning("could not snapshot skill %s: %s", name, exc)
+
+    async def _snapshot_file(
+        self, name: str, path: str, content: str | None, action: str = "before.file"
+    ) -> None:
+        if _RESTORING.get() or content is None:
+            return
+        try:
+            await skill_snapshots.save(name, {
+                "kind": "file", "action": action, "path": path, "content": content,
+            })
+        except Exception as exc:  # noqa: BLE001 - a snapshot must not block the write
+            _LOG.warning("could not snapshot file %s/%s: %s", name, path, exc)
+
+    async def snapshots(self, name: str, limit: int = skill_snapshots.MAX_PER_SKILL) -> list[dict[str, Any]]:
+        await self._ensure_seeded()
+        return await skill_snapshots.list_for(name, limit=limit)
+
+    async def rollback(self, snapshot_id: str) -> dict[str, Any]:
+        """Restore exactly one recorded before-state through the normal write path."""
+        await self._ensure_seeded()
+        snapshot = await skill_snapshots.load(snapshot_id)
+        if snapshot is None:
+            raise KeyError(f"unknown snapshot: {snapshot_id}")
+        name = str(snapshot.get("skill_name") or "")
+        kind = str(snapshot.get("kind") or "")
+        token = _RESTORING.set(True)
+        try:
+            if kind == "file":
+                path = str(snapshot.get("path") or "")
+                content = snapshot.get("content")
+                current = {item["path"] for item in await self.files(name)} if name in self._skills else set()
+                if content is None:
+                    if path in current:
+                        await self.remove_file(name, path)
+                else:
+                    await self.write_file(name, path, str(content))
+            elif kind == "skill":
+                manifest = SkillManifest.model_validate(snapshot.get("manifest") or {})
+                if manifest.name != name:
+                    raise ValueError("snapshot manifest does not match its skill name")
+                existing = self._skills.get(name)
+                await self.register(manifest, replace=existing is not None)
+                target = {
+                    str(item.get("path")): str(item.get("content"))
+                    for item in (snapshot.get("files") or [])
+                    if item.get("path")
+                }
+                current = {item["path"] for item in await self.files(name)}
+                for path in sorted(current - set(target)):
+                    await self.remove_file(name, path)
+                for path, content in target.items():
+                    await self.write_file(name, path, content)
+            else:
+                raise ValueError(f"unknown snapshot kind: {kind!r}")
+        finally:
+            _RESTORING.reset(token)
+        record = self._skills.get(name)
+        await self._history(
+            name, record.version if record else "", "rollback",
+            {"snapshot_id": snapshot_id, "kind": kind},
+        )
+        await self._emit("skill.rolled_back", name=name, snapshot_id=snapshot_id, kind=kind)
+        return {
+            "skill": name, "kind": kind, "snapshot_id": snapshot_id,
+            "restored": record is not None,
+        }
+
+    # -- prompt index --------------------------------------------------------
+
+    def index_entries(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Active, non-archived skills for the always-loaded system-prompt index."""
+        entries: list[dict[str, Any]] = []
+        for name in sorted(self._skills):
+            record = self._skills[name]
+            if not record.enabled or record.status in {"disabled", "archived"}:
+                continue
+            usage = self._usage.get(name) or {}
+            if str(usage.get("state") or "active") == "archived":
+                continue
+            entries.append({
+                "name": record.name,
+                "description": safe_description(record.description),
+                "category": record.category,
+                "created_by": record.created_by,
+            })
+            if len(entries) >= max(1, limit):
+                break
+        return entries
+
+    def index_prompt_block(self, limit: int = 50, max_chars: int = 1600) -> str:
+        """A bounded, one-line-per-skill block for the conversation system prompt."""
+        entries = self.index_entries(limit=limit)
+        if not entries:
+            return ""
+        lines = ["SKILLS (learned procedures; load full text with skill_read before use):"]
+        used = len(lines[0]) + 1
+        for entry in entries:
+            description = entry["description"] or entry["name"]
+            line = f"- {entry['name']} — {description} [{entry['category']}]"
+            if used + len(line) + 1 > max_chars:
+                break
+            lines.append(line)
+            used += len(line) + 1
+        return "\n".join(lines) if len(lines) > 1 else ""
