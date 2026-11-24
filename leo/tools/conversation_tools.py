@@ -40,6 +40,7 @@ from html.entities import html5 as _HTML5_ENTITIES
 
 from .. import db
 from ..contracts import RiskLevel, ToolSpec, utcnow
+from .conversation_scope import assert_conversation_visible, current_conversation
 
 FORMATS: tuple[str, ...] = ("md", "json", "txt")
 DEFAULT_LIMIT = 100
@@ -49,6 +50,16 @@ MAX_TEXT_CHARS = 4_000
 MAX_EXCERPT_CHARS = 280
 MAX_ITEMS = 10
 REDACTED = "[REDACTED]"
+
+# Long-term recall is a window, not a transcript dump. The model may page inside
+# the most recent window; anything older is outside this tool by design.
+MESSAGES_DEFAULT_LIMIT = 40
+MESSAGES_MAX_LIMIT = 200
+MESSAGES_MAX_PAGE_CHARS = 32_000
+MESSAGES_WINDOW_MESSAGES = 400
+MESSAGES_CROSS_LIMIT = 50
+MESSAGES_CROSS_WINDOW_MESSAGES = 100
+MESSAGES_CROSS_PAGE_CHARS = 16_000
 
 # Exports are stable, versioned files: repeated calls must not grow the
 # directory without bound (versions and total bytes are both capped).
@@ -908,14 +919,97 @@ async def _load(conversation_id: Any, after_id: Any, limit: int) -> tuple[str, l
     return conversation_id, page, has_more, next_cursor
 
 
-async def conversation_messages(args: dict[str, Any], ctx: dict[str, Any]) -> Any:
-    """Read compact, redacted turns with a stable ``after_id`` cursor."""
-    limit = _limit(args.get("limit"), "limit", DEFAULT_LIMIT, MAX_MESSAGES)
-    conversation_id, rows, has_more, next_cursor = await _load(
-        args.get("conversation_id"), args.get("after_id"), limit
+async def _resolve_conversation(args: dict[str, Any], ctx: Any) -> tuple[str, bool]:
+    """Return ``(conversation_id, cross_conversation)`` for a recall read.
+
+    A model-supplied id never silently replaces the authenticated binding: with
+    no id the bound current conversation is used, and an explicit different id is
+    an ownership-checked cross read with tighter limits.
+    """
+    supplied = args.get("conversation_id")
+    current = current_conversation(ctx)
+    if supplied is None:
+        if current is None:
+            raise ValueError(
+                "conversation_messages requires a bound current conversation "
+                "or an explicit conversation_id"
+            )
+        return current, False
+    if not isinstance(supplied, str) or not supplied.strip():
+        raise ValueError("conversation_id must be a non-empty string")
+    conversation_id = supplied.strip()
+    if conversation_id == current:
+        return conversation_id, False
+    assert_conversation_visible(ctx, conversation_id)
+    return conversation_id, True
+
+
+async def _window_bounds(conversation_id: str, window: int) -> tuple[int, int]:
+    """Return ``(oldest_id, newest_id)`` of the newest ``window`` messages."""
+    row = await db.fetchone(
+        "SELECT MIN(id) AS oldest, MAX(id) AS newest FROM ("
+        "SELECT id FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT ?)",
+        (conversation_id, max(1, int(window))),
     )
+    if row is None or row["newest"] is None:
+        return 0, 0
+    return int(row["oldest"]), int(row["newest"])
+
+
+def _budget_turns(
+    turns: list[dict[str, Any]], max_chars: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """Trim a page to an aggregate character ceiling; always keep one turn."""
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for turn in turns:
+        cost = len(json.dumps(turn, ensure_ascii=False, default=str))
+        if kept and used + cost > max_chars:
+            return kept, True
+        kept.append(turn)
+        used += cost
+    return kept, False
+
+
+async def conversation_messages(args: dict[str, Any], ctx: dict[str, Any]) -> Any:
+    """Read compact, redacted turns inside a bounded recent window."""
+    conversation_id, cross = await _resolve_conversation(args, ctx)
+    limit = _limit(
+        args.get("limit"),
+        "limit",
+        MESSAGES_DEFAULT_LIMIT,
+        MESSAGES_CROSS_LIMIT if cross else MESSAGES_MAX_LIMIT,
+    )
+    found = await db.fetchone(
+        "SELECT id FROM conversations WHERE id=?", (conversation_id,)
+    )
+    if found is None:
+        raise ValueError(f"unknown conversation: {conversation_id}")
+
+    window = MESSAGES_CROSS_WINDOW_MESSAGES if cross else MESSAGES_WINDOW_MESSAGES
+    oldest, newest = await _window_bounds(conversation_id, window)
+    requested = args.get("after_id")
+    start = _cursor(requested)
+    clamped = requested is not None and start < oldest
+    if start < oldest:
+        # ``after_id`` is exclusive: start one before the window floor so the
+        # oldest visible message is included on the first page.
+        start = max(0, oldest - 1)
+
+    rows = await db.fetchall(
+        "SELECT id, role, content, metadata, created_at FROM messages "
+        "WHERE conversation_id=? AND id>? ORDER BY id ASC LIMIT ?",
+        (conversation_id, start, limit + 1),
+    )
+    has_more = len(rows) > limit
+    page = rows[:limit]
     patterns = _patterns(ctx)
-    turns = [_turn(row, patterns, excerpt=True) for row in rows]
+    turns = [_turn(row, patterns, excerpt=True) for row in page]
+    turns, trimmed = _budget_turns(
+        turns, MESSAGES_CROSS_PAGE_CHARS if cross else MESSAGES_MAX_PAGE_CHARS
+    )
+    has_more = has_more or trimmed
+    next_cursor = str(turns[-1]["id"]) if has_more and turns else None
     return {
         "success": True,
         "conversation_id": conversation_id,
@@ -925,6 +1019,19 @@ async def conversation_messages(args: dict[str, Any], ctx: dict[str, Any]) -> An
         "has_more": has_more,
         "next_cursor": next_cursor,
         "redacted": True,
+        "cross_conversation": cross,
+        "clamped": clamped,
+        "window": {
+            "oldest_id": oldest,
+            "newest_id": newest,
+            "window_start_id": oldest,
+            "max_messages": window,
+            "max_page_chars": MESSAGES_CROSS_PAGE_CHARS if cross else MESSAGES_MAX_PAGE_CHARS,
+        },
+        "hint": (
+            f"Showing the most recent {window} messages. Use after_id to scroll "
+            "inside this window; older messages are outside this tool's recall window."
+        ),
     }
 
 
@@ -1319,7 +1426,9 @@ def register(registry: Any, services: Any = None) -> list[str]:
                 name="conversation_messages",
                 description=(
                     "Read compact, redacted turns from durable chat history with "
-                    "after_id/next_cursor pagination; includes tool names and errors."
+                    "after_id/next_cursor pagination; includes tool names and errors. "
+                    "Reads the bound conversation by default; older messages are outside "
+                    "its bounded recall window."
                 ),
                 category="conversation",
                 risk=RiskLevel.LOW,
@@ -1328,7 +1437,7 @@ def register(registry: Any, services: Any = None) -> list[str]:
                     {
                         "conversation_id": {"type": "string", "minLength": 1, "maxLength": 256},
                         "after_id": {"type": ["integer", "string", "null"], "minimum": 0},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": MAX_MESSAGES},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": MESSAGES_MAX_LIMIT},
                     },
                     [],
                 ),
@@ -1340,6 +1449,10 @@ def register(registry: Any, services: Any = None) -> list[str]:
                         "has_more": {"type": "boolean"},
                         "next_cursor": {"type": ["string", "null"]},
                         "redacted": {"type": "boolean"},
+                        "cross_conversation": {"type": "boolean"},
+                        "clamped": {"type": "boolean"},
+                        "window": {"type": "object"},
+                        "hint": {"type": "string"},
                     },
                     ["success", "count", "has_more"],
                 ),

@@ -241,3 +241,68 @@ async def test_compact_is_listed_as_available_not_unavailable(app):
     entry = next(item for item in catalog if item.get("name") == "compact")
     assert entry["available"] is True
     assert "/compact" in entry["help"] or "Summarize" in entry["help"]
+
+
+@pytest.mark.asyncio
+async def test_auto_compaction_preserves_system_prompt_and_pending_user(app):
+    from leo.contracts import ChatMessage
+
+    conversation_id = "conv-app-system"
+    await _conversation(app, conversation_id)
+    await _history(app, conversation_id, 20)
+    app.router = StubRouter()
+    app.compaction.config = compaction.CompactionConfig(
+        keep_recent_tokens=50, memory_flush=False, threshold=0.0001
+    )
+    pending = ChatMessage(role="user", content="continue the build")
+    cursor = await db.execute(
+        "INSERT INTO messages(conversation_id,role,content,metadata,created_at)"
+        " VALUES(?,?,?,?,?)",
+        (conversation_id, "user", pending.content, "{}", "2026-01-01T00:00:01+00:00"),
+    )
+    history = await app._conversation_history(conversation_id)
+    system = ChatMessage(role="system", content="system rules")
+
+    result = await app._maybe_auto_compact(
+        conversation_id,
+        [*history, system, pending],
+        budget=10_000,
+        pending_user=pending,
+        pending_user_id=int(cursor.lastrowid),
+    )
+
+    assert result[0].name == compaction.SUMMARY_NAME
+    assert sum(1 for m in result if m.role == "system" and m.content == "system rules") == 1
+    assert sum(1 for m in result if m.role == "user" and m.content == pending.content) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_compaction_after_a_prior_summary_keeps_ids_aligned(app):
+    conversation_id = "conv-app-realigned"
+    await _conversation(app, conversation_id)
+    await _history(app, conversation_id, 20)
+    app.router = StubRouter()
+    app.compaction.config = compaction.CompactionConfig(
+        keep_recent_tokens=50, memory_flush=False, threshold=0.0001
+    )
+
+    first = await app._maybe_auto_compact(
+        conversation_id, await app._conversation_history(conversation_id), budget=10_000
+    )
+    assert first and first[0].name == compaction.SUMMARY_NAME
+    first_boundary = await compaction.latest(conversation_id)
+
+    await _history(app, conversation_id, 10)
+    # The replay starts with a synthetic summary row that has no durable id;
+    # the engine must align rows and ids before choosing a new boundary.
+    replay = await app._conversation_history(conversation_id)
+    second = await app._maybe_auto_compact(conversation_id, replay, budget=10_000)
+
+    assert second and second[0].name == compaction.SUMMARY_NAME
+    second_boundary = await compaction.latest(conversation_id)
+    assert second_boundary is not None and first_boundary is not None
+    assert second_boundary.upto_message_id > first_boundary.upto_message_id
+    row = await db.fetchone(
+        "SELECT id FROM messages WHERE id=?", (second_boundary.upto_message_id,)
+    )
+    assert row is not None, "the stored boundary must name a real summarized row"

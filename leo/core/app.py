@@ -404,7 +404,18 @@ class LeoApp:
         from ..integrations.factory import IntegrationFactory
         from ..integrations.gateway import Gateway
 
-        self.context = ContextOptimizer()
+        context_config = getattr(self.settings, "context", None)
+        self.context = ContextOptimizer(
+            tool_output_chars=int(getattr(context_config, "tool_output_chars", 2_000)),
+            max_memories=int(getattr(context_config, "max_memories", 5)),
+            compact=bool(getattr(context_config, "compact", True)),
+            min_memory_score=float(getattr(context_config, "min_memory_score", 0.0)),
+            max_message_chars=int(getattr(context_config, "max_message_chars", 12_000)),
+            protect_head_messages=int(getattr(context_config, "protect_head_messages", 2)),
+            protect_head_tokens=int(getattr(context_config, "protect_head_tokens", 4_000)),
+            protect_tail_messages=int(getattr(context_config, "protect_tail_messages", 2)),
+            protect_tail_tokens=int(getattr(context_config, "protect_tail_tokens", 6_000)),
+        )
         self.compaction = compaction.CompactionEngine(
             self._compaction_config(), memory=None
         )
@@ -1838,6 +1849,8 @@ class LeoApp:
             identifier_policy=str(getattr(raw, "identifier_policy", "strict")),
             memory_flush=bool(getattr(raw, "memory_flush", True)),
             on_timeout=str(getattr(raw, "on_timeout", "deterministic")),
+            protect_objective=bool(getattr(raw, "protect_objective", True)),
+            objective_chars=int(getattr(raw, "objective_chars", 4_000)),
         )
 
     def _compaction_provider(self) -> Any:
@@ -1899,23 +1912,31 @@ class LeoApp:
         conversation_id: str,
         messages: list[ChatMessage],
         budget: int,
+        *,
+        pending_user: ChatMessage | None = None,
+        pending_user_id: int | None = None,
     ) -> list[ChatMessage]:
         """Compact before a turn when occupancy crosses the configured threshold.
 
-        Returns the messages to send. A compaction failure never blocks the
-        turn: the existing per-turn optimizer still bounds the request.
+        Only durable rows are summarized, with their ids in lockstep; the
+        current turn's pending user message and the system prompt are carried
+        through verbatim. Returns the messages to send; a failure never blocks
+        the turn (the per-turn optimizer still bounds the request).
         """
         config = self.compaction.config
         if not compaction.CompactionEngine.should_compact(messages, budget, config):
             return messages
         rows = await self._conversation_rows(conversation_id)
-        if not rows:
+        if pending_user_id is not None:
+            rows = [row for row in rows if int(row["id"]) != int(pending_user_id)]
+        if len(rows) < 3:
             return messages
+        durable = self._rows_to_messages(list(rows))
         message_ids = [int(row["id"]) for row in rows]
         try:
             result = await self.compaction.compact(
                 conversation_id,
-                messages,
+                durable,
                 provider=self._compaction_provider(),
                 budget=budget,
                 previous=await compaction.latest(conversation_id),
@@ -1932,16 +1953,34 @@ class LeoApp:
         boundary = await compaction.latest(conversation_id)
         if boundary is None:
             return messages
-        # Rebuild the replay view: summary + post-boundary history, then the
-        # current turn's user message (which is not durable history yet).
-        replay = await self._conversation_history(conversation_id)
-        latest_user = next(
-            (m for m in reversed(messages) if m.role == "user"), None
-        )
-        if latest_user is not None and not any(
-            m.role == "user" and m.content == latest_user.content for m in replay
-        ):
-            replay = [*replay, latest_user]
+        # Rebuild from the durable rows that survived the boundary. The pending
+        # user row is excluded here and re-appended from memory so images and
+        # attachments survive (durable rows do not store image blocks).
+        post_rows = [
+            row
+            for row in await self._conversation_rows(conversation_id)
+            if pending_user_id is None or int(row["id"]) != int(pending_user_id)
+        ]
+        replay: list[ChatMessage] = [
+            compaction.CompactionEngine.summary_message(boundary),
+            *self._rows_to_messages(post_rows),
+        ]
+        systems = [
+            message
+            for message in messages
+            if message.role == "system" and message.name != compaction.SUMMARY_NAME
+        ]
+        if systems:
+            insert_at = 1 if replay and replay[0].name == compaction.SUMMARY_NAME else 0
+            replay[insert_at:insert_at] = systems
+        if pending_user is not None:
+            replay.append(pending_user)
+        else:
+            latest_user = next((m for m in reversed(messages) if m.role == "user"), None)
+            if latest_user is not None and not any(
+                m.role == "user" and m.content == latest_user.content for m in replay
+            ):
+                replay.append(latest_user)
         _LOG.info(
             "auto-compaction committed",
             extra={
@@ -2530,22 +2569,24 @@ class LeoApp:
                     for a in resolved
                 ]
             }
-        await db.execute(
+        user_cursor = await db.execute(
             "INSERT INTO messages(conversation_id,role,content,metadata,created_at) VALUES(?,?,?,?,?)",
             (conversation_id, "user", turn_text,
              json.dumps(attachment_metadata, default=str), utcnow()),
         )
+        user_row_id = getattr(user_cursor, "lastrowid", None)
         memories = await self.search.search(text, limit=5) if self.search else []
         budget = self._context_budget()
         # Memories are injected exactly once by ContextOptimizer, which applies
         # relevance selection and a dedicated token budget.
         system = self._conversation_system_prompt()
         tool_specs = [spec.model_dump(mode="json") for spec in self.registry.list_specs()]
+        user_message = ChatMessage(role="user", content=turn_text, images=images)
         request = ModelRequest(
             messages=[
                 *history,
                 ChatMessage(role="system", content=system),
-                ChatMessage(role="user", content=turn_text, images=images),
+                user_message,
             ],
             task_category="conversation",
             tools=tool_specs,
@@ -2555,7 +2596,11 @@ class LeoApp:
         # Durable compaction runs before the per-turn optimizer so the summary
         # replaces history instead of being re-derived on every request.
         request.messages = await self._maybe_auto_compact(
-            conversation_id, request.messages, budget
+            conversation_id,
+            request.messages,
+            budget,
+            pending_user=user_message,
+            pending_user_id=user_row_id,
         )
         request.messages = self.context.optimize(request.messages, budget=budget, memories=memories, provider=self.router)
         tool_results: list[dict[str, Any]] = []
@@ -2888,10 +2933,11 @@ class LeoApp:
                 if candidate:
                     resolved.append(candidate)
             metadata = {"attachments": [{"id": a.get("id"), "name": a.get("name"), "mime": a.get("mime")} for a in resolved]}
-            await db.execute(
+            user_cursor = await db.execute(
                 "INSERT INTO messages(conversation_id,role,content,metadata,created_at) VALUES(?,?,?,?,?)",
                 (conversation_id, "user", text, json.dumps(metadata, default=str), utcnow()),
             )
+            user_row_id = getattr(user_cursor, "lastrowid", None)
             # The user turn is durable before the stream opens: a client abort
             # can no longer leave an empty orphan conversation.
             yield ev(type="run.started", conversation_id=conversation_id)
@@ -2911,18 +2957,23 @@ class LeoApp:
             memories = await self.search.search(prompt, limit=5) if self.search else []
             system = self._conversation_system_prompt()
             tool_specs = [spec.model_dump(mode="json") for spec in self.registry.list_specs()]
+            user_message = ChatMessage(role="user", content=prompt, images=images)
             request = ModelRequest(
                 messages=[
                     *history,
                     ChatMessage(role="system", content=system),
-                    ChatMessage(role="user", content=prompt, images=images),
+                    user_message,
                 ],
                 task_category="conversation", tools=tool_specs, task_id=conversation_id,
                 reasoning_effort=await self.reasoning_state.effort_for(conversation_id),
             )
             # Durable compaction runs once, before the per-turn optimizer.
             request.messages = await self._maybe_auto_compact(
-                conversation_id, request.messages, budget
+                conversation_id,
+                request.messages,
+                budget,
+                pending_user=user_message,
+                pending_user_id=user_row_id,
             )
             request.messages = self.context.optimize(request.messages, budget=budget, memories=memories, provider=self.router)
             tool_results: list[dict[str, Any]] = []

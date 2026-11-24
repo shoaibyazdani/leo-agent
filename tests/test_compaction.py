@@ -529,3 +529,81 @@ async def test_empty_summarizer_still_commits_a_boundary(test_env):
 
     assert result.ok, result.reason
     assert await compaction.latest(conversation_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# objective protection and durable id alignment
+
+
+def test_align_drops_summary_rows_and_their_ids_together():
+    messages = [
+        ChatMessage(role="user", content="build the thing"),
+        ChatMessage(role="system", content="old summary", name=compaction.SUMMARY_NAME),
+        ChatMessage(role="user", content="continue"),
+    ]
+    aligned, ids = CompactionEngine._align(messages, [11, 12, 13])
+    assert [m.content for m in aligned] == ["build the thing", "continue"]
+    assert ids == [11, 13]
+
+
+@pytest.mark.asyncio
+async def test_misaligned_message_ids_are_refused_truthfully(test_env):
+    engine = CompactionEngine(CompactionConfig())
+    messages = [ChatMessage(role="user", content=f"q{i}") for i in range(4)]
+    result = await engine.compact(
+        "conv-misaligned",
+        messages,
+        provider=FakeProvider(),
+        budget=10_000,
+        message_ids=[1, 2, 3],
+    )
+    assert not result.ok
+    assert "align" in (result.reason or "")
+
+
+def test_summary_message_carries_the_original_objective():
+    record = compaction.CompactionRecord(
+        id=1,
+        conversation_id="conv-objective",
+        summary="summary body",
+        upto_message_id=10,
+        messages_summarized=3,
+        details={"original_objective": "implement the parser", "quality_degraded": False},
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    message = CompactionEngine.summary_message(record)
+    assert "Original objective (preserved verbatim):" in message.content
+    assert "implement the parser" in message.content
+    assert "Summary:" in message.content
+
+
+@pytest.mark.asyncio
+async def test_compact_records_the_objective_and_shapes_the_summarizer_input(test_env):
+    conversation_id = "conv-objective-compact"
+    rows = [
+        ("user", "implement the parser end to end", None),
+        ("assistant", "working", None),
+        ("user", "continue", None),
+        ("assistant", "still working", None),
+        ("user", "finish it", None),
+    ]
+    ids = await _seed(conversation_id, rows)
+    provider = FakeProvider(["summary"])
+    engine = CompactionEngine(
+        CompactionConfig(keep_recent_tokens=4, memory_flush=False)
+    )
+    messages = [ChatMessage(role=role, content=text) for role, text, _ in rows]
+
+    result = await engine.compact(
+        conversation_id,
+        messages,
+        provider=provider,
+        budget=10_000,
+        message_ids=ids,
+    )
+
+    assert result.ok, result.reason
+    assert result.details["original_objective"] == "implement the parser end to end"
+    summarizer_input = provider.requests[0].messages[1].content
+    assert "OBJECTIVE (preserve verbatim" in summarizer_input
+    assert "implement the parser end to end" in summarizer_input

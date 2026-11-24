@@ -333,6 +333,24 @@ class CompactionConfig(BaseModel):
     on_timeout: str = "deterministic"
     # Optional summarizer override; empty means the active session model.
     model: str = ""
+    # Carry the first real user ask through the durable summary verbatim, so an
+    # interrupted/resumed turn never loses its objective.
+    protect_objective: bool = True
+    objective_chars: int = Field(default=4_000, ge=200, le=20_000)
+
+
+class ContextConfig(BaseModel):
+    """Per-turn context shaping, separate from durable compaction."""
+
+    max_message_chars: int = Field(default=12_000, ge=0)
+    tool_output_chars: int = Field(default=2_000, ge=0)
+    max_memories: int = Field(default=5, ge=0)
+    compact: bool = True
+    min_memory_score: float = Field(default=0.0, ge=0.0)
+    protect_head_messages: int = Field(default=2, ge=0, le=50)
+    protect_head_tokens: int = Field(default=4_000, ge=0)
+    protect_tail_messages: int = Field(default=2, ge=0, le=50)
+    protect_tail_tokens: int = Field(default=6_000, ge=0)
 
 
 class AutoNoteConfig(BaseModel):
@@ -457,6 +475,7 @@ class Settings(BaseModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     models: ModelConfig = Field(default_factory=ModelConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
     progress: ProgressConfig = Field(default_factory=ProgressConfig)
     learning: LearningConfig = Field(default_factory=LearningConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
@@ -617,6 +636,13 @@ class Settings(BaseModel):
             "compaction": [
                 "enabled", "threshold", "keep_recent_tokens",
                 "summary_input_chars", "corrective_attempts",
+                "identifier_policy", "memory_flush", "on_timeout",
+                "protect_objective", "objective_chars",
+            ],
+            "context": [
+                "max_message_chars", "tool_output_chars", "max_memories", "compact",
+                "min_memory_score", "protect_head_messages", "protect_head_tokens",
+                "protect_tail_messages", "protect_tail_tokens",
             ],
         }.items():
             target = getattr(settings, group)

@@ -22,6 +22,7 @@ from .. import db
 from ..contracts import ChatMessage, RiskLevel, ToolSpec
 from ..models.context import ContextOptimizer
 from ..models.provider import CHARS_PER_TOKEN, estimate_tokens
+from .conversation_scope import current_conversation
 
 TOOL_NAMES = ("context_stats", "token_estimate", "context_preview")
 
@@ -37,8 +38,8 @@ _MAX_TEXT_CHARS = 20000
 # The current conversation is an execution-context fact, never a tool argument.
 # ``correlation_id``/``task_id`` are populated by ToolExecutorImpl from the
 # authenticated call, and the chat app sets them to the active conversation id.
-_TRUSTED_CONVERSATION_KEYS = ("conversation_id", "current_conversation_id")
-_QUOTA_PREFIXES = ("task:", "correlation:", "actor:")
+# The binding rules live in ``conversation_scope`` so every transcript tool uses
+# exactly the same precedence.
 
 # Settings redaction patterns are honoured too; these cover common secret forms
 # that the default settings patterns do not (bearer credentials, JWTs, PINs).
@@ -137,40 +138,7 @@ def _coerce_message(value: Any) -> ChatMessage | None:
     return None
 
 
-def _current_conversation(ctx: Any) -> str | None:
-    """Return the conversation the authenticated call is bound to, if any."""
-    if not isinstance(ctx, Mapping):
-        return None
-    current: str | None = None
-    for key in _TRUSTED_CONVERSATION_KEYS:
-        value = ctx.get(key)
-        if isinstance(value, str) and value:
-            current = value
-            break
-    if current is None:
-        # A task-scoped chat call is the strongest binding; the executor derives
-        # it from ToolCall.task_id, which the chat app sets to the conversation.
-        value = ctx.get("task_id")
-        if isinstance(value, str) and value:
-            candidate = value[len("task:"):] if value.startswith("task:") else value
-            if (candidate and candidate != "global"
-                    and not candidate.startswith(_QUOTA_PREFIXES)):
-                current = candidate
-        if current is None:
-            value = ctx.get("correlation_id")
-            if isinstance(value, str) and value and not value.startswith(_QUOTA_PREFIXES):
-                current = value
-    if current is None:
-        return None
-    # Optional composition-root ownership metadata: if supplied, the actor must
-    # own the conversation before any of its messages are readable.
-    owners = ctx.get("conversation_actors") or ctx.get("conversation_owners")
-    if isinstance(owners, Mapping):
-        allowed = owners.get(current)
-        actor = ctx.get("actor")
-        if allowed is not None and actor is not None and str(allowed) != str(actor):
-            return None
-    return current
+_current_conversation = current_conversation
 
 
 def _bound_conversation(args: dict[str, Any], ctx: Any) -> str | None:

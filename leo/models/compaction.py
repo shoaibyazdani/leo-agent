@@ -90,6 +90,10 @@ class CompactionConfig:
     memory_flush: bool = True
     # What an automatic compaction does when the summarizer times out.
     on_timeout: str = "deterministic"
+    # Carry the first real user ask through the summary verbatim, so the
+    # objective survives an interrupted/resumed turn.
+    protect_objective: bool = True
+    objective_chars: int = 4_000
 
     def __post_init__(self) -> None:
         if not 0.0 < float(self.threshold) <= 1.0:
@@ -106,6 +110,8 @@ class CompactionConfig:
             raise ValueError(
                 "compaction.on_timeout must be 'deterministic' or 'keep_history'"
             )
+        if int(self.objective_chars) < 200:
+            raise ValueError("compaction.objective_chars must be >= 200")
 
 
 @dataclass
@@ -248,10 +254,23 @@ def _render(message: ChatMessage, limit: int) -> str:
     return f"{message.role}: {body}"
 
 
+def first_objective(messages: Sequence[ChatMessage], max_chars: int = 4_000) -> str:
+    """The first real user ask, trimmed. Skips system/summary/tool rows."""
+    for message in messages:
+        if message.role != "user":
+            continue
+        text = (message.content or "").strip()
+        if text:
+            return text[: max(0, int(max_chars))]
+    return ""
+
+
 def shape_summary_input(
     messages: Sequence[ChatMessage],
     budget_chars: int = DEFAULT_SUMMARY_INPUT_CHARS,
     previous_summary: str = "",
+    *,
+    objective: str = "",
 ) -> str:
     """Build a bounded summarizer transcript with explicit gap markers.
 
@@ -322,6 +341,12 @@ def shape_summary_input(
         return ""
 
     lines: list[str] = []
+    if objective.strip():
+        lines.append(
+            "OBJECTIVE (preserve verbatim; this is what the session was asked to do):\n"
+            + objective.strip()[: max(0, int(budget_chars // 4))]
+        )
+        lines.append("")
     if previous_summary:
         lines.append(
             "Previous summary (carry its facts forward; it is already compacted):\n"
@@ -564,6 +589,30 @@ class CompactionEngine:
         used = sum(estimate_tokens(m.content) for m in messages)
         return used >= int(budget * float(config.threshold))
 
+    @staticmethod
+    def _align(
+        messages: Sequence[ChatMessage], message_ids: Sequence[int] | None
+    ) -> tuple[list[ChatMessage], list[int] | None]:
+        """Drop synthetic summary rows and their ids in lockstep.
+
+        The split is computed by index over ``messages`` and applied to
+        ``message_ids``; one stale summary row that exists in the text but not in
+        the durable rows shifts every id after it. Returns ``None`` ids when the
+        caller's lists do not align, so ``compact`` can fail truthfully.
+        """
+        if message_ids is None:
+            return list(messages), None
+        if len(message_ids) != len(messages):
+            return list(messages), None
+        kept_messages: list[ChatMessage] = []
+        kept_ids: list[int] = []
+        for message, message_id in zip(messages, message_ids):
+            if message.role == "system" and message.name == SUMMARY_NAME:
+                continue
+            kept_messages.append(message)
+            kept_ids.append(int(message_id))
+        return kept_messages, kept_ids
+
     # -- memory flush ------------------------------------------------------
     async def _flush_memory(self, conversation_id: str, messages: Sequence[ChatMessage]) -> dict[str, Any]:
         """Persist durable facts from the span about to leave model context.
@@ -624,6 +673,20 @@ class CompactionEngine:
         if len(messages) < 3:
             return CompactionResult(False, reason="not enough history to compact", tokens_before=before)
 
+        had_message_ids = message_ids is not None
+        messages, message_ids = self._align(messages, message_ids)
+        if had_message_ids and message_ids is None:
+            return CompactionResult(
+                False,
+                reason="message_ids must align 1:1 with messages",
+                tokens_before=before,
+            )
+        objective = (
+            first_objective(messages, self.config.objective_chars)
+            if self.config.protect_objective
+            else ""
+        )
+
         split = choose_split(messages, self.config.keep_recent_tokens)
         if split is None:
             history_tokens = sum(estimate_tokens(m.content) for m in messages)
@@ -653,6 +716,7 @@ class CompactionEngine:
             older,
             self.config.summary_input_chars,
             previous.summary if previous else "",
+            objective=objective,
         )
         if not transcript.strip():
             return CompactionResult(False, reason="empty summarizer input", tokens_before=before)
@@ -737,6 +801,8 @@ class CompactionEngine:
             "focus": focus[:200] or None,
             "quality_degraded": degraded,
             "split_index": split,
+            "original_objective": objective or None,
+            "summarized_span": [0, split],
         }
 
         if preview:
@@ -819,11 +885,12 @@ class CompactionEngine:
                 "Conversation summary (durable compaction; older turns omitted; "
                 "quality degraded — some details may be missing):"
             )
-        return ChatMessage(
-            role="system",
-            content=header + "\n" + record.summary,
-            name=SUMMARY_NAME,
-        )
+        objective = str(record.details.get("original_objective") or "").strip()
+        body = header + "\n"
+        if objective:
+            body += "Original objective (preserved verbatim):\n" + objective + "\n\n"
+        body += "Summary:\n" + record.summary
+        return ChatMessage(role="system", content=body, name=SUMMARY_NAME)
 
 
 __all__ = [
@@ -837,6 +904,7 @@ __all__ = [
     "choose_split",
     "clear",
     "collect_identifiers",
+    "first_objective",
     "init_schema",
     "latest",
     "outline_degraded",
