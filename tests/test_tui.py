@@ -107,3 +107,72 @@ def test_cli_exposes_chat_and_tui_commands() -> None:
     help_result = runner.invoke(cli_mod.cli, ["chat", "--help"])
     assert help_result.exit_code == 0
     assert "--conversation" in help_result.stdout
+
+
+@pytest.mark.asyncio
+async def test_stop_command_targets_the_running_conversation() -> None:
+    app = await _mock_app()
+    try:
+        console, stream = _console()
+        tui = tui_mod.ChatTUI(app, console=console, conversation_id="conv-tui")
+
+        # Idle: nothing to stop, and no durable request is left behind.
+        assert await tui.run_command("stop", []) is True
+        assert "no turn is running" in stream.getvalue().lower()
+
+        # Busy: the command writes the turn stop for this conversation.
+        tui._turning = True
+        assert await tui.run_command("stop", []) is True
+        assert await app._turn_stop_requested("conv-tui", "2000-01-01T00:00:00+00:00")
+        assert "stop requested" in stream.getvalue().lower()
+    finally:
+        await app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stop_typed_while_a_turn_streams_interrupts_it() -> None:
+    """The TUI keeps reading input during a turn: /stop dispatches inline."""
+    import asyncio
+    import time
+
+    class _SlowApp:
+        def __init__(self) -> None:
+            self.stopped = asyncio.Event()
+
+        async def initialize(self) -> None:
+            return None
+
+        async def request_turn_stop(self, conversation_id: str, requested_by: str = "") -> bool:
+            self.stopped.set()
+            return True
+
+        async def ask_stream(self, text, channel="cli", subject=None, conversation_id=None):
+            yield {"type": "run.started", "conversation_id": "conv-tui-stream"}
+            try:
+                await asyncio.wait_for(self.stopped.wait(), timeout=5)
+                yield {"type": "message.finished", "content": "stopped", "status": "cancelled"}
+                yield {"type": "run.finished", "status": "cancelled"}
+            except asyncio.TimeoutError:
+                yield {"type": "message.finished", "content": "done", "status": "completed"}
+                yield {"type": "run.finished", "status": "completed"}
+
+    calls = {"n": 0}
+
+    def fake_input(_prompt: str) -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "do something long"
+        if calls["n"] == 2:
+            time.sleep(0.1)  # let the turn start and claim its conversation id
+            return "/stop"
+        raise EOFError
+
+    app = _SlowApp()
+    console, stream = _console()
+    tui = tui_mod.ChatTUI(app, console=console, input_fn=fake_input)
+
+    assert await asyncio.wait_for(tui.run(), timeout=10) == 0
+    assert app.stopped.is_set()
+    output = stream.getvalue().lower()
+    assert "stop requested" in output
+    assert "cancelled" in output

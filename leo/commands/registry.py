@@ -35,6 +35,12 @@ from ..security import ApprovalRequired
 
 ALL_SURFACES: frozenset[str] = frozenset({"chat", "cli", "api", "gateway", "desktop"})
 CHAT_SURFACES: frozenset[str] = frozenset({"chat", "cli", "desktop"})
+# How a command interacts with a turn that is already running:
+#   any       — nothing special; the surface may queue it.
+#   idle      — only valid when no turn is in flight.
+#   interrupt — dispatched inline and stops the running turn, never queued
+#               behind it (this is Hermes's "interrupt_then_dispatch").
+VALID_BUSY_POLICIES: frozenset[str] = frozenset({"any", "idle", "interrupt"})
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _APPROVAL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -152,6 +158,11 @@ class CommandSpec:
                 raise ValueError(f"invalid alias for /{self.name}: {alias!r}")
         object.__setattr__(self, "action", self.action or f"slash.{self.name}")
         object.__setattr__(self, "risk", RiskLevel(self.risk))
+        if self.busy_policy not in VALID_BUSY_POLICIES:
+            raise ValueError(
+                f"/{self.name}: busy_policy must be one of "
+                f"{sorted(VALID_BUSY_POLICIES)}, got {self.busy_policy!r}"
+            )
         if not self.available and not self.unavailable_reason:
             raise ValueError(f"/{self.name} is unavailable but has no reason")
         if self.operator_only and not self.available:
@@ -399,6 +410,23 @@ class CommandRegistry:
         if len(matches) == 1:
             return matches[0], []
         return None, [f"/{spec.name}" for spec in matches[:12]]
+
+    def busy_policy_for(self, text: str) -> str | None:
+        """Busy policy of the command ``text`` names, or ``None`` if not one.
+
+        Surfaces call this before queueing input: a command whose policy is
+        ``interrupt`` must be handled inline while a turn is running, never
+        appended to the queue behind that turn.
+        """
+        parsed = parse(text)
+        if parsed is None or parsed.error or not parsed.name:
+            return None
+        spec, _ = self.resolve(parsed.name)
+        return spec.busy_policy if spec is not None else None
+
+    def is_interrupt(self, text: str) -> bool:
+        """True when ``text`` is a slash command that interrupts a live turn."""
+        return self.busy_policy_for(text) == "interrupt"
 
     # ---- help / catalog ---------------------------------------------------
     def _policy_kwargs(self) -> dict[str, frozenset[str]]:
@@ -672,6 +700,6 @@ class CommandRegistry:
 
 __all__ = [
     "ADMIN_PRINCIPALS_DEFAULT", "ALL_SURFACES", "OPERATOR_PRINCIPALS_DEFAULT",
-    "ArgumentSpec", "CommandContext", "CommandRegistry", "CommandResult",
-    "CommandSpec", "CommandStatus", "ParsedCommand", "parse",
+    "VALID_BUSY_POLICIES", "ArgumentSpec", "CommandContext", "CommandRegistry",
+    "CommandResult", "CommandSpec", "CommandStatus", "ParsedCommand", "parse",
 ]

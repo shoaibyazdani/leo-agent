@@ -565,3 +565,27 @@ async def test_outbox_unconfirmed_handler_result_stays_retryable():
     assert result["failed"] == 1 and result["remaining"] == 1
     row = (await gateway.pending_outbox())[0]
     assert row["attempts"] == 1 and "did not confirm delivery" in row["last_error"]
+
+
+async def test_interrupt_commands_are_handled_at_admission_not_in_the_outbox():
+    """A /stop must not wait behind the serial outbox for the turn it targets.
+
+    Inbound messages drain one turn at a time; an interrupt-class command is
+    routed out of band at admission, exactly like Hermes's gateway /stop.
+    """
+    gateway = make_gateway()
+    seen: list[tuple[str, str]] = []
+
+    async def handler(conversation_id: str, text: str) -> None:
+        seen.append((conversation_id, text))
+
+    gateway.set_interrupt_handler(lambda text: text.strip() == "/stop", handler)
+    admitted = await gateway.receive(msg(text="/stop"))
+
+    assert seen == [(admitted["conversation_id"], "/stop")]
+    # The admitted row still exists, so the user receives the acknowledgement.
+    row = await db.fetchone(
+        "SELECT text FROM gateway_outbox WHERE conversation_id=?",
+        (admitted["conversation_id"],),
+    )
+    assert row is not None and row["text"] == "/stop"

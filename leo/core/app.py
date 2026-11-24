@@ -239,10 +239,18 @@ class LeoApp:
         from ..models.reasoning_state import ReasoningState
         self.reasoning_state = ReasoningState()
         self._cancelled_runs: set[str] = set()
+        # Runs stopped by /stop (a turn-level stop) rather than by an explicit
+        # run cancellation (the Stop button). Both end cancelled, but /stop has
+        # a truthful "Stopped at your request" terminal row; a run cancel keeps
+        # the historical silent-abort path.
+        self._stop_runs: set[str] = set()
         # In-process turn interrupts, keyed by conversation: a /stop wakes the
         # live model call, stream and tool wait immediately instead of waiting
         # for the next durable poll. The SQLite row stays the cross-process path.
         self._stop_events: dict[str, asyncio.Event] = {}
+        # When the in-process request landed, for the same "only this turn"
+        # window the durable row uses. Cleared with the row when consumed.
+        self._stop_requested_at: dict[str, str] = {}
         # Origin chat of the turn in flight: {channel, target, conversation_id}.
         # Used by task_create(background=true) so progress reaches the chat
         # that asked, and cleared when the turn ends.
@@ -278,9 +286,10 @@ class LeoApp:
         self._evolution_learning_digest_proposals = 0
         self._evolution_learning_auto_writes = 0
 
-    def _start_run(self, run_id: str, conversation_id: str) -> None:
+    def _start_run(self, run_id: str, conversation_id: str, *, slash: bool = False) -> None:
         self._runs[run_id] = {
-            "conversation_id": conversation_id, "status": "running", "started_at": utcnow(),
+            "conversation_id": conversation_id, "status": "running",
+            "started_at": utcnow(), "slash": bool(slash),
         }
 
     def _finish_run(self, run_id: str, status: str) -> None:
@@ -297,32 +306,78 @@ class LeoApp:
         A cancellation that landed before this call is authoritative: never
         overwrite it with a success status reported by the model loop.
         """
-        if run_id in self._cancelled_runs:
+        if run_id in self._cancelled_runs or run_id in self._stop_runs:
             status = "cancelled"
         self._finish_run(run_id, status)
         self._cancelled_runs.discard(run_id)
+        self._stop_runs.discard(run_id)
         self._runs.pop(run_id, None)
 
     # -- turn stop ---------------------------------------------------------
-    async def request_turn_stop(self, conversation_id: str, requested_by: str = "operator") -> bool:
-        """Ask the live turn for a conversation to stop at its next step.
+    def _stop_event(self, conversation_id: str) -> asyncio.Event:
+        """The in-process interrupt event for one conversation.
 
-        A stop crosses processes: the command may be handled by one worker loop
-        while another runs the turn, so the request lives in SQLite, not in this
-        process's memory.
+        An ``asyncio.Event`` (not a bare set) because ``_await_with_stop`` waits
+        on it: a stop therefore wakes a model call or tool wait immediately,
+        instead of being noticed at the next 0.75 s poll.
+        """
+        key = str(conversation_id)
+        event = self._stop_events.get(key)
+        if event is None:
+            event = asyncio.Event()
+            self._stop_events[key] = event
+        return event
+
+    async def request_turn_stop(
+        self,
+        conversation_id: str,
+        requested_by: str = "operator",
+        *,
+        exclude_run_id: str | None = None,
+    ) -> bool:
+        """Stop the turn running in ``conversation_id`` now.
+
+        Three things happen, so every surface observes the same stop:
+
+        * the in-process event wakes ``_await_with_stop`` immediately;
+        * every live run for the conversation is marked cancelled, so a
+          streaming turn's ``cancellation_guard`` fires at its next checkpoint;
+        * a durable ``turn_cancels`` row keeps the request working across
+          processes.
+
+        ``exclude_run_id`` is the caller's *own* run (a ``/stop`` dispatched
+        through a streaming turn): it must never cancel the request that carries
+        it.
         """
         if not conversation_id:
             return False
+        key = str(conversation_id)
+        requested_at = utcnow()
+        self._stop_requested_at[key] = requested_at
+        self._stop_event(conversation_id).set()
+        for run_id, info in tuple(self._runs.items()):
+            if run_id == exclude_run_id:
+                continue
+            # A slash command is a response to the operator, not work: stopping
+            # the conversation must never cut a /help or /stop acknowledgement.
+            if info.get("slash"):
+                continue
+            if str(info.get("conversation_id")) == key:
+                self._stop_runs.add(run_id)
         await db.execute(
             "INSERT INTO turn_cancels(conversation_id, requested_at, requested_by) "
             "VALUES(?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET "
             "requested_at=excluded.requested_at, requested_by=excluded.requested_by",
-            (str(conversation_id), utcnow(), str(requested_by)),
+            (key, requested_at, str(requested_by)),
         )
         return True
 
     async def _turn_stop_requested(self, conversation_id: str, since: str) -> bool:
         """True when a stop was requested after this turn started."""
+        key = str(conversation_id)
+        requested_at = self._stop_requested_at.get(key)
+        if requested_at is not None and str(requested_at) >= str(since):
+            return True
         try:
             row = await db.fetchone(
                 "SELECT requested_at FROM turn_cancels WHERE conversation_id=?",
@@ -340,14 +395,24 @@ class LeoApp:
         A model call can run for minutes and the router retries it across
         providers. Observing the stop only *between* rounds meant several /stop
         messages could arrive while the turn kept working, which reads as the stop
-        being ignored. This polls the same durable flag while the call is in
-        flight, cancels it, and raises the same TurnStopped the caller handles.
+        being ignored. This waits on the in-process stop event (immediate) and
+        polls the durable flag (cross-process), then cancels the call and raises
+        the same TurnStopped the caller handles.
         """
         task = asyncio.ensure_future(awaitable)
+        # Real app turns share an asyncio.Event, so a stop wakes this wait at
+        # once. A test double without that registry still works through the
+        # durable poll every 0.75 s.
+        events = getattr(self, "_stop_events", None)
+        event = self._stop_event(conversation_id) if events is not None else None
+        waiter = asyncio.ensure_future(event.wait()) if event is not None else None
         try:
             while True:
-                done, _ = await asyncio.wait({task}, timeout=0.75)
-                if done:
+                pending = {task, waiter} if waiter is not None else {task}
+                done, _ = await asyncio.wait(
+                    pending, timeout=0.75, return_when=asyncio.FIRST_COMPLETED
+                )
+                if task in done:
                     return task.result()
                 if await self._turn_stop_requested(conversation_id, since):
                     _LOG.info("stop observed while waiting", extra={
@@ -365,19 +430,41 @@ class LeoApp:
                         pass
                     await self._clear_turn_stop(conversation_id)
                     raise TurnStopped(conversation_id)
+                if waiter is not None and waiter.done():
+                    # The event fired outside this turn's window (a request the
+                    # turn did not own): re-arm instead of spinning on the
+                    # already-completed waiter.
+                    event.clear()
+                    waiter = asyncio.ensure_future(event.wait())
         finally:
             if not task.done():
                 task.cancel()
+            if waiter is not None and not waiter.done():
+                waiter.cancel()
 
     async def _clear_turn_stop(self, conversation_id: str) -> None:
+        """Consume the stop request for a conversation (both channels).
+
+        The event is cleared, not discarded: a waiter may still hold a reference,
+        and clearing is what makes "no stop pending" true for the next turn.
+        """
+        event = self._stop_events.get(str(conversation_id))
+        if event is not None:
+            event.clear()
+        self._stop_requested_at.pop(str(conversation_id), None)
         try:
             await db.execute("DELETE FROM turn_cancels WHERE conversation_id=?",
                              (str(conversation_id),))
         except Exception:  # noqa: BLE001
             pass
 
-    async def cancel_run(self, run_id: str) -> str:
-        """Cancel a live run; unknown or terminal runs are rejected truthfully."""
+    async def cancel_run(self, run_id: str, *, exclude_run_id: str | None = None) -> str:
+        """Cancel a live run; unknown or terminal runs are rejected truthfully.
+
+        The durable turn stop is requested too, so cancelling a run also reaches
+        a long tool call (which observes the stop event, not the run registry)
+        and any worker process that owns the conversation.
+        """
         info = self._runs.get(run_id)
         if info is None:
             raise LookupError(f"unknown run: {run_id}")
@@ -387,6 +474,12 @@ class LeoApp:
             return "already_cancelled"
         self._cancelled_runs.add(run_id)
         info["status"] = "cancelled"
+        # One stop mechanism for both entry points: the same request wakes a
+        # tool wait (which only watches the stop event/durable row), and reaches
+        # a worker process that owns this conversation.
+        await self.request_turn_stop(
+            info["conversation_id"], requested_by="run.cancel", exclude_run_id=exclude_run_id
+        )
         await self.events.emit(
             "run.cancelled", run_id=run_id, conversation_id=info["conversation_id"]
         )
@@ -574,6 +667,12 @@ class LeoApp:
         self.tasks.register_default_delivery(self._channel_delivery)
         # Durable outbox turns are driven by app.ask and answered via Gateway.send.
         self.gateway.set_reply_handler(self._gateway_reply)
+        # An interrupt-class command (/stop) is handled at admission time, not
+        # as the next outbox turn: the drain loop is serial, so a queued /stop
+        # would only run after the turn it targets has already finished.
+        self.gateway.set_interrupt_handler(
+            self.commands.is_interrupt, self._channel_interrupt
+        )
         self.gateway.set_attachment_sink(self._store_channel_attachment)
         # Approval buttons on the operator's own channel: a tap resolves the
         # approval through the privileged path, never as a chat turn.
@@ -1185,6 +1284,22 @@ class LeoApp:
             return None
         attachment_id = record.get("id") if isinstance(record, dict) else None
         return str(attachment_id) if attachment_id else None
+
+    async def _channel_interrupt(self, conversation_id: str, text: str) -> None:
+        """Handle an interrupt-class command that arrived on a channel.
+
+        Called by the gateway at admission time (out of band from the serial
+        outbox), so ``/stop`` reaches the running turn instead of waiting behind
+        it. The admitted message still becomes a normal outbox row afterwards, so
+        the user gets the usual "Stopping" acknowledgement.
+        """
+        await self.request_turn_stop(conversation_id, requested_by="channel:stop")
+        await self.events.emit(
+            "chat.stop_requested",
+            conversation_id=conversation_id,
+            channel="gateway",
+            command=str(text or "")[:80],
+        )
 
     async def _gateway_reply(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Answer one admitted inbound message durably, then send its reply."""
@@ -2712,10 +2827,13 @@ class LeoApp:
             "conversation_id": conversation_id,
         }
         # A stop only counts if it arrives during THIS turn: clear any leftover
-        # request first, then remember when the turn started.
-        await self._clear_turn_stop(conversation_id)
+        # request first, then remember when the turn started. A slash command is
+        # not a turn — clearing here would consume the request /stop just wrote.
+        is_slash = text.lstrip().startswith("/")
+        if not is_slash:
+            await self._clear_turn_stop(conversation_id)
         turn_started = utcnow()
-        if text.lstrip().startswith("/"):
+        if is_slash:
             # Slash input is an explicit command invocation, not a prompt. One
             # user row and one assistant row bracket the dispatch; no model call
             # and no tool-spec payload is ever constructed for this turn.
@@ -3124,8 +3242,11 @@ class LeoApp:
             "conversation_id": conversation_id,
         }
         # A stop only counts if it arrives during THIS turn: clear any leftover
-        # request first, then remember when the turn started.
-        await self._clear_turn_stop(conversation_id)
+        # request first, then remember when the turn started. A slash command is
+        # not a turn — clearing here would consume the request /stop just wrote.
+        is_slash = text.lstrip().startswith("/")
+        if not is_slash:
+            await self._clear_turn_stop(conversation_id)
         turn_started = utcnow()
         seq = 0
         final_row_id: int | None = None
@@ -3137,7 +3258,7 @@ class LeoApp:
             seq += 1
             return payload
 
-        self._start_run(run_id, conversation_id)
+        self._start_run(run_id, conversation_id, slash=is_slash)
 
         def cancellation_guard() -> None:
             """One checkpoint for every phase of the model/tool loop.
@@ -3149,13 +3270,16 @@ class LeoApp:
             """
             if run_id in self._cancelled_runs:
                 raise _RunCancelled(run_id)
+            if run_id in self._stop_runs:
+                # /stop: terminal as cancelled, with a truthful "Stopped" row.
+                raise TurnStopped(conversation_id)
 
         # The try covers the whole turn, including history/attachment/model
         # setup. A failure there must still produce error + run.finished and
         # must not leave the run registered as "running" forever.
         reasoning_token = None
         try:
-            if text.lstrip().startswith("/"):
+            if is_slash:
                 cancellation_guard()
                 await db.execute(
                     "INSERT OR IGNORE INTO conversations(id,channel,subject,created_at,updated_at) VALUES(?,?,?,?,?)",
@@ -3317,11 +3441,70 @@ class LeoApp:
             typed_stream = getattr(self.router, "stream_events", None)
 
             async def _guarded_chunks(source: AsyncIterator[StreamChunk]) -> AsyncIterator[StreamChunk]:
-                """Pass stream events through, ending the turn when a stop arrives."""
-                async for chunk in source:
+                """Pass stream events through, ending the turn when a stop arrives.
+
+                The next chunk is raced against the in-process stop event, so a
+                stop lands while the model is silent (thinking, retrying) instead
+                of only when it emits text. A 0.75 s fallback still polls the
+                durable row for a stop issued by another process.
+                """
+                iterator = source.__aiter__()
+                while True:
+                    # An explicit run cancel (the Stop button) keeps its silent
+                    # abort path; a /stop ends with a truthful Stopped row.
+                    cancellation_guard()
                     if await self._turn_stop_requested(conversation_id, turn_started):
                         await self._clear_turn_stop(conversation_id)
                         raise TurnStopped(conversation_id)
+                    nxt = asyncio.ensure_future(iterator.__anext__())
+                    try:
+                        while True:
+                            waiter = asyncio.ensure_future(
+                                self._stop_event(conversation_id).wait()
+                            )
+                            try:
+                                done, _ = await asyncio.wait(
+                                    {nxt, waiter}, timeout=0.75,
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                            finally:
+                                if not waiter.done():
+                                    waiter.cancel()
+                                try:
+                                    await waiter
+                                except BaseException:  # noqa: BLE001 - cancellation is the exit
+                                    pass
+                            if nxt in done:
+                                try:
+                                    chunk = nxt.result()
+                                except StopAsyncIteration:
+                                    return
+                                break
+                            # An explicit run cancel (Stop button) that landed
+                            # while the chunk was pending wins over the /stop
+                            # path and keeps its silent abort.
+                            cancellation_guard()
+                            if await self._turn_stop_requested(conversation_id, turn_started):
+                                nxt.cancel()
+                                try:
+                                    await nxt
+                                except BaseException:  # noqa: BLE001 - the stream is being abandoned
+                                    pass
+                                await self._clear_turn_stop(conversation_id)
+                                raise TurnStopped(conversation_id)
+                            if waiter.done():
+                                # A stale event outside this turn's window:
+                                # clear it and wait again for the same chunk.
+                                event = self._stop_events.get(str(conversation_id))
+                                if event is not None:
+                                    event.clear()
+                    finally:
+                        if not nxt.done():
+                            nxt.cancel()
+                            try:
+                                await nxt
+                            except BaseException:  # noqa: BLE001 - abandoned stream
+                                pass
                     yield chunk
 
             async def _text_only_chunks(model_request: Any) -> AsyncIterator[StreamChunk]:
@@ -3476,7 +3659,7 @@ class LeoApp:
                 new_executions = 0
                 round_duplicates = 0
                 for raw_call in calls:
-                    if run_id in self._cancelled_runs:
+                    if run_id in self._cancelled_runs or run_id in self._stop_runs:
                         # The assistant(tool_calls) row is already durable.
                         # Close every call that never ran with an explicit
                         # not-executed tool row so the group stays pairable.
@@ -3658,9 +3841,35 @@ class LeoApp:
             self._end_run(run_id, "cancelled")
             yield ev(type="run.finished", status="cancelled")
         except TurnStopped:
+            # Same truthful terminal path as ask(): one durable row, the run
+            # closed in the registry, and a message.finished the client can
+            # seal on. Leaving the run registered made a later /stop target a
+            # turn that no longer existed.
             await self._clear_turn_stop(conversation_id)
             await self.progress.end("stopped")
-            yield ev(type="assistant.message", content="⏹ Stopped at your request.")
+            stopped_content = "⏹ Stopped at your request."
+            await db.execute(
+                "INSERT INTO messages(conversation_id,role,content,metadata,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (conversation_id, "assistant", stopped_content,
+                 json.dumps({"run_status": "cancelled", "tool_calls": [],
+                             "tool_calls_pending": []}, default=str), utcnow()),
+            )
+            await db.execute(
+                "UPDATE conversations SET updated_at=? WHERE id=?", (utcnow(), conversation_id)
+            )
+            await self.events.emit(
+                "chat.stopped", conversation_id=conversation_id, channel=channel
+            )
+            self._end_run(run_id, "cancelled")
+            yield ev(type="assistant.message", content=stopped_content)
+            yield ev(
+                type="message.finished", content=stopped_content, provider="", model="",
+                usage={}, memories_used=[], tool_results=[], tool_calls_pending=[],
+                status="cancelled", reasoning_seen=False,
+                simulated=self._model_provenance()[0],
+                model_status=self._model_provenance()[1],
+            )
             yield ev(type="run.finished", status="cancelled")
             return
         except Exception as exc:  # noqa: BLE001 - stream must report failures to the client
