@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping
 from .. import db
 from ..contracts import MemoryCategory, MemoryKind, RiskLevel, ToolCall, new_id, utcnow
 from ..security.permissions import ApprovalRequired
+from ..skills import staging
 from ..tools import conversation_tools
 from .registry import (
     ALL_SURFACES,
@@ -1533,6 +1534,76 @@ async def _run_skill(ctx: CommandContext, name: str, arguments: dict[str, Any]) 
     return _summary(ctx, "skill", text or f"Skill {name} completed", data)
 
 
+async def _approve_consolidation(
+    ctx: CommandContext, proposal_id: str, record: dict[str, Any]
+) -> CommandResult:
+    """Replay a staged consolidation plan operation by operation."""
+    operations = list(record.get("operations") or [])
+    results: list[dict[str, Any]] = []
+    try:
+        with staging.bypass_staging():
+            for index, operation in enumerate(operations):
+                op = str(operation.get("op") or "")
+                if op == "read":
+                    arguments: dict[str, Any] = {"name": operation.get("name")}
+                    if operation.get("file_path"):
+                        arguments["file_path"] = operation["file_path"]
+                    call = ToolCall(
+                        name="skill_read", arguments=arguments, actor=ctx.actor,
+                        correlation_id=ctx.conversation_id,
+                    )
+                elif op == "manage":
+                    call = ToolCall(
+                        name="skill_manage",
+                        arguments=dict(operation.get("arguments") or {}),
+                        actor=ctx.actor, correlation_id=ctx.conversation_id,
+                    )
+                elif op == "archive":
+                    skills = getattr(ctx.app, "skills", None)
+                    if skills is None:
+                        raise RuntimeError("skills service is unavailable")
+                    await skills.set_state(str(operation.get("name") or ""), "archived")
+                    results.append({
+                        "op": "archive", "name": operation.get("name"), "success": True,
+                    })
+                    continue
+                else:
+                    raise ValueError(f"operation {index} has unsupported op {op!r}")
+                result = await ctx.app.executor.execute(call)
+                success = bool(getattr(result, "success", False))
+                results.append({
+                    "op": op,
+                    "name": (operation.get("name") or (operation.get("arguments") or {}).get("name")),
+                    "success": success,
+                    "error": None if success else getattr(result, "error", None),
+                })
+                if not success:
+                    raise RuntimeError(
+                        getattr(result, "error", None) or f"operation {index} ({op}) failed"
+                    )
+    except Exception as exc:  # noqa: BLE001 - report partial progress truthfully
+        await staging.resolve(
+            proposal_id, "failed", by=ctx.actor, error=str(exc),
+            result={"operations": results},
+        )
+        return CommandResult.error(
+            "skills",
+            f"applying {proposal_id} failed after {len(results)} operation(s): {exc}",
+            code="apply_failed", data={"operations": results},
+        )
+    await staging.resolve(
+        proposal_id, "applied", by=ctx.actor, result={"operations": results},
+    )
+    await _audit(
+        ctx, "slash.skills.approve", proposal_id,
+        f"applied consolidation plan ({len(results)} operations)",
+    )
+    return _summary(
+        ctx, "skills", f"Applied consolidation plan {proposal_id}",
+        {"operations": results},
+    )
+
+
 async def skills_command(ctx: CommandContext) -> CommandResult:
     skills = _require_service(ctx, "skills")
     sub = ctx.argv[0].lower() if ctx.argv else "list"
@@ -1567,6 +1638,33 @@ async def skills_command(ctx: CommandContext) -> CommandResult:
         name = ctx.argv[1] if len(ctx.argv) > 1 else None
         rows = await skills.history(name, limit=_token_limit(ctx))
         return _summary(ctx, "skills", f"{len(rows)} skill history rows", {"history": rows})
+    if sub == "snapshots":
+        name = ctx.require(1, "skill name")
+        rows = await skills.snapshots(name, limit=_token_limit(ctx))
+        items = [
+            {
+                "id": item.get("id"), "kind": item.get("kind"),
+                "action": item.get("action"), "created_at": item.get("created_at"),
+            }
+            for item in rows
+        ]
+        return _summary(
+            ctx, "skills", f"{len(items)} snapshots for {name}", {"snapshots": items},
+        )
+    if sub == "rollback":
+        if not _operator(ctx):
+            return CommandResult.denied("skills", "only an operator may roll back a skill")
+        snapshot_id = ctx.require(1, "snapshot id")
+        restored = await skills.rollback(snapshot_id)
+        await _audit(
+            ctx, "slash.skills.rollback", snapshot_id,
+            f"rolled back {restored.get('kind')} for {restored.get('skill')}",
+        )
+        return _summary(
+            ctx, "skills",
+            f"Restored {restored.get('kind')} for {restored.get('skill')}",
+            restored,
+        )
     if sub == "run":
         name = ctx.require(1, "skill name")
         _, values = _kv(ctx.argv[2:])
@@ -1576,13 +1674,259 @@ async def skills_command(ctx: CommandContext) -> CommandResult:
         record = await skills.enable(name) if sub == "enable" else await skills.disable(name)
         await _audit(ctx, f"slash.skills.{sub}", name, f"skill {sub} via slash")
         return _summary(ctx, "skills", f"Skill {name} {sub}d", {"skill": _dump(record)})
-    if sub in ("install", "audit", "approve", "reject", "diff", "approval"):
+    if sub == "usage":
+        rows = await skills.usage_list()
+        rows.sort(
+            key=lambda item: str(
+                item.get("last_used_at") or item.get("last_viewed_at")
+                or item.get("last_patched_at") or item.get("updated_at") or ""
+            ),
+            reverse=True,
+        )
+        items = rows[:_token_limit(ctx)]
+        return _summary(ctx, "skills", f"{len(items)} skill usage rows", {"usage": items})
+    if sub in ("pin", "unpin", "lock", "unlock"):
+        if not _operator(ctx):
+            return CommandResult.denied("skills", f"only an operator may {sub} a skill")
+        name = ctx.require(1, "skill name")
+        flag = sub in ("pin", "lock")
+        record = (
+            await skills.set_pinned(name, flag)
+            if sub in ("pin", "unpin")
+            else await skills.set_locked(name, flag)
+        )
+        await _audit(ctx, f"slash.skills.{sub}", name, f"skill {sub} via slash")
+        return _summary(ctx, "skills", f"Skill {name} {sub}ned", {"skill": _dump(record)})
+    if sub in ("archive", "restore"):
+        if not _operator(ctx):
+            return CommandResult.denied("skills", f"only an operator may {sub} a skill")
+        name = ctx.require(1, "skill name")
+        record = await skills.set_state(name, "archived" if sub == "archive" else "active")
+        await _audit(ctx, f"slash.skills.{sub}", name, f"skill {sub} via slash")
+        return _summary(ctx, "skills", f"Skill {name} {sub}d", {"skill": _dump(record)})
+    if sub == "curator":
+        curator = getattr(ctx.app, "curator", None)
+        if curator is None:
+            return CommandResult.unsupported(
+                "skills", "The skill curator is not attached in this composition root.",
+            )
+        action = ctx.argv[1].lower() if len(ctx.argv) > 1 else "status"
+        if action == "status":
+            data = {**curator.status(), "last_run": await curator.last_run()}
+            return _summary(ctx, "skills", "Skill curator status", data)
+        if action == "candidates":
+            groups = await curator.candidates()
+            return _summary(
+                ctx, "skills",
+                f"{len(groups)} consolidation candidate groups",
+                {"candidates": groups},
+            )
+        if action == "run":
+            if not _operator(ctx):
+                return CommandResult.denied("skills", "only an operator may run the curator")
+            counts = await curator.scan()
+            await _audit(
+                ctx, "slash.skills.curator.run", "skills",
+                f"curator pass: {counts.get('archived', 0)} archived",
+            )
+            return _summary(ctx, "skills", "Skill curator run complete", counts)
+        if action == "consolidate":
+            if not _operator(ctx):
+                return CommandResult.denied(
+                    "skills", "only an operator may propose consolidations",
+                )
+            consolidation = getattr(ctx.app, "consolidation", None)
+            if consolidation is None:
+                return CommandResult.unsupported(
+                    "skills",
+                    "The consolidation planner is not attached in this composition root.",
+                )
+            if not consolidation.enabled:
+                return CommandResult.error(
+                    "skills",
+                    "Consolidation is opt-in; set skills.curator.consolidate to true.",
+                    code="consolidation_disabled",
+                )
+            dry_run = any(
+                token in ("--dry-run", "--dry_run") for token in ctx.argv[2:]
+            )
+            counts = await consolidation.propose(dry_run=dry_run)
+            await _audit(
+                ctx, "slash.skills.curator.consolidate", "skills",
+                f"consolidation plan: {counts.get('proposed', 0)} proposed",
+            )
+            return _summary(
+                ctx, "skills",
+                "Consolidation plan staged" if not dry_run else "Consolidation preview",
+                counts,
+            )
+        raise ValueError(
+            "usage: /skills curator [status|run|candidates|consolidate [--dry-run]]"
+        )
+    if sub == "pending":
+        records = await staging.pending(limit=_token_limit(ctx))
+        items = staging.summarize(records, limit=_token_limit(ctx))
+        return _summary(
+            ctx, "skills",
+            f"{len(items)} staged skill writes" if items else "no staged skill writes",
+            {"proposals": items},
+        )
+    if sub == "diff":
+        proposal_id = ctx.require(1, "proposal id")
+        record = await staging.load(proposal_id)
+        if record is None:
+            raise ValueError(f"unknown staged skill write: {proposal_id}")
+        if str(record.get("kind") or "write") == "consolidate":
+            operations = []
+            for operation in list(record.get("operations") or [])[:12]:
+                if operation.get("op") == "manage":
+                    arguments = operation.get("arguments") or {}
+                    operations.append({
+                        "op": "manage",
+                        "action": arguments.get("action"),
+                        "name": arguments.get("name"),
+                        "file_path": arguments.get("file_path"),
+                        "preview": str(
+                            arguments.get("content") or arguments.get("file_content") or ""
+                        )[:1_500],
+                    })
+                else:
+                    operations.append(operation)
+            preview = {
+                "id": record.get("id"),
+                "kind": "consolidate",
+                "status": record.get("status"),
+                "title": record.get("title"),
+                "digest": record.get("arguments_digest"),
+                "created_at": record.get("created_at"),
+                "operations": operations,
+            }
+        else:
+            payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+            preview = {
+                "id": record.get("id"),
+                "kind": "write",
+                "status": record.get("status"),
+                "action": record.get("action"),
+                "skill": record.get("skill"),
+                "digest": record.get("arguments_digest"),
+                "created_at": record.get("created_at"),
+                "file_path": payload.get("file_path"),
+                "old": str(payload.get("old_string") or "")[:2_000],
+                "new": str(payload.get("new_string") or "")[:2_000],
+                "content": str(payload.get("content") or payload.get("file_content") or "")[:4_000],
+            }
+        return _summary(ctx, "skills", f"Staged skill write {proposal_id}", preview)
+    if sub in ("approve", "reject") and not _operator(ctx):
+        return CommandResult.denied(
+            "skills",
+            f"only an operator may {sub} staged skill writes",
+        )
+    if sub == "approve":
+        proposal_id = ctx.require(1, "proposal id")
+        record = await staging.claim(proposal_id, by=ctx.actor)
+        if record is None:
+            existing = await staging.load(proposal_id)
+            if existing is None:
+                raise ValueError(f"unknown staged skill write: {proposal_id}")
+            return CommandResult.error(
+                "skills",
+                f"staged write {proposal_id} is {existing.get('status')}, not pending",
+                code="not_pending",
+            )
+        if str(record.get("kind") or "write") == "consolidate":
+            return await _approve_consolidation(ctx, proposal_id, record)
+        payload = dict(record.get("payload") or {})
+        action = str(payload.pop("action", "") or record.get("action") or "")
+        call = ToolCall(
+            name="skill_manage",
+            arguments={"action": action, **payload},
+            actor=ctx.actor,
+            correlation_id=ctx.conversation_id,
+        )
+        try:
+            with staging.bypass_staging():
+                result = await ctx.app.executor.execute(call)
+        except Exception as exc:  # noqa: BLE001 - report the real failure, keep the row
+            await staging.resolve(proposal_id, "failed", by=ctx.actor, error=str(exc))
+            return CommandResult.error(
+                "skills", f"applying {proposal_id} failed: {exc}", code="apply_failed",
+            )
+        data = result.model_dump(mode="json")
+        if not result.success:
+            await staging.resolve(
+                proposal_id, "failed", by=ctx.actor, error=result.error or "tool failed",
+            )
+            return CommandResult.error(
+                "skills",
+                f"applying {proposal_id} failed: {result.error or result.decision}",
+                code="apply_failed", data=data,
+            )
+        await staging.resolve(proposal_id, "applied", by=ctx.actor, result={"decision": result.decision})
+        await _audit(
+            ctx, "slash.skills.approve", proposal_id,
+            f"applied staged skill write ({action})",
+        )
+        return _summary(ctx, "skills", f"Applied staged skill write {proposal_id}", data)
+    if sub == "reject":
+        proposal_id = ctx.require(1, "proposal id")
+        record = await staging.resolve(proposal_id, "rejected", by=ctx.actor)
+        if record is None:
+            raise ValueError(f"unknown staged skill write: {proposal_id}")
+        await _audit(ctx, "slash.skills.reject", proposal_id, "rejected staged skill write")
+        return _summary(
+            ctx, "skills", f"Rejected staged skill write {proposal_id}",
+            {"id": proposal_id, "status": record.get("status")},
+        )
+    if sub in ("install", "audit", "approval"):
         return CommandResult.unsupported(
             "skills",
             f"/skills {sub} is not wired in LEO: skill installation and provenance review "
             "are CLI/API operations with their own approval flow.",
         )
-    raise ValueError(f"unknown /skills subcommand {sub!r}; try list, search, inspect, run, enable, disable, history")
+    raise ValueError(
+        f"unknown /skills subcommand {sub!r}; try list, search, inspect, run, enable, "
+        "disable, history, pending, diff, approve, reject"
+    )
+
+
+async def journey_command(ctx: CommandContext) -> CommandResult:
+    """Timeline of what LEO learned: authored skills and memory notes."""
+    limit = _token_limit(ctx)
+    items: list[dict[str, Any]] = []
+    skill_rows = await db.fetchall(
+        "SELECT name, description, created_at FROM skills "
+        "WHERE created_by='agent' ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+    for row in skill_rows:
+        items.append({
+            "kind": "skill",
+            "id": row["name"],
+            "label": row["name"],
+            "detail": str(row["description"] or "")[:120],
+            "created_at": row["created_at"],
+        })
+    memory_rows = await db.fetchall(
+        "SELECT id, category, content, created_at FROM memory_items "
+        "ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+    for row in memory_rows:
+        items.append({
+            "kind": "memory",
+            "id": row["id"],
+            "label": str(row["category"] or "memory"),
+            "detail": " ".join(str(row["content"] or "").split())[:120],
+            "created_at": row["created_at"],
+        })
+    items.sort(key=lambda item: str(item.get("created_at") or ""))
+    items = items[-limit:]
+    return _summary(
+        ctx, "journey",
+        f"{len(items)} learned items (oldest first)" if items else "no learned items yet",
+        {"items": items},
+    )
 
 
 async def skill_command(ctx: CommandContext) -> CommandResult:
@@ -1609,6 +1953,65 @@ async def skill_command(ctx: CommandContext) -> CommandResult:
     result = await _run_skill(ctx, name, arguments)
     result.command = "skill"
     return result
+
+
+# ---------------------------------------------------------------------------
+# review
+
+
+async def refine_command(ctx: CommandContext) -> CommandResult:
+    """Start one bounded post-turn review for the current conversation.
+
+    This reports that a review *started*; the outcome arrives as an artifact,
+    audit row and ``review.completed``/``review.failed`` event. The review can
+    only act through validated tools, so the command itself grants nothing.
+    """
+    review = getattr(ctx.app, "review", None)
+    if review is None:
+        return CommandResult.unsupported(
+            "refine",
+            "The post-turn review engine is not attached in this composition root.",
+        )
+    if not ctx.conversation_id:
+        return CommandResult.error(
+            "refine", "No conversation is active; start a chat turn first.",
+            code="no_conversation",
+        )
+    focus = " ".join(ctx.argv).strip() or None
+    if not review.trigger(ctx.conversation_id, focus=focus):
+        return CommandResult.error(
+            "refine", "The review engine is stopping; no review was started.",
+            code="review_unavailable",
+        )
+    return CommandResult.ok(
+        "refine",
+        "Post-turn review started in the background. Its artifact and audit row "
+        "name exactly what it changed (or that there was nothing to save).",
+        data={"conversation_id": ctx.conversation_id, "focus": focus},
+    )
+
+
+async def learn_command(ctx: CommandContext) -> CommandResult:
+    """Start an explicit skill-authoring run from a source the user named."""
+    review = getattr(ctx.app, "review", None)
+    if review is None:
+        return CommandResult.unsupported(
+            "learn", "The skill-authoring engine is not attached in this composition root.",
+        )
+    source = " ".join(ctx.argv).strip()
+    if not source:
+        raise ValueError("usage: /learn <path, URL, or procedure>")
+    if not review.trigger_learn(ctx.conversation_id, source):
+        return CommandResult.error(
+            "learn", "Skill authoring could not be started.", code="learn_unavailable",
+        )
+    return CommandResult.ok(
+        "learn",
+        "Skill authoring started in the background. It gathers the source with "
+        "read-only tools and saves through skill_manage; the result is named in "
+        "the review artifact and audit row.",
+        data={"conversation_id": ctx.conversation_id, "source": source},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2131,14 +2534,10 @@ UNAVAILABLE: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
      "Approval policy is configured in leo.yaml; no runtime mode switch is implemented."),
     ("memory_review", (), "[pending|approve|reject]", "Review staged memory writes",
      "LEO memory writes are authorized and audited at write time; there is no staged-memory review queue."),
-    ("learn", (), "<source>", "Distill a reusable skill from a source",
-     "No skill-distillation pipeline exists in LEO."),
     ("plan", (), "[task]", "Write an implementation plan file without executing",
      "No plan-file writer exists in LEO; /tasks create stores an objective."),
     ("review", (), "[instructions]", "Spawn an independent reviewer subagent",
-     "LEO has a verification engine but no dedicated slash-triggered reviewer subagent."),
-    ("refine", (), "", "Run memory/skill self-improvement in a fork",
-     "No self-improvement fork service exists in LEO."),
+     "LEO has a verification engine but no dedicated slash-triggered reviewer subagent. Use /refine for the bounded post-turn learning pass."),
     ("init", (), "[notes]", "Generate AGENTS.md from a repository scan",
      "No repository instruction-file generator exists in LEO."),
     ("insights_upload", (), "[days]", "Upload usage analytics",
@@ -2195,8 +2594,6 @@ UNAVAILABLE: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
      "LEO has direct schedules (/schedule) but no blueprint catalog."),
     ("kanban", (), "[subcommand]", "Multi-profile collaboration board",
      "LEO has no shared kanban board service."),
-    ("journey", ("learning", "memory-graph"), "[list|delete|edit]", "Open a learning timeline",
-     "LEO has durable memories but no learning-journey timeline."),
     ("worktree", (), "[new|list|prune]", "Manage isolated git worktrees",
      "No worktree service is registered in the LEO composition root."),
     ("rollback", (), "[number|--all]", "Restore filesystem checkpoints",
@@ -2385,14 +2782,38 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
 
     # -- skills --------------------------------------------------------------
     registry.register(_spec(
-        "skills", "List, search, inspect, run, enable/disable or review skill history",
-        skills_command, args_hint="[list|search <q>|inspect <name>|run <name> [k=v]|enable|disable|history]",
+        "skills",
+        "List, search, inspect, run, enable/disable, review history, approve staged writes or manage lifecycle",
+        skills_command,
+        args_hint=(
+            "[list|search <q>|inspect <name>|run <name> [k=v]|enable|disable|history|"
+            "snapshots <name>|rollback <id>|usage|pin|unpin|lock|unlock|archive|restore|"
+            "pending|diff <id>|approve <id>|reject <id>|"
+            "curator [status|run|candidates|consolidate [--dry-run]]]"
+        ),
         category="skills",
     ))
     registry.register(_spec(
         "skill", "Explicitly invoke a named skill (also the fallback for /<skill-name>)",
         skill_command, args_hint="<name> [instruction]", category="skills",
         min_args=1, resource_arg=0,
+    ))
+    registry.register(_spec(
+        "refine",
+        "Run a bounded post-turn skill/memory review for this conversation",
+        refine_command, args_hint="[focus]", category="skills",
+    ))
+    registry.register(_spec(
+        "learn",
+        "Distill a reusable skill from a path, URL, or procedure",
+        learn_command, args_hint="<path|url|procedure>", category="skills",
+        min_args=1,
+    ))
+    registry.register(_spec(
+        "journey",
+        "Timeline of authored skills and memory notes, oldest first",
+        journey_command, aliases=("learning", "memory-graph"),
+        args_hint="[limit]", category="skills",
     ))
 
     # -- memory --------------------------------------------------------------
@@ -2493,14 +2914,14 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
         "session": {"resume", "import", "retry", "undo", "rewind", "branch",
                     "steer", "queue", "bg", "btw", "quit"},
         "goals": {"goal", "subgoal", "personality", "reasoning", "fast", "verbose", "yolo",
-                  "approvals_mode", "memory_review", "learn", "plan", "review", "refine"},
+                  "approvals_mode", "memory_review", "plan", "review"},
         "maintenance": {"init", "insights_upload", "reload", "reload-mcp", "reload-skills",
                         "update", "restart", "pause", "start", "discard", "answer", "topic",
                         "sethome", "platform", "handoff", "autoprune", "codex-runtime", "egress",
                         "profile", "snapshot"},
         "integrations": {"login", "subscription", "topup", "voice", "wake", "pet", "hatch",
                          "skin", "theme", "plugins", "bundles", "curator", "moa", "blueprint",
-                         "kanban", "journey", "browser", "image", "paste", "copy", "prompt",
+                         "kanban", "browser", "image", "paste", "copy", "prompt",
                          "palette", "connectors"},
         "development": {"worktree", "rollback"},
         "display": {"statusbar", "timestamps", "focus", "footer", "battery", "indicator",

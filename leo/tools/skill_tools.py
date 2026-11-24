@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..contracts import RiskLevel, ToolSpec
+from .skill_read_marks import mark_skill_read
 
 # Gate inputs must come from the registry's trusted inventories (its
 # ``available_tools``/``available_toolsets``/``gate_context`` configuration) and
@@ -77,9 +78,13 @@ def _summary(record: dict[str, Any]) -> dict[str, Any]:
         "category": record.get("category"),
         "description": record.get("description"),
         "source": record.get("source"),
+        "created_by": record.get("created_by", "native"),
         "status": record.get("status"),
+        "state": record.get("state", "active"),
         "health": record.get("health"),
         "enabled": bool(record.get("enabled", True)),
+        "pinned": bool(record.get("pinned", False)),
+        "locked": bool(record.get("locked", False)),
         "has_handler": bool(record.get("has_handler")),
     }
 
@@ -139,21 +144,47 @@ async def skill_search(args: dict[str, Any], ctx: dict[str, Any]) -> Any:
 
 
 async def skill_read(args: dict[str, Any], ctx: dict[str, Any]) -> Any:
-    """Read one skill manifest through ``SkillRegistry.get``."""
+    """Read one skill manifest, or one supporting file, through the registry.
+
+    A successful read records a per-context mark. ``skill_manage`` refuses to
+    patch or overwrite that exact target until the mark exists, so a write is
+    always based on the text this call returned rather than an earlier quote.
+    """
     skills = _services(ctx)
     name = args["name"]
+    file_path = args.get("file_path")
     record = await skills.get(name)
     if record is None:
         raise ValueError(f"unknown skill: {name!r}")
     data = _as_dict(record)
     has_handler = bool(data.get("has_handler") or getattr(record, "has_handler", False))
-    return {
+    result: dict[str, Any] = {
         "found": True,
         "name": name,
         "has_handler": has_handler,
         "executable": has_handler,
         "skill": data,
     }
+    try:
+        result["files"] = await skills.files(name)
+    except Exception:  # noqa: BLE001 - an older registry has no file bundle
+        result["files"] = []
+    if file_path is not None:
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise ValueError("file_path must be a non-empty string")
+        content = await skills.read_file(name, file_path)
+        if content is None:
+            raise ValueError(f"file not found in skill {name!r}: {file_path}")
+        result["file_path"] = file_path
+        result["content"] = content
+        mark_skill_read(name, file_path)
+    else:
+        mark_skill_read(name)
+    try:
+        await skills.bump_usage(name, "views")
+    except Exception:  # noqa: BLE001, S110 - telemetry must never fail a read
+        pass
+    return result
 
 
 async def skill_invoke(args: dict[str, Any], ctx: dict[str, Any]) -> Any:
@@ -275,12 +306,20 @@ _SPECS: list[tuple[ToolSpec, Any]] = [
     (
         ToolSpec(
             name="skill_read",
-            description="Read the full manifest of one registered skill, including whether it has an executable handler.",
+            description=(
+                "Read one registered skill's full manifest and file index, or one "
+                "supporting file with file_path (e.g. 'references/api.md'). A successful "
+                "read authorizes a subsequent patch of that exact target."
+            ),
             category="skills",
             risk=RiskLevel.LOW,
             permissions=["skill:read"],
             input_schema=_schema({
                 "name": {"type": "string", "minLength": 1},
+                "file_path": {
+                    "type": "string",
+                    "description": "Optional supporting file path under references/, templates/ or scripts/.",
+                },
             }, ["name"]),
             resource_field="",
         ),

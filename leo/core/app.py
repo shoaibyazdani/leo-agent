@@ -9,6 +9,7 @@ import os
 import re
 from collections import deque
 from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -233,6 +234,9 @@ class LeoApp:
         # Attached by initialize(); proposal-only self-evolution engines.
         self.healing: Any = None
         self.learning: Any = None
+        self.review: Any = None
+        self.curator: Any = None
+        self.consolidation: Any = None
         self.services: dict[str, Any] = {}
         self.tool_roster: dict[str, list[str]] = {}
         self.attachments = AttachmentStore(self.settings)
@@ -264,6 +268,9 @@ class LeoApp:
             "learning_dropped": 0,
         }
         self._evolution_last_catchup = 0.0
+        # Curator due-check throttle: the scheduler ticks every second, but the
+        # interval is measured in hours. One check per five minutes is enough.
+        self._curator_last_check = 0.0
         # Bounded, in-memory queue of completed-turn hints. Ideas are derived
         # from durable history only at scan time, and only once per batch.
         self._evolution_learning_pending: deque[dict[str, Any]] = deque()
@@ -528,6 +535,21 @@ class LeoApp:
             self.agent_registry, self.tasks, self.router, self.executor, self.events, self.settings
         )
         self.skills = SkillRegistry(self.events, self.permissions)
+        # Load durable (including authored) skills before the first prompt is
+        # built: index_prompt_block() is synchronous and reads the in-memory
+        # snapshot.
+        await self.skills.ready()
+        from ..review.consolidate import ConsolidationEngine
+        from ..skills.curator import CuratorEngine
+
+        self.curator = CuratorEngine(self.settings, self.skills, self.events)
+        self.consolidation = ConsolidationEngine(
+            self.settings, self.router, self.skills, self.curator, self.events,
+        )
+        services.update(
+            curator=self.curator, skill_curator=self.curator,
+            consolidation=self.consolidation, skill_consolidation=self.consolidation,
+        )
         self.factory = IntegrationFactory(
             events=self.events, permissions=self.permissions, registry=self.skills, settings=self.settings
         )
@@ -730,6 +752,8 @@ class LeoApp:
                 # Bounded catch-up for events that arrived while no app instance
                 # was attached. Event hooks do the live work; this is a backstop.
                 await self._maybe_evolution_catchup()
+                # Deterministic authored-skill lifecycle (interval + idle gated).
+                await self._maybe_curator()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # keep the runtime alive; errors are logged and audited
@@ -779,6 +803,11 @@ class LeoApp:
         self._scheduler_task = None
         self._heartbeat_tasks.clear()
         self._detach_self_evolution()
+        if self.review is not None:
+            try:
+                await self.review.drain()
+            except Exception as exc:  # noqa: BLE001 - shutdown must not fail
+                _LOG.debug("review drain failed", extra={"error": str(exc)})
         await self.events.emit("app.shutdown")
 
     # ---- background worker/delivery handlers --------------------------------
@@ -1417,12 +1446,44 @@ class LeoApp:
                 )
                 self._subscribe_evolution("chat.completed", self._on_chat_completed)
                 self._subscribe_evolution("run.finished", self._on_run_finished)
+
+        try:
+            from ..review import ReviewEngine
+        except Exception as exc:  # noqa: BLE001 - optional module developed in parallel
+            _LOG.warning("review engine unavailable", extra={"error": str(exc)})
+        else:
+            review_cfg = getattr(getattr(self.settings, "learning", None), "review", None)
+            if review_cfg is not None:
+                try:
+                    self.review = ReviewEngine(
+                        self.events,
+                        self.settings,
+                        router=self.router,
+                        executor=self.executor,
+                        skills=self.skills,
+                        learning=self.learning,
+                        skip_source=self._is_harness_learning_source,
+                    )
+                except Exception as exc:  # noqa: BLE001 - optional engine must not block boot
+                    _LOG.warning("review engine could not be attached", extra={"error": str(exc)})
+                    self.review = None
+                if self.review is not None:
+                    services.update(review=self.review, skill_review=self.review)
+                    # One trigger only: a normal turn emits BOTH
+                    # ``chat.completed`` and ``run.finished``; subscribing to
+                    # both would count one turn twice against the interval.
+                    self._subscribe_evolution("chat.completed", self.review.observe)
         self._evolution_attached = bool(self._evolution_subscriptions)
 
     def _detach_self_evolution(self) -> None:
         for topic, handler in self._evolution_subscriptions:
             self.events.unsubscribe(topic, handler)
         self._evolution_subscriptions.clear()
+        if self.review is not None:
+            try:
+                self.review.stop()
+            except Exception as exc:  # noqa: BLE001 - shutdown must not fail
+                _LOG.debug("review stop failed", extra={"error": str(exc)})
         if self.healing is not None:
             try:
                 self.healing.detach()
@@ -1857,6 +1918,34 @@ class LeoApp:
         self._evolution_last_catchup = now
         await self.evolution_catchup()
 
+    async def _maybe_curator(self) -> None:
+        """Run the deterministic skill curator when its interval and idle gate hold."""
+        curator = getattr(self, "curator", None)
+        if curator is None:
+            return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if now - self._curator_last_check < 300:
+            return
+        self._curator_last_check = now
+        try:
+            idle_since = None
+            row = await db.fetchone("SELECT MAX(updated_at) AS last FROM conversations")
+            if row is not None and row["last"]:
+                try:
+                    idle_since = datetime.fromisoformat(str(row["last"]))
+                    if idle_since.tzinfo is None:
+                        idle_since = idle_since.replace(tzinfo=UTC)
+                except (TypeError, ValueError):
+                    idle_since = None
+            if not await curator.due(idle_since=idle_since):
+                return
+            await curator.scan()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - maintenance must not stop the runtime
+            _LOG.warning("skill curator failed", extra={"error": str(exc)})
+
     @staticmethod
     def _fallback_remediation_counts(proposals: list[dict[str, Any]]) -> dict[str, int]:
         """Truthful counters for healing engines without ``remediation_status``.
@@ -1965,6 +2054,26 @@ class LeoApp:
                     "harness_events_suppressed": self._evolution_learning_harness_suppressed,
                     "harness_proposals_enabled": self._harness_learning_enabled(),
                 }
+        if self.review is not None:
+            try:
+                status["review"] = self.review.status()
+            except Exception as exc:  # noqa: BLE001 - health must stay available
+                _LOG.warning("review status failed", extra={"error": str(exc)})
+                status["review"] = {"attached": True, "status_error": str(exc)[:200]}
+        if self.curator is not None:
+            try:
+                status["curator"] = {
+                    **self.curator.status(),
+                    "last_run": await self.curator.last_run(),
+                }
+            except Exception as exc:  # noqa: BLE001 - health must stay available
+                _LOG.warning("curator status failed", extra={"error": str(exc)})
+                status["curator"] = {"status_error": str(exc)[:200]}
+        if self.consolidation is not None:
+            try:
+                status["consolidation"] = self.consolidation.status()
+            except Exception as exc:  # noqa: BLE001 - health must stay available
+                _LOG.warning("consolidation status failed", extra={"error": str(exc)})
         return status
 
     CONVERSATION_HISTORY_LIMIT = 50
@@ -2509,7 +2618,22 @@ class LeoApp:
             "happens next. Match the user's language. Prefer one clear recommendation over a menu of options."
         )
         identity = self._identity_blocks()
-        return f"{base}\n\n{identity}" if identity else base
+        parts = [base]
+        if identity:
+            parts.append(identity)
+        # Progressive disclosure: the always-loaded block carries only the
+        # name, a 60-character trigger and the category. The full procedure is
+        # loaded on demand with skill_read, so the index stays cheap and a
+        # 100 KB reference never rides in every turn.
+        skills = getattr(self, "skills", None)
+        if skills is not None:
+            try:
+                block = skills.index_prompt_block()
+            except Exception:  # noqa: BLE001 - the prompt must never fail to build
+                block = ""
+            if block:
+                parts.append(block)
+        return "\n\n".join(parts)
 
     async def _persist_stall_interim(
         self, conversation_id: str, content: str, provider: str

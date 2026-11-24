@@ -87,6 +87,16 @@ def assess_call(
     if name in SELF_MODIFY_TOOLS:
         return RiskLevel.HIGH, "changes the agent's own model or skills"
 
+    if name == "skill_manage":
+        # Authored skills are documentation-only and every write is validated,
+        # read-before-write gated and audited. Deletion has no undelete on the
+        # tool surface, so it keeps the old HIGH floor. A profile that wants a
+        # human tap for authoring enables the review write-approval gate.
+        action = str(arguments.get("action") or "").strip().lower()
+        if action == "delete":
+            return RiskLevel.HIGH, "deletes an agent-authored skill; no undelete on the tool surface"
+        return RiskLevel.MEDIUM, "changes the agent's own skill library (validated, audited)"
+
     if name in ("write_file", "patch", "file_copy", "file_move"):
         return _assess_path(arguments, name)
 

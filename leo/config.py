@@ -457,8 +457,62 @@ class AutoNoteConfig(BaseModel):
     allow_unattended_writes: bool = True
 
 
+class ReviewConfig(BaseModel):
+    """Post-turn skill review (bounded, evidence-backed, proposal-only writes)."""
+
+    enabled: bool = True
+    # Completed non-harness turns between automatic reviews for one
+    # conversation. 0 disables automatic runs but keeps the explicit path.
+    interval_turns: int = Field(default=5, ge=0, le=100)
+    # One review is a bounded model loop, never an open-ended agent session.
+    max_tool_rounds: int = Field(default=12, ge=1, le=50)
+    max_input_tokens: int = Field(default=48_000, ge=1_000, le=2_000_000)
+    timeout_seconds: float = Field(default=120.0, ge=5.0, le=3600.0)
+    # A transcript shorter than this is not evidence of a reusable class of
+    # work; the review skips without spending a model call.
+    min_transcript_chars: int = Field(default=200, ge=0, le=100_000)
+    # Empty = the configured default chat model.
+    model: str = ""
+    # Whether the review may propose memory notes in addition to skills.
+    capture_memory: bool = True
+    # Background skill writes are staged for /skills approve by default.
+    # Interactive foreground writes are unaffected.
+    write_approval: bool = True
+    # Explicit /learn may gather a source with read-only local and web tools.
+    # Writes are direct because the user asked for this skill.
+    learn_enabled: bool = True
+    learn_max_tool_rounds: int = Field(default=24, ge=1, le=80)
+    learn_max_input_tokens: int = Field(default=96_000, ge=1_000, le=2_000_000)
+    learn_allow_network: bool = True
+    # Bounded transcript replay.
+    max_messages: int = Field(default=80, ge=4, le=400)
+    max_transcript_chars: int = Field(default=60_000, ge=1_000, le=1_000_000)
+    # Tool output is data; only a short preview is replayed to the reviewer.
+    tool_preview_chars: int = Field(default=500, ge=0, le=5_000)
+
+
 class LearningConfig(BaseModel):
     auto_notes: AutoNoteConfig = Field(default_factory=AutoNoteConfig)
+    review: ReviewConfig = Field(default_factory=ReviewConfig)
+
+
+class CuratorConfig(BaseModel):
+    """Deterministic authored-skill lifecycle (never deletes content)."""
+
+    enabled: bool = True
+    interval_hours: int = Field(default=168, ge=1, le=8760)
+    min_idle_hours: float = Field(default=2.0, ge=0.0, le=720.0)
+    stale_after_days: int = Field(default=14, ge=1, le=3650)
+    archive_after_days: int = Field(default=30, ge=1, le=3650)
+    # LLM consolidation is opt-in and only ever stages a plan.
+    consolidate: bool = False
+    max_groups: int = Field(default=3, ge=1, le=20)
+    # Empty = the configured default chat model.
+    model: str = ""
+
+
+class SkillsConfig(BaseModel):
+    curator: CuratorConfig = Field(default_factory=CuratorConfig)
 
 
 class AutomationConfig(BaseModel):
@@ -558,6 +612,7 @@ class Settings(BaseModel):
     stall_guard: StallGuardConfig = Field(default_factory=StallGuardConfig)
     progress: ProgressConfig = Field(default_factory=ProgressConfig)
     learning: LearningConfig = Field(default_factory=LearningConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     computer: ComputerConfig = Field(default_factory=ComputerConfig)

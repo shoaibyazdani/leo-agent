@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS skills (
   input_schema TEXT NOT NULL DEFAULT '{}', output_schema TEXT NOT NULL DEFAULT '{}',
   entrypoint TEXT, status TEXT NOT NULL DEFAULT 'registered', health TEXT NOT NULL DEFAULT 'unknown',
   source TEXT NOT NULL DEFAULT 'native', manifest TEXT NOT NULL DEFAULT '{}',
+  created_by TEXT NOT NULL DEFAULT 'native',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 
@@ -151,6 +152,34 @@ CREATE TABLE IF NOT EXISTS skill_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL, version TEXT NOT NULL,
   action TEXT NOT NULL, detail TEXT, changed_at TEXT NOT NULL
 );
+
+-- Supporting documents for an authored skill (references/templates/scripts).
+-- Kept out of the manifest JSON so a 100 KB reference cannot bloat every
+-- registry reload. The manifest only carries an index of paths.
+CREATE TABLE IF NOT EXISTS skill_files (
+  skill_name TEXT NOT NULL, path TEXT NOT NULL, content TEXT NOT NULL,
+  sha256 TEXT NOT NULL, bytes INTEGER NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY (skill_name, path)
+);
+
+-- Usage/state telemetry for lifecycle maintenance. Native code skills are
+-- seeded as ``created_by='native'`` and are never curated.
+CREATE TABLE IF NOT EXISTS skill_usage (
+  skill_name TEXT PRIMARY KEY,
+  created_by TEXT NOT NULL DEFAULT 'native',
+  views INTEGER NOT NULL DEFAULT 0,
+  invocations INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0,
+  patches INTEGER NOT NULL DEFAULT 0,
+  last_viewed_at TEXT,
+  last_used_at TEXT,
+  last_patched_at TEXT,
+  state TEXT NOT NULL DEFAULT 'active',
+  pinned INTEGER NOT NULL DEFAULT 0,
+  locked INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_usage_state ON skill_usage(state, updated_at);
 
 CREATE TABLE IF NOT EXISTS tool_calls (
   id TEXT PRIMARY KEY, tool TEXT NOT NULL, actor TEXT, args TEXT,
@@ -347,21 +376,33 @@ async def _enable_wal(conn: aiosqlite.Connection) -> None:
             raise
 
 
+async def _table_columns(conn: aiosqlite.Connection, table: str) -> set[str]:
+    rows = await (await conn.execute(f"PRAGMA table_info({table})")).fetchall()
+    return {row["name"] for row in rows}
+
+
+async def _add_column(
+    conn: aiosqlite.Connection, table: str, column: str, declaration: str
+) -> None:
+    """Add one column idempotently, tolerating a concurrent initializer."""
+    if column in await _table_columns(conn, table):
+        return
+    try:
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+    except sqlite3.OperationalError as exc:  # pragma: no cover - timing dependent
+        # A concurrent initializer added the column between our PRAGMA check
+        # and the ALTER. The schema now has it exactly once.
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
 async def _migrate(conn: aiosqlite.Connection) -> None:
     """Idempotent in-place migrations for databases created before a change."""
-    columns = {
-        row["name"]
-        for row in await (await conn.execute("PRAGMA table_info(tasks)")).fetchall()
-    }
-    if "version" not in columns:
-        # Compare-and-swap guard for task rows (durable engine lost-update defence).
-        try:
-            await conn.execute("ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
-        except sqlite3.OperationalError as exc:  # pragma: no cover - timing dependent
-            # A concurrent initializer added the column between our PRAGMA
-            # check and the ALTER. The schema now has it exactly once.
-            if "duplicate column" not in str(exc).lower():
-                raise
+    # Compare-and-swap guard for task rows (durable engine lost-update defence).
+    await _add_column(conn, "tasks", "version", "INTEGER NOT NULL DEFAULT 0")
+    # Provenance of the manifest itself; older rows predate authored skills
+    # and default to ``native`` so no existing row changes meaning.
+    await _add_column(conn, "skills", "created_by", "TEXT NOT NULL DEFAULT 'native'")
 
 
 async def initialize(path: str | Path | None = None) -> Path:

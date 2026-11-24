@@ -278,6 +278,13 @@ class SkillManifest(BaseRecord):
     source: str = "native"
     documentation: str = ""
     tests: list[str] = Field(default_factory=list)
+    # Who produced this manifest: a shipped native skill, LEO's post-turn
+    # reviewer, or an explicit user request. The write path is the only place
+    # that may set this; ``native`` skills are never agent-authored.
+    created_by: Literal["native", "agent", "user"] = "native"
+    # Bounded, reviewable provenance for an authored manifest (review id,
+    # conversation id, evidence digests). Never an execution grant.
+    origin: dict[str, Any] = Field(default_factory=dict)
     # Import provenance is metadata for review, never an execution grant. It is
     # persisted with the manifest so a DB reload cannot silently lose it.
     provenance: dict[str, Any] = Field(default_factory=dict)
