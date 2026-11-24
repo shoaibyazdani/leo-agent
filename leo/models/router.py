@@ -7,7 +7,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
-from typing import Any
+from typing import Any, Callable
 
 from .. import db
 from ..config import ModelProviderConfig, Settings, _mock_fallback_env_override
@@ -25,6 +25,8 @@ from .mock import MockProvider
 from .provider import (
     ModelEmptyOutputError,
     ModelError,
+    ModelHTTPError,
+    ModelTimeoutError,
     ModelValidationError,
     build_provider,
     estimate_request_tokens,
@@ -137,10 +139,15 @@ class ModelRouter:
         providers: dict[str, Any] | None = None,
         validator: Callable[[ModelRequest, ModelResponse], bool] | None = None,
         backoff_base: float = 0.25,
+        now: Callable[[], float] | None = None,
     ) -> None:
         self.settings = settings or Settings.load()
         self.validator = validator or _default_validator
         self._backoff_base = backoff_base
+        # Provider health is in-memory only: a restart starts clean.
+        self._clock: Callable[[], float] = now or time.monotonic
+        self._cooldowns: dict[str, float] = {}
+        self._cooldown_streak: dict[str, int] = {}
         # Build failures are recorded, never downgraded to a warning followed
         # by a mock answer. ``status()`` reports them as a blocked model state
         # and every model call raises a clear error until they are fixed.
@@ -154,6 +161,9 @@ class ModelRouter:
         # never fold it into an answer or a tool round.
         self.last_stream_reasoning: str = ""
         self.last_stream_usage: Any | None = None
+        # Streaming finish reason (e.g. "length", "stop") so the caller can
+        # distinguish a truncated answer from a completed one.
+        self.last_stream_finish_reason: str | None = None
         if not self.providers and self._mock_fallback_allowed:
             cfg = self.settings.models.providers.get("mock") or ModelProviderConfig(kind="mock", model="mock-1")
             self.providers["mock"] = MockProvider(cfg, name="mock")
@@ -298,6 +308,14 @@ class ModelRouter:
             "routable_live_providers": live,
             "routable_mock_providers": mocks,
             "build_errors": [dict(item) for item in self._build_errors],
+            "cooldowns": [
+                {
+                    "provider": name,
+                    "seconds_remaining": round(max(0.0, until - self._clock()), 1),
+                }
+                for name, until in sorted(self._cooldowns.items())
+                if until > self._clock()
+            ],
         }
 
     def _build_providers(self) -> dict[str, Any]:
@@ -613,6 +631,75 @@ class ModelRouter:
         except Exception as exc:
             log.error("could not record model usage", extra={"provider": name, "error": str(exc)[:200]})
 
+    def _available(self, name: str) -> bool:
+        return self._cooldowns.get(name, 0.0) <= self._clock()
+
+    def _note_failure(self, name: str, exc: BaseException) -> None:
+        """Bench a provider after a rate limit or transient transport failure."""
+        cfg = self.settings.models
+        if isinstance(exc, ModelHTTPError) and exc.status_code == 429:
+            base = (
+                float(exc.retry_after)
+                if exc.retry_after not in (None, 0)
+                else float(getattr(cfg, "rate_limit_cooldown_seconds", 30.0) or 0.0)
+            )
+            streak = self._cooldown_streak.get(name, 0) + 1
+            self._cooldown_streak[name] = streak
+            ceiling = float(getattr(cfg, "rate_limit_cooldown_max_seconds", 3_600.0) or 0.0)
+            delay = min(max(0.0, float(base)) * (2 ** max(0, streak - 1)), ceiling)
+        elif getattr(cfg, "failover_on_transient", True) and (
+            isinstance(exc, ModelTimeoutError)
+            or (isinstance(exc, ModelHTTPError) and exc.retryable)
+        ):
+            delay = float(getattr(cfg, "transient_cooldown_seconds", 10.0) or 0.0)
+        else:
+            return
+        if delay > 0:
+            self._cooldowns[name] = self._clock() + delay
+
+    def _note_success(self, name: str) -> None:
+        self._cooldowns.pop(name, None)
+        self._cooldown_streak.pop(name, None)
+
+    def _attempt_chain(self, ranked: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        """Best available provider, then the configured fallback, then extras.
+
+        ``models.fallback`` is a real second tier, not only a ranking hint: even
+        with ``escalation_limit: 0`` a rate-limited primary gets one failover
+        attempt on the configured fallback when it is routable.
+        """
+        available = [item for item in ranked if self._available(item[0])]
+        if not available:
+            return []
+        chain = [available[0]]
+        fallback = str(getattr(self.settings.models, "fallback", "") or "")
+        if fallback and fallback != chain[0][0]:
+            for item in available:
+                if item[0] == fallback:
+                    chain.append(item)
+                    break
+        extra = max(0, int(getattr(self.settings.models, "escalation_limit", 0) or 0))
+        limit = extra + len(chain)
+        for item in available:
+            if len(chain) >= limit:
+                break
+            if item[0] not in {name for name, _ in chain}:
+                chain.append(item)
+        return chain
+
+    def _terminal_error(self, errors: list[BaseException]) -> BaseException:
+        if errors and all(
+            getattr(error, "code", None) == "model_rate_limited" for error in errors
+        ):
+            error = ModelError(
+                "every model tier is rate limited", code="model_rate_limited"
+            )
+            error.retry_after = max(
+                float(getattr(item, "retry_after", 0.0) or 0.0) for item in errors
+            )
+            return error
+        return errors[-1] if errors else ModelError("all model attempts failed")
+
     async def complete(
         self, request: ModelRequest, *, _empty_output_retried: bool = False
     ) -> ModelResponse:
@@ -628,9 +715,16 @@ class ModelRouter:
         ranked = self._rank(request, stats)
         if not ranked:
             raise self._no_route_error()
-        max_attempts = min(len(ranked), max(0, self.settings.models.escalation_limit) + 1)
+        chain = self._attempt_chain(ranked)
+        if not chain:
+            error = ModelError("every model tier is cooling down", code="model_rate_limited")
+            error.retry_after = max(
+                0.0, max(self._cooldowns.values(), default=self._clock()) - self._clock()
+            )
+            raise error
         last_error: BaseException | None = None
-        for attempt, (name, provider) in enumerate(ranked[:max_attempts], start=1):
+        errors: list[BaseException] = []
+        for attempt, (name, provider) in enumerate(chain, start=1):
             started = time.perf_counter()
             response: ModelResponse | None = None
             attempt_error: BaseException | None = None
@@ -640,10 +734,13 @@ class ModelRouter:
                     raise ModelValidationError(f"{name}: output failed validation")
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 response.usage.latency_ms = elapsed_ms
+                self._note_success(name)
                 return response
             except Exception as exc:
                 attempt_error = exc
                 last_error = exc
+                errors.append(exc)
+                self._note_failure(name, exc)
                 log.warning(
                     "model attempt failed",
                     extra={"provider": name, "attempt": attempt, "error": self._scrub(str(exc))[:200]},
@@ -670,7 +767,9 @@ class ModelRouter:
                 return await self.complete(retry, _empty_output_retried=True)
             except Exception as exc:
                 raise exc from last_error
-        raise last_error or ModelError("all model attempts failed")
+        raise self._terminal_error(errors) if errors else ModelError(
+            "all model attempts failed"
+        )
 
     async def stream(
         self, request: ModelRequest, *, _empty_output_retried: bool = False
@@ -686,6 +785,7 @@ class ModelRouter:
         self.last_stream_tool_calls = []
         self.last_stream_content = ""
         self.last_stream_usage = None
+        self.last_stream_finish_reason = None
         self._apply_request_defaults(request)
         if self._is_blocked():
             raise self._no_route_error()
@@ -693,9 +793,16 @@ class ModelRouter:
         ranked = self._rank(request, stats, require_streaming=True)
         if not ranked:
             raise self._no_route_error()
-        max_attempts = min(len(ranked), max(0, self.settings.models.escalation_limit) + 1)
+        chain = self._attempt_chain(ranked)
+        if not chain:
+            error = ModelError("every model tier is cooling down", code="model_rate_limited")
+            error.retry_after = max(
+                0.0, max(self._cooldowns.values(), default=self._clock()) - self._clock()
+            )
+            raise error
         last_error: BaseException | None = None
-        for attempt, (name, provider) in enumerate(ranked[:max_attempts], start=1):
+        errors: list[BaseException] = []
+        for attempt, (name, provider) in enumerate(chain, start=1):
             started = time.perf_counter()
             emitted = False
             attempt_error: BaseException | None = None
@@ -707,10 +814,14 @@ class ModelRouter:
                 self.last_stream_tool_calls = list(getattr(provider, "last_tool_calls", []) or [])
                 self.last_stream_content = str(getattr(provider, "last_content", "") or "")
                 self.last_stream_usage = getattr(provider, "last_usage", None)
+                self.last_stream_finish_reason = getattr(provider, "last_finish_reason", None)
+                self._note_success(name)
                 return
             except Exception as exc:
                 attempt_error = exc
                 last_error = exc
+                errors.append(exc)
+                self._note_failure(name, exc)
                 log.warning(
                     "model stream attempt failed",
                     extra={"provider": name, "attempt": attempt, "error": self._scrub(str(exc))[:200]},
@@ -739,7 +850,9 @@ class ModelRouter:
             async for text in self.stream(retry, _empty_output_retried=True):
                 yield text
             return
-        raise last_error or ModelError("all model stream attempts failed")
+        raise self._terminal_error(errors) if errors else ModelError(
+            "all model stream attempts failed"
+        )
 
     def _stream_hook_overridden(self) -> bool:
         """Whether a caller replaced this instance's legacy ``stream()`` hook.
@@ -774,6 +887,7 @@ class ModelRouter:
         self.last_stream_content = ""
         self.last_stream_reasoning = ""
         self.last_stream_usage = None
+        self.last_stream_finish_reason = None
         if self._stream_hook_overridden():
             # Respect an injected text-only stream implementation. It already
             # publishes last_stream_provider/content/tool_calls/usage itself;
@@ -788,9 +902,16 @@ class ModelRouter:
         ranked = self._rank(request, stats, require_streaming=True)
         if not ranked:
             raise self._no_route_error()
-        max_attempts = min(len(ranked), max(0, self.settings.models.escalation_limit) + 1)
+        chain = self._attempt_chain(ranked)
+        if not chain:
+            error = ModelError("every model tier is cooling down", code="model_rate_limited")
+            error.retry_after = max(
+                0.0, max(self._cooldowns.values(), default=self._clock()) - self._clock()
+            )
+            raise error
         last_error: BaseException | None = None
-        for attempt, (name, provider) in enumerate(ranked[:max_attempts], start=1):
+        errors: list[BaseException] = []
+        for attempt, (name, provider) in enumerate(chain, start=1):
             started = time.perf_counter()
             emitted = False
             typed_text: list[str] = []
@@ -836,10 +957,14 @@ class ModelRouter:
                     getattr(provider, "last_reasoning", "") or ""
                 )
                 self.last_stream_usage = getattr(provider, "last_usage", None)
+                self.last_stream_finish_reason = getattr(provider, "last_finish_reason", None)
+                self._note_success(name)
                 return
             except Exception as exc:
                 attempt_error = exc
                 last_error = exc
+                errors.append(exc)
+                self._note_failure(name, exc)
                 log.warning(
                     "model typed stream attempt failed",
                     extra={"provider": name, "attempt": attempt, "error": self._scrub(str(exc))[:200]},
@@ -869,7 +994,9 @@ class ModelRouter:
             async for chunk in self.stream_events(retry, _empty_output_retried=True):
                 yield chunk
             return
-        raise last_error or ModelError("all model typed stream attempts failed")
+        raise self._terminal_error(errors) if errors else ModelError(
+            "all model typed stream attempts failed"
+        )
 
     async def usage_report(self) -> list[dict[str, Any]]:
         """Return recorded model calls, newest first, with parsed metadata."""

@@ -261,6 +261,10 @@ class ModelProviderConfig(BaseModel):
     cost_per_million_output: float = 0.0
     timeout_seconds: float = 120.0
     max_retries: int = 2
+    # A provider's Retry-After above this cap fails over immediately instead of
+    # blocking an interactive turn.
+    max_retry_after_seconds: float = Field(default=60.0, ge=0.0, le=600.0)
+    retry_jitter: bool = True
     # Output-token ceiling per turn. A reasoning model spends this budget on
     # thinking first; too small a ceiling produces a turn with no text and no tool
     # call, which is refused as an empty response.
@@ -298,6 +302,12 @@ class ModelConfig(BaseModel):
     fallback: str | None = None
     providers: dict[str, ModelProviderConfig] = Field(default_factory=dict)
     escalation_limit: int = 2
+    # A rate-limited or transiently failing provider is skipped for this long,
+    # so the next call fails over instead of hammering it.
+    failover_on_transient: bool = True
+    rate_limit_cooldown_seconds: float = Field(default=30.0, ge=0.0, le=3_600.0)
+    rate_limit_cooldown_max_seconds: float = Field(default=3_600.0, ge=0.0, le=86_400.0)
+    transient_cooldown_seconds: float = Field(default=10.0, ge=0.0, le=3_600.0)
     temperature: float = 0.2
     # Global default reasoning effort. Unset means no reasoning parameter is
     # sent; a per-provider reasoning_effort or a live /reasoning overrides it.
@@ -437,6 +447,15 @@ class ChannelsConfig(BaseModel):
     policies: dict[str, ChannelPolicyConfig] = Field(default_factory=dict)
 
 
+class StallGuardConfig(BaseModel):
+    """Bounded re-prompt when a turn announces work and then stops."""
+
+    enabled: bool = True
+    max_nudges: int = Field(default=1, ge=0, le=2)
+    max_reply_chars: int = Field(default=400, ge=100, le=2_000)
+    tail_chars: int = Field(default=160, ge=40, le=1_000)
+
+
 class ProgressConfig(BaseModel):
     """Live "what am I doing right now" report for a working turn.
 
@@ -476,6 +495,7 @@ class Settings(BaseModel):
     models: ModelConfig = Field(default_factory=ModelConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+    stall_guard: StallGuardConfig = Field(default_factory=StallGuardConfig)
     progress: ProgressConfig = Field(default_factory=ProgressConfig)
     learning: LearningConfig = Field(default_factory=LearningConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
@@ -643,6 +663,12 @@ class Settings(BaseModel):
                 "max_message_chars", "tool_output_chars", "max_memories", "compact",
                 "min_memory_score", "protect_head_messages", "protect_head_tokens",
                 "protect_tail_messages", "protect_tail_tokens",
+            ],
+            "stall_guard": ["enabled", "max_nudges", "max_reply_chars", "tail_chars"],
+            "models": [
+                "escalation_limit", "failover_on_transient",
+                "rate_limit_cooldown_seconds", "rate_limit_cooldown_max_seconds",
+                "transient_cooldown_seconds",
             ],
         }.items():
             target = getattr(settings, group)
