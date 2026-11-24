@@ -574,17 +574,19 @@ class LeoApp:
         # register after this point, so the notice waits for one instead of
         # blocking boot or dropping the message.
         from .restart_notice import (
-            _previous_boot_was_recent,
+            _seconds_since_previous_boot,
             announce_restart_if_pending,
             record_boot,
         )
 
-        # Read the previous stamp before overwriting it, so "this boot followed
-        # one minutes ago" is a fact rather than a race with the notice task.
-        restarted = await _previous_boot_was_recent()
+        # Measure the previous boot BEFORE overwriting the stamp: reading it
+        # inside the notice task would always see zero and read as a crash loop.
+        previous_age = await _seconds_since_previous_boot()
         await record_boot()
         asyncio.create_task(
-            announce_restart_if_pending(self, wait_seconds=120, restarted=restarted)
+            announce_restart_if_pending(
+                self, wait_seconds=120, previous_boot_age=previous_age
+            )
         )
         _LOG.info("LEO initialized", extra={"db": str(self.settings.db_path)})
         return self
