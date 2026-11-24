@@ -308,6 +308,47 @@ class ModelProviderConfig(BaseModel):
         return values
 
 
+DEFAULT_VISION_PROMPT = (
+    "Read this image for an agent that cannot see it. Say what it is in one line, "
+    "then every detail that matters: visible text verbatim, numbers, names, UI state, "
+    "errors, and anything unusual. Be concrete and complete; no preamble, no offers to help."
+)
+
+
+class VisionConfig(BaseModel):
+    """A separate vision slot, mirroring Hermes' auxiliary vision router.
+
+    The chat model is chosen for reasoning and is often text-only (this box runs a
+    deepseek default). Reading an image is therefore its own call on its own
+    provider: the turn receives the DESCRIPTION as text, so a photo never depends
+    on the chat model being multimodal and never reaches it as pixels.
+
+    ``mode``: ``describe`` always routes images through the vision slot, ``native``
+    attaches them to the chat model (only for a declared-vision main model),
+    ``auto`` describes when the chat model did not declare ``vision``, ``off``
+    disables the feature and leaves today's behaviour.
+    """
+
+    enabled: bool = True
+    mode: str = "describe"
+    # Slot name from ``models.providers``; when absent the first enabled provider
+    # that declares ``vision`` is used.
+    provider: str | None = None
+    prompt: str = DEFAULT_VISION_PROMPT
+    # A description longer than this is cut: the main model needs the facts, not
+    # an essay that eats its context.
+    max_description_chars: int = 6_000
+    max_tokens: int = 2_000
+
+    @field_validator("mode")
+    @classmethod
+    def _check_mode(cls, value: str) -> str:
+        allowed = {"auto", "describe", "native", "off"}
+        if value not in allowed:
+            raise ValueError(f"mode must be one of {sorted(allowed)}")
+        return value
+
+
 class ModelConfig(BaseModel):
     default: str = "opencode-go"
     # No implicit mock fallback: an unset fallback means exactly that. Mock is
@@ -321,6 +362,9 @@ class ModelConfig(BaseModel):
     rate_limit_cooldown_seconds: float = Field(default=30.0, ge=0.0, le=3_600.0)
     rate_limit_cooldown_max_seconds: float = Field(default=3_600.0, ge=0.0, le=86_400.0)
     transient_cooldown_seconds: float = Field(default=10.0, ge=0.0, le=3_600.0)
+    # Images are read by their own provider/model, never by the chat model unless
+    # it declares vision AND the operator asks for native routing.
+    vision: VisionConfig = Field(default_factory=VisionConfig)
     temperature: float = 0.2
     # Global default reasoning effort. Unset means no reasoning parameter is
     # sent; a per-provider reasoning_effort or a live /reasoning overrides it.

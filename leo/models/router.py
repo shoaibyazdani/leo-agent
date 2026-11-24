@@ -554,6 +554,7 @@ class ModelRouter:
         stats: Mapping[str, tuple[float, float]],
         *,
         require_streaming: bool = False,
+        only: str | None = None,
     ) -> list[tuple[str, Any]]:
         required = self._required_capabilities(request)
         if require_streaming:
@@ -564,6 +565,8 @@ class ModelRouter:
         needed_tokens = estimate_request_tokens(request) + max(0, request.max_tokens or 0)
         candidates: list[tuple[int, float, str, str, Any]] = []
         for name, provider in self.providers.items():
+            if only is not None and name != only:
+                continue
             config = self._config(provider)
             if not config.enabled:
                 continue
@@ -745,7 +748,11 @@ class ModelRouter:
         return errors[-1] if errors else ModelError("all model attempts failed")
 
     async def complete(
-        self, request: ModelRequest, *, _empty_output_retried: bool = False
+        self,
+        request: ModelRequest,
+        *,
+        _empty_output_retried: bool = False,
+        slot: str | None = None,
     ) -> ModelResponse:
         """Complete a request, escalating through ranked providers on failure.
 
@@ -757,7 +764,7 @@ class ModelRouter:
         if self._is_blocked():
             raise self._no_route_error()
         stats = await self._measured_stats()
-        ranked = self._rank(request, stats)
+        ranked = self._rank(request, stats, only=slot)
         if not ranked:
             raise self._no_route_error()
         chain = self._attempt_chain(ranked)
@@ -812,7 +819,7 @@ class ModelRouter:
             log.warning("model empty output; retrying with final-answer-only request")
             retry = self.final_answer_only_request(request)
             try:
-                return await self.complete(retry, _empty_output_retried=True)
+                return await self.complete(retry, _empty_output_retried=True, slot=slot)
             except Exception as exc:
                 raise exc from last_error
         raise self._terminal_error(errors) if errors else ModelError(
