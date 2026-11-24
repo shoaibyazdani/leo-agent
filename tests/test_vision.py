@@ -180,3 +180,59 @@ async def test_an_unreadable_image_is_a_sentence_not_a_dead_turn() -> None:
 
     assert images == []
     assert "could not read it" in prompt
+
+
+def _wire_messages(kind: str):
+    """Build a real provider for that wire and return its first chat message."""
+    from leo.config import ModelProviderConfig
+    from leo.contracts import ChatMessage, ModelRequest
+    from leo.models.provider import build_provider
+
+    config = ModelProviderConfig(kind=kind, model="glm-5.3-flash", base_url="https://example.invalid")
+    provider = build_provider("glm-5.3-flash", config)
+    request = ModelRequest(
+        messages=[ChatMessage(role="user", content="what is this?", images=[IMAGE_BLOCK])],
+    )
+    built = provider._messages(request)
+    return built[0] if isinstance(built, list) else built[1][0]
+
+
+def test_the_openai_wire_actually_sends_the_image() -> None:
+    """Images were dropped entirely on the OpenAI wire, so the model saw no picture."""
+    message = _wire_messages("openai-compatible")
+
+    parts = message["content"]
+    assert isinstance(parts, list), "content must become parts when an image is present"
+    assert parts[0]["type"] == "image_url"
+    assert parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert parts[-1] == {"type": "text", "text": "what is this?"}
+
+
+def test_the_anthropic_wire_keeps_its_native_block() -> None:
+    message = _wire_messages("anthropic-compatible")
+
+    parts = message["content"]
+    assert parts[0] == IMAGE_BLOCK, "the stored block IS the Anthropic shape"
+
+
+def test_the_openai_wire_translates_the_stored_image_block() -> None:
+    """The live bug: an Anthropic-shaped block in an OpenAI content list is ignored,
+    so the vision model answers "please upload the image" while the call succeeds."""
+    from leo.models.provider import _openai_image_part
+
+    part = _openai_image_part(IMAGE_BLOCK)
+
+    assert part is not None
+    assert part["type"] == "image_url"
+    assert part["image_url"]["url"].startswith("data:image/png;base64,")
+    # an already-correct part passes through untouched
+    assert _openai_image_part(part) == part
+
+
+def test_a_url_image_and_a_broken_block_are_handled() -> None:
+    from leo.models.provider import _openai_image_part
+
+    url_block = {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}
+    assert _openai_image_part(url_block)["image_url"]["url"] == "https://x/y.png"
+    assert _openai_image_part({"type": "image", "source": {}}) is None
+    assert _openai_image_part({"type": "image", "source": {"type": "base64"}}) is None
