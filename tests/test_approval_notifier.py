@@ -10,6 +10,12 @@ from leo.events import Event, EventBus
 from leo.security.notifier import ApprovalNotifier
 
 
+@pytest.fixture(autouse=True)
+def _notifications_opt_in(monkeypatch):
+    """The suite-wide kill switch is off here: this module tests the notifier."""
+    monkeypatch.delenv("LEO_NO_NOTIFY", raising=False)
+
+
 class FakeAdapter:
     channel = "telegram"
 
@@ -120,6 +126,23 @@ async def test_a_foreign_database_never_announces(monkeypatch, tmp_path) -> None
     adapter = FakeAdapter()
     notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
     monkeypatch.setenv("LEO_DB_PATH", str(tmp_path / "elsewhere.db"))
+
+    assert notifier.start() is False
+    await _pending_approval("apr_1")
+    await bus.emit("approval.requested", approval_id="apr_1", action="x", risk="high")
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_scratch_database_without_an_explicit_owner_never_announces(monkeypatch) -> None:
+    """No LEO_DB_PATH still means the configured database owns the buttons."""
+    from leo import db
+
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    monkeypatch.delenv("LEO_DB_PATH", raising=False)
+    assert db.get_db_path() != _settings().db_path
 
     assert notifier.start() is False
     await _pending_approval("apr_1")

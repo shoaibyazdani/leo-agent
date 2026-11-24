@@ -92,9 +92,15 @@ class ApprovalNotifier:
 
         if str(os.environ.get("LEO_NO_NOTIFY") or "").strip().lower() in {"1", "true", "yes", "on"}:
             return "LEO_NO_NOTIFY is set"
-        expected = str(os.environ.get("LEO_DB_PATH") or "").strip()
-        if not expected:
-            return None
+        # The owning database is the one the operator's gateway reads: an
+        # explicit override when the deployment sets one, otherwise the path
+        # the loaded configuration names. Without the config fallback a test or
+        # ad-hoc script that inherits the operator's config and points
+        # ``db.set_db_path`` at a scratch file claimed no owner at all, so it
+        # announced approvals the gateway could never resolve — the live box
+        # received empty cards exactly this way while a test suite ran with the
+        # service environment.
+        expected = str(os.environ.get("LEO_DB_PATH") or self.settings.db_path)
         try:
             current = db.get_db_path()
             claimed = Path(expected).expanduser().resolve()
