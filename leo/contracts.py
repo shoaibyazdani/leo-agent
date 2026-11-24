@@ -154,6 +154,9 @@ class ModelRequest(BaseRecord):
     task_category: str | None = None
     task_id: str | None = None
     agent_id: str | None = None
+    # Reasoning effort for this request (none|minimal|low|medium|high|xhigh|
+    # max|ultra). None means no reasoning parameter is sent to the provider.
+    reasoning_effort: str | None = None
 
 
 class StreamChunk(BaseRecord):

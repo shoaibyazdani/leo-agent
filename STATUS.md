@@ -8,8 +8,8 @@ narrative changelog.
 - Provider-independent agent platform: streaming chat in the dashboard and in
   the terminal (`leo chat`), durable tasks, layered memory, specialist agents,
   native tools and skills, approvals with audit, integrations adapters.
-- Measured from the live `LeoApp.initialize()` composition root: 100
-  registered tools, 38 available slash commands (126 registered slash
+- Measured from the live `LeoApp.initialize()` composition root: 96
+  registered tools, 39 available slash commands (126 registered slash
   commands in total) and 24 specialist agents.
 - Durable conversation compaction: older turns are summarized once, the summary
   is stored in the `compactions` table, and later turns replay the summary plus

@@ -22,6 +22,17 @@ def isolated_db(tmp_path: Path, monkeypatch):
     # The notifier's own tests opt back in explicitly.
     monkeypatch.setenv("LEO_DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("LEO_NO_NOTIFY", "1")
+    # Channel credentials are the other half of the inherited environment:
+    # a live Telegram token in the operator's shell makes "offline" tests see
+    # telegram as configured instead of blocked, and makes the base-adapter
+    # typing test reach a token path it never should. Strip every adapter's
+    # credential/verification variable so tests start from a clean slate;
+    # tests that need a configured channel set their own values explicitly.
+    from leo.integrations.channels import ALL_ADAPTERS
+
+    for adapter_cls in ALL_ADAPTERS.values():
+        for name in adapter_cls.credential_env + adapter_cls.verification_env:
+            monkeypatch.delenv(name, raising=False)
     asyncio.run(db.initialize())
     yield
     db._db_path = None

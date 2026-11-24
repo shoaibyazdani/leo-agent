@@ -329,7 +329,11 @@ class ModelRouter:
                     log.warning("live provider cannot be built", extra={"provider": name, "error": reason})
                     continue
                 try:
-                    providers[name] = build_provider(name, cfg, backoff_base=self._backoff_base)
+                    provider = build_provider(name, cfg, backoff_base=self._backoff_base)
+                    # Global default is the lowest-priority effort source; a live
+                    # /reasoning override (request) or per-provider config wins.
+                    provider.default_effort = getattr(self.settings.models, "reasoning_effort", None)
+                    providers[name] = provider
                 except Exception as exc:  # broken live config must never become a mock answer
                     reason = self._scrub(str(exc)) or type(exc).__name__
                     self._build_errors.append({"provider": name, "error": reason})

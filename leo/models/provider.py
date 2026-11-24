@@ -20,6 +20,13 @@ import httpx
 from ..config import ModelProviderConfig
 from ..contracts import ModelRequest, ModelResponse, StreamChunk, Usage, new_id
 from ..logging import get_logger
+from .reasoning import (
+    ANTHROPIC_WIRE_EFFORTS,
+    OPENAI_WIRE_EFFORTS,
+    clamp_effort,
+    parse_effort,
+    thinking_budget,
+)
 
 log = get_logger("models.provider")
 
@@ -414,6 +421,27 @@ class BaseHTTPProvider:
     def supports(self, capability: str) -> bool:
         return capability in self.capabilities
 
+    def _effort_for(self, request: ModelRequest, wire: tuple[str, ...]) -> str | None:
+        """Resolve and clamp the reasoning effort for one request.
+
+        Precedence: per-request (set by /reasoning) > per-provider config >
+        global config. Unset stays unset so ordinary turns send no reasoning
+        parameter. The resolved level is clamped onto ``wire`` (or the
+        provider's declared ``reasoning_efforts``) without escalating cost.
+        """
+        raw = (
+            getattr(request, "reasoning_effort", None)
+            or getattr(self.config, "reasoning_effort", None)
+            or getattr(self, "default_effort", None)
+        )
+        if not raw:
+            return None
+        level = parse_effort(raw)
+        if level is None:
+            return None
+        declared = list(getattr(self.config, "reasoning_efforts", None) or []) or list(wire)
+        return clamp_effort(level, declared)
+
     @property
     def base_url(self) -> str:
         return str(self.config.base_url or "")
@@ -750,6 +778,12 @@ class AnthropicProvider(BaseHTTPProvider):
         if request.response_format is not None:
             # Forward the caller-supplied format unchanged; no schema is invented.
             body["output_config"] = {"format": dict(request.response_format)}
+        # Reasoning effort -> Anthropic thinking block. Only sent when a level
+        # was explicitly requested; the budget is clamped below max_tokens.
+        effort = self._effort_for(request, ANTHROPIC_WIRE_EFFORTS)
+        budget = thinking_budget(effort, body["max_tokens"])
+        if budget is not None:
+            body["thinking"] = {"type": "enabled", "budget_tokens": budget}
         if stream:
             body["stream"] = True
         return body
@@ -951,6 +985,11 @@ class OpenAIProvider(BaseHTTPProvider):
             if not self.supports("structured"):
                 raise ModelUnsupportedError(f"{self.name}: structured output is not a configured capability")
             body["response_format"] = dict(request.response_format)
+        # Reasoning effort -> OpenAI-compatible reasoning_effort field. Only
+        # sent when a level was explicitly requested; ``none`` disables it.
+        effort = self._effort_for(request, OPENAI_WIRE_EFFORTS)
+        if effort is not None:
+            body["reasoning_effort"] = effort
         if stream:
             body["stream"] = True
             if self.supports("usage"):

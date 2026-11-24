@@ -505,6 +505,98 @@ async def model_command(ctx: CommandContext) -> CommandResult:
     )
 
 
+async def reasoning_command(ctx: CommandContext) -> CommandResult:
+    """Set/show reasoning effort and thinking display (session-scoped by default).
+
+    Mirrors Hermes' /reasoning: an effort ladder wider than any one provider
+    wire, clamped per provider so a request never escalates cost; display
+    toggles for showing/clamping thinking; ``--global`` persists the effort.
+    """
+    from ..models.reasoning import EFFORT_LADDER, parse_effort
+
+    state = getattr(ctx.app, "reasoning_state", None)
+    if state is None:
+        return CommandResult.unsupported(
+            "reasoning", "Reasoning state service is not available; nothing was changed."
+        )
+    argv = list(ctx.argv)
+    global_scope = "--global" in argv
+    argv = [a for a in argv if a != "--global"]
+    conversation_id = ctx.conversation_id or "cli"
+
+    # No args: show current state (session effort, effective effort, display).
+    if not argv:
+        session = await state.get(conversation_id)
+        effective = await state.effort_for(conversation_id)
+        configured = getattr(ctx.app.settings.models, "reasoning_effort", None)
+        display = "on" if session.get("show") else "off"
+        detail = "full" if session.get("full") else "clamped"
+        message = (
+            f"reasoning effort: {effective or 'unset'} "
+            f"(session: {session.get('effort') or 'unset'}, config: {configured or 'unset'}); "
+            f"thinking display: {display} ({detail})"
+        )
+        return _summary(ctx, "reasoning", message, {
+            "effort": effective, "session_effort": session.get("effort"),
+            "config_effort": configured, "show": session.get("show"),
+            "full": session.get("full"), "levels": list(EFFORT_LADDER),
+        })
+
+    arg = argv[0].lower()
+
+    # Display toggles (always session-scoped, never global).
+    if arg in ("show", "on"):
+        result = await state.set_display(conversation_id, show=True)
+        await _audit(ctx, "slash.reasoning.display", "show", "thinking display enabled")
+        return _summary(ctx, "reasoning", "Thinking display: on", {"show": result["show"]})
+    if arg in ("hide", "off"):
+        result = await state.set_display(conversation_id, show=False)
+        await _audit(ctx, "slash.reasoning.display", "hide", "thinking display disabled")
+        return _summary(ctx, "reasoning", "Thinking display: off", {"show": result["show"]})
+    if arg in ("full", "all"):
+        result = await state.set_display(conversation_id, show=True, full=True)
+        await _audit(ctx, "slash.reasoning.display", "full", "full thinking display enabled")
+        return _summary(ctx, "reasoning", "Thinking display: on (full)", {
+            "show": result["show"], "full": result["full"],
+        })
+    if arg in ("clamp", "collapse", "short"):
+        result = await state.set_display(conversation_id, full=False)
+        await _audit(ctx, "slash.reasoning.display", "clamp", "thinking display clamped")
+        return _summary(ctx, "reasoning", "Thinking display: clamped", {
+            "show": result["show"], "full": result["full"],
+        })
+
+    if arg in ("reset", "clear", "none"):
+        if global_scope:
+            await state.set_global(None)
+            await _audit(ctx, "slash.reasoning.global", "reset", "global reasoning effort cleared")
+            return _summary(ctx, "reasoning", "Global reasoning effort: unset (config default applies)")
+        await state.clear(conversation_id)
+        await _audit(ctx, "slash.reasoning.reset", conversation_id, "session reasoning state cleared")
+        return _summary(ctx, "reasoning", "Session reasoning state cleared")
+
+    level = parse_effort(arg)
+    if level is None:
+        return CommandResult.unsupported(
+            "reasoning",
+            f"unknown reasoning level {arg!r}; valid: {', '.join(EFFORT_LADDER)} "
+            "(aliases: off, min, med, hi, xh, extreme)",
+        )
+
+    if global_scope:
+        await state.set_global(level)
+        await _audit(ctx, "slash.reasoning.global", level, "global reasoning effort set")
+        return _summary(ctx, "reasoning", f"Global reasoning effort: {level} (applies to new sessions)", {
+            "effort": level, "scope": "global",
+        })
+
+    result = await state.set_effort(conversation_id, level)
+    await _audit(ctx, "slash.reasoning.effort", level, "session reasoning effort set")
+    return _summary(ctx, "reasoning", f"Reasoning effort: {level} (this session)", {
+        "effort": level, "scope": "session", "show": result.get("show"),
+    })
+
+
 async def usage_command(ctx: CommandContext) -> CommandResult:
     router = _require_service(ctx, "router")
     report = await router.usage_report()
@@ -1807,8 +1899,6 @@ UNAVAILABLE: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
      "No standing-goal subsystem exists in LEO."),
     ("personality", (), "[name]", "Set a session personality overlay",
      "LEO has no personality overlay service."),
-    ("reasoning", ("think", "thinking", "t"), "[level|show|hide]", "Set reasoning effort or display",
-     "Reasoning effort is configured on providers in leo.yaml; no per-session override exists."),
     ("fast", (), "[status|auto|on|off]", "Set provider fast/priority mode",
      "LEO has no runtime priority-processing override."),
     ("verbose", (), "[on|off|full]", "Set tool-output verbosity",
@@ -1994,6 +2084,11 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
     registry.register(_spec(
         "model", "Show model status/providers; runtime switching is not supported",
         model_command, aliases=("models",), args_hint="[status|list|<name>]", category="models",
+    ))
+    registry.register(_spec(
+        "reasoning", "Set/show reasoning effort and thinking display (session or --global)",
+        reasoning_command, aliases=("think", "thinking", "t"),
+        args_hint="[level|show|hide|full|clamp|reset] [--global]", category="models",
     ))
     registry.register(_spec(
         "usage", "Show recorded model token/cost usage (read-only)",

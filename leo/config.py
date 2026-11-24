@@ -269,6 +269,14 @@ class ModelProviderConfig(BaseModel):
     # Secret header VALUES are never stored: use extra_header_env instead.
     extra_headers: dict[str, str] = Field(default_factory=dict)
     extra_header_env: dict[str, str] = Field(default_factory=dict)
+    # Optional per-model reasoning effort (none|minimal|low|medium|high|xhigh|
+    # max|ultra). Unset means the global models.reasoning_effort applies. This
+    # is a config default; /reasoning overrides it live for the session.
+    reasoning_effort: str | None = None
+    # Optional narrowing of the wire vocabulary this model accepts. When unset,
+    # the widest OpenAI-compatible set is assumed and the level is clamped onto
+    # it. Declare the real set when a gateway rejects a level with HTTP 400.
+    reasoning_efforts: list[str] = Field(default_factory=list)
 
     @field_validator("api_key_env")
     @classmethod
@@ -291,6 +299,9 @@ class ModelConfig(BaseModel):
     providers: dict[str, ModelProviderConfig] = Field(default_factory=dict)
     escalation_limit: int = 2
     temperature: float = 0.2
+    # Global default reasoning effort. Unset means no reasoning parameter is
+    # sent; a per-provider reasoning_effort or a live /reasoning overrides it.
+    reasoning_effort: str | None = None
     # Opt-in for *automatic* mock injection when nothing live is routable.
     # An explicit ``kind: mock`` provider in config is itself an opt-in and
     # remains legal without this flag.

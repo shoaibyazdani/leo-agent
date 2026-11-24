@@ -209,6 +209,8 @@ class LeoApp:
         self.services: dict[str, Any] = {}
         self.tool_roster: dict[str, list[str]] = {}
         self.attachments = AttachmentStore(self.settings)
+        from ..models.reasoning_state import ReasoningState
+        self.reasoning_state = ReasoningState()
         self._cancelled_runs: set[str] = set()
         # Origin chat of the turn in flight: {channel, target, conversation_id}.
         # Used by task_create(background=true) so progress reaches the chat
@@ -2524,6 +2526,7 @@ class LeoApp:
             task_category="conversation",
             tools=tool_specs,
             task_id=conversation_id,
+            reasoning_effort=await self.reasoning_state.effort_for(conversation_id),
         )
         # Durable compaction runs before the per-turn optimizer so the summary
         # replaces history instead of being re-derived on every request.
@@ -2891,6 +2894,7 @@ class LeoApp:
                     ChatMessage(role="user", content=prompt, images=images),
                 ],
                 task_category="conversation", tools=tool_specs, task_id=conversation_id,
+                reasoning_effort=await self.reasoning_state.effort_for(conversation_id),
             )
             # Durable compaction runs once, before the per-turn optimizer.
             request.messages = await self._maybe_auto_compact(
