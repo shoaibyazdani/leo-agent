@@ -59,6 +59,9 @@ class CompleteRequest(BaseModel):
     # An inline keyboard the answer carries (the model picker). Optional: a
     # channel that cannot render one simply ignores it.
     reply_markup: dict[str, Any] | None = None
+    # When set, replace this already-sent message (the tapped menu card) with
+    # the answer instead of posting a duplicate below it.
+    edit_message_id: str | None = None
 
 
 class FailRequest(BaseModel):
@@ -180,35 +183,53 @@ def create_api(
             if adapter is None:
                 delivered, error = False, f"no adapter for {admission['channel']}"
             else:
-                try:
-                    # A hung platform call must not keep the turn (and its typing
-                    # pulse) alive forever: the worker renews the lease until this
-                    # returns, so an unbounded send is an endless "still typing".
-                    # Only pass the keyboard when the answer has one, so a
-                    # text-only adapter keeps its own send() signature.
-                    extra = {"reply_markup": request.reply_markup} if request.reply_markup else {}
-                    await asyncio.wait_for(
-                        adapter.send(admission["subject"], request.answer, **extra),
-                        timeout=DELIVERY_TIMEOUT_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    delivered, error = False, "delivery timed out"
-                    _LOG.warning(
-                        "gateway delivery timed out for %s after %ss",
-                        admission["channel"], DELIVERY_TIMEOUT_SECONDS,
-                        extra={"channel": admission["channel"], "kind": "delivery_timeout"},
-                    )
-                except Exception as exc:  # delivery failure must not lose the turn
-                    delivered, error = False, f"{type(exc).__name__}: {exc}"[:300]
-                    # The reason belongs in the message, not only in an `extra` field
-                    # that the default formatter drops: a silent "delivery failed"
-                    # line is what made a 400 from the chat platform look like a
-                    # healthy turn that simply never arrived.
-                    _LOG.warning(
-                        "gateway delivery failed for %s: %s",
-                        admission["channel"], error,
-                        extra={"channel": admission["channel"], "error": error},
-                    )
+                edited = False
+                if request.edit_message_id and callable(
+                    getattr(adapter, "edit_message_text", None)
+                ):
+                    # A menu tap replaces the card the human tapped. Posting a
+                    # second full menu below it made every tap look like a
+                    # duplicated card.
+                    try:
+                        edited = bool(await asyncio.wait_for(
+                            adapter.edit_message_text(
+                                admission["subject"], request.edit_message_id,
+                                request.answer, request.reply_markup,
+                            ),
+                            timeout=DELIVERY_TIMEOUT_SECONDS,
+                        ))
+                    except Exception:  # noqa: BLE001 - a failed edit falls back to send
+                        edited = False
+                if not edited:
+                    try:
+                        # A hung platform call must not keep the turn (and its typing
+                        # pulse) alive forever: the worker renews the lease until this
+                        # returns, so an unbounded send is an endless "still typing".
+                        # Only pass the keyboard when the answer has one, so a
+                        # text-only adapter keeps its own send() signature.
+                        extra = {"reply_markup": request.reply_markup} if request.reply_markup else {}
+                        await asyncio.wait_for(
+                            adapter.send(admission["subject"], request.answer, **extra),
+                            timeout=DELIVERY_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        delivered, error = False, "delivery timed out"
+                        _LOG.warning(
+                            "gateway delivery timed out for %s after %ss",
+                            admission["channel"], DELIVERY_TIMEOUT_SECONDS,
+                            extra={"channel": admission["channel"], "kind": "delivery_timeout"},
+                        )
+                    except Exception as exc:  # delivery failure must not lose the turn
+                        delivered, error = False, f"{type(exc).__name__}: {exc}"[:300]
+                        # The reason belongs in the message, not only in an `extra` field
+                        # that the default formatter drops: a silent "delivery failed"
+                        # line is what made a 400 from the chat platform look like a
+                        # healthy turn that simply never arrived.
+                        _LOG.warning(
+                            "gateway delivery failed for %s: %s",
+                            admission["channel"], error,
+                            extra={"channel": admission["channel"], "error": error},
+                        )
         if request.conversation_id:
             await store.save_route(admission["channel"], admission["subject"],
                                    request.conversation_id)
@@ -407,21 +428,27 @@ def run_gateway(host: str = "127.0.0.1", port: int = 8766) -> None:
         _settings = Settings.load()
         _permissions = PermissionManagerImpl(_settings)
 
-        async def _admit_command(text: str, channel: str, subject: str) -> None:
+        async def _admit_command(
+            text: str, channel: str, subject: str, source_message_id: str | None = None,
+        ) -> None:
             """Queue a slash command as if the operator had typed it.
 
-            A model tap must not edit config from this process: the brain owns
-            settings and re-reads the default per turn, so the tap travels as
-            normal work. The nonce keeps two taps of the same model distinct —
-            admissions are de-duplicated by payload digest.
+            A model or reasoning tap must not edit state from this process: the
+            brain owns settings and the current conversation route, so the tap
+            travels as normal work. The nonce keeps two taps of the same value
+            distinct — admissions are de-duplicated by payload digest. The
+            source message id lets the brain's reply replace the tapped card
+            instead of posting a duplicate menu below it.
             """
             from ..contracts import new_id
 
             nonce = new_id("cb")
+            payload = {"text": text, "sender_id": "operator-button",
+                       "message_id": nonce, "conversation_ref": subject}
+            if source_message_id:
+                payload["source_message_id"] = str(source_message_id)
             await store.admit(
-                channel=channel, subject=subject,
-                payload={"text": text, "sender_id": "operator-button",
-                         "message_id": nonce, "conversation_ref": subject},
+                channel=channel, subject=subject, payload=payload,
                 principal=subject, request_id=nonce,
             )
 

@@ -558,7 +558,7 @@ async def test_reasoning_tap_relays_through_the_command_queue():
     adapter = Adapter()
     admitted: list[tuple[str, str, str]] = []
 
-    async def admit(text, channel, subject):
+    async def admit(text, channel, subject, message_id=None):
         admitted.append((text, channel, subject))
 
     result = await handle_tap(
@@ -590,7 +590,7 @@ async def test_reasoning_tap_rejects_unknown_payload_without_relaying():
     adapter = Adapter()
     admitted: list[str] = []
 
-    async def admit(text, channel, subject):
+    async def admit(text, channel, subject, message_id=None):
         admitted.append(text)
 
     result = await handle_tap(
@@ -677,6 +677,7 @@ async def test_single_process_telegram_tap_changes_the_session_and_returns_a_men
 
         def __init__(self):
             self.sent: list[dict] = []
+            self.edited: list[dict] = []
             self.answers: list[str] = []
 
         async def answer_callback_query(self, callback_id, text=""):
@@ -686,6 +687,13 @@ async def test_single_process_telegram_tap_changes_the_session_and_returns_a_men
         async def send(self, target, text, **kwargs):
             self.sent.append({"target": str(target), "text": str(text), **kwargs})
             return {"ok": True}
+
+        async def edit_message_text(self, target, message_id, text, reply_markup=None):
+            self.edited.append({
+                "target": str(target), "message_id": str(message_id),
+                "text": str(text), "reply_markup": dict(reply_markup or {}),
+            })
+            return True
 
     adapter = Adapter()
     app.gateway.adapters["telegram"] = adapter
@@ -706,9 +714,11 @@ async def test_single_process_telegram_tap_changes_the_session_and_returns_a_men
     )
 
     assert await app.reasoning_state.effort_for("conv-tap") == "high"
-    assert adapter.sent
-    assert "Active effort: high" in adapter.sent[-1]["text"]
-    markup = adapter.sent[-1].get("reply_markup") or {}
+    # The tapped card is edited in place: no second full menu is posted.
+    assert adapter.sent == []
+    assert adapter.edited and adapter.edited[-1]["message_id"] == "9"
+    assert "Active effort: high" in adapter.edited[-1]["text"]
+    markup = adapter.edited[-1].get("reply_markup") or {}
     callbacks = {
         button.get("callback_data")
         for row in markup.get("inline_keyboard") or []
@@ -824,7 +834,7 @@ async def test_reasoning_tap_queues_a_durable_admission_for_the_brain():
 
     store = GatewayStore()
 
-    async def admit(text, channel, subject):
+    async def admit(text, channel, subject, message_id=None):
         await store.admit(
             channel=channel, subject=subject,
             payload={"text": text, "message_id": f"cb-{text}", "sender_id": subject,

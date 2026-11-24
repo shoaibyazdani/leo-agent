@@ -33,7 +33,10 @@ _LOG = get_logger("gateway.callbacks")
 ResolveFn = Callable[[str, bool, str], Awaitable[Mapping[str, Any]]]
 # A model tap is relayed as a normal slash command, so the switch happens in the
 # process that owns settings instead of being written behind its back.
-AdmitFn = Callable[[str, str, str], Awaitable[None]]
+# (text, channel, subject, source_message_id). The source id is optional so a
+# tap can be answered by editing the card that was tapped instead of posting a
+# duplicate menu below it.
+AdmitFn = Callable[..., Awaitable[None]]
 
 MODEL_TAP_PREFIX = "mdl:"
 REASONING_TAP_PREFIX = "rsn:"
@@ -189,8 +192,9 @@ async def handle_tap(
             return {"ok": False, "reason": "no admission path"}
         # The command runs in the process that owns settings and the current
         # conversation route, so a session-scoped tap lands in the right
-        # conversation. Its reply carries the refreshed menu.
-        await admit(command, channel, chat_id or sender_id)
+        # conversation. Passing the source message id lets its reply replace
+        # the menu card that was tapped instead of posting a second one.
+        await admit(command, channel, chat_id or sender_id, message_id or None)
         await reply("Applying…")
         _LOG.info("reasoning tap relayed", extra={
             "channel": channel, "command": command.split()[1] if len(command.split()) > 1 else "menu",
