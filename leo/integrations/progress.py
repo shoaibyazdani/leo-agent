@@ -5,15 +5,18 @@ calls, and the only thing on the screen is a typing indicator. This mirrors the
 turn into ONE message that is edited in place, so the work is visible without a
 flood of notifications:
 
-    ⏳ Working — 6 min — iteration 36/250
-    shell     cd /root/hermes-workspace && pytest -q
-    ✍️ Writing leo/integrations/messaging.py
-    patch     leo/gateway/server.py
+    🛠 **12s** · 3 steps
+    📍 Found the quoted-operator bug; patching the splitter now.
+    ✓ `shell` `pytest -q`
+    ✓ `patch` `leo/tools/shell_policy.py`
 
 Deliberate properties:
 
 * One message, edited. Telegram rate-limits edits, so flushes are throttled and a
   burst of tool calls collapses into the latest state instead of many sends.
+* Narrated, not just logged. The model's own sentence for the working round
+  ("found X; patching Y now") sits above the tool rows, so the operator reads
+  intent and finding, not only the tail of a command log.
 * Redacted, truncated arguments. A command can contain a token; the preview is
   squeezed through the same redaction patterns the executor uses and capped.
 * Cosmetic only. A failed send or edit is counted and never raised, because a
@@ -42,6 +45,7 @@ DEFAULT_SIGNIFICANT_TOOLS = (
     "git_*", "browser_navigate",
 )
 ARGUMENT_PREVIEW_CHARS = 52
+NARRATION_MAX_CHARS = 240
 
 # Tools whose effect is a file write read better with a marker than a bare name.
 _WRITE_TOOLS = frozenset({"write_file", "patch", "file_move", "file_copy"})
@@ -61,6 +65,33 @@ def _preview(value: Any) -> str:
     return text
 
 
+_NARRATION_MARKUP = re.compile(r"[*`]+")
+
+
+def _narration_text(value: Any) -> str:
+    """The model's own status line: what it is doing, in its words.
+
+    A working round's assistant text is prose: sometimes one sentence, sometimes
+    a heading and a list. The card has one line for it, so take the first
+    substantive line, strip the markup Telegram's legacy Markdown would choke
+    on, redact anything secret-shaped, and cap it.
+    """
+    for raw in str(value or "").splitlines():
+        line = " ".join(raw.split())
+        if not line or line.startswith("```"):
+            continue
+        line = re.sub(r"^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)", "", line)
+        for pattern in _REDACTIONS:
+            line = pattern.sub("[redacted]", line)
+        line = _NARRATION_MARKUP.sub("", line).strip()
+        if len(line) < 3:
+            continue
+        if len(line) > NARRATION_MAX_CHARS:
+            line = line[: NARRATION_MAX_CHARS - 1].rstrip() + "…"
+        return line
+    return ""
+
+
 def _short_path(value: Any) -> str:
     """Drop the leading workspace so a path reads as `leo/app.py`, not `/root/...`."""
     text = str(value or "")
@@ -70,31 +101,16 @@ def _short_path(value: Any) -> str:
     return text
 
 
-# One glyph per tool family. A row reads at a glance: the shape of the work,
-# then the one detail that identifies it. Text-only glyphs (no emoji) keep the
-# column alignment stable on every client.
-_TOOL_GLYPH = {
-    "shell": "❯", "terminal": "❯",
-    "write_file": "✎", "patch": "✎", "file_move": "✎", "file_copy": "✎",
-    "read_file": "◦", "list_files": "◦", "search_files": "◦", "grep": "◦",
-    "browser_navigate": "◇", "browser_extract_text": "◇", "browser_click": "◇",
-    "http_get": "◇", "http_json": "◇", "web_search": "◇",
-}
-_DEFAULT_GLYPH = "·"
-# Tool labels are padded to this width so the detail column lines up. A longer
-# label simply pushes its own row out; alignment is a nicety, not a contract.
-_LABEL_WIDTH = 9
-
-
 def _step_line(tool: str, arguments: dict[str, Any] | None, ok: bool | None) -> str:
-    """One aligned row: `❯ shell  `pytest -q``.
+    """One log row: `✓ `shell` `pytest -q``.
 
-    The tool name is monospace so the column reads as a set, not as prose. The
-    detail is monospace too: a command and a path are literal strings, and a
-    proportional font makes them harder to scan or copy.
+    The marker is the outcome (✓ done, ⚠️ failed), the tool name is monospace so
+    the rows read as a set, and the detail is monospace because a command or a
+    path is a literal string. The tool label already names the family, so a
+    per-tool icon would only add noise.
     """
     args = arguments or {}
-    glyph = _TOOL_GLYPH.get(tool, _DEFAULT_GLYPH)
+    marker = "⚠️" if ok is False else "✓"
     label = tool if tool not in {"terminal"} else "shell"
     if tool in _WRITE_TOOLS:
         detail = _short_path(
@@ -106,10 +122,9 @@ def _step_line(tool: str, arguments: dict[str, Any] | None, ok: bool | None) -> 
         detail = _command_summary(args.get("command") or "")
     else:
         detail = _short_path(args.get("command") or args.get("path") or args.get("query") or "")
-    warn = " ⚠" if ok is False else ""
     if not detail:
-        return f"{glyph} `{label}`{warn}"
-    return f"{glyph} `{{label}}` {_mono(_preview(detail))}{warn}".replace("{label}", label)
+        return f"{marker} `{label}`"
+    return f"{marker} `{label}` {_mono(_preview(detail))}"
 
 
 def _mono(text: str) -> str:
@@ -142,7 +157,7 @@ _COALESCED_TOOLS = frozenset({"shell", "terminal", "read_file", "search_files", 
 
 
 def _row_label(row: str) -> str:
-    """The tool label of a rendered row (`❯ `shell` `x`` -> `shell`), or ''."""
+    """The tool label of a rendered row (`✓ `shell` `x`` -> `shell`), or ''."""
     match = re.search(r"`([a-z_]+)`", row)
     return match.group(1) if match else ""
 
@@ -168,6 +183,7 @@ class ProgressReporter:
             str(pattern) for pattern in (raw_significant or DEFAULT_SIGNIFICANT_TOOLS)
         )
         self._steps: deque[str] = deque(maxlen=max(self.max_steps, 12))
+        self._narration = ""
         self._significant_seen = False
         self._channel = ""
         self._target = ""
@@ -189,7 +205,7 @@ class ProgressReporter:
     async def begin(self, channel: str, target: str, budget: int = 0) -> bool:
         """Start reporting for one turn. Returns False when nothing will be sent.
 
-        A previous report is closed first: two open "⏳ Working" messages in one
+        A previous report is closed first: two open "🛠 working" messages in one
         chat is how a log looks broken — the older one freezes at its last step
         while the new turn starts another.
         """
@@ -212,6 +228,7 @@ class ProgressReporter:
         self._message_id = ""
         self._last_text = ""
         self._steps.clear()
+        self._narration = ""
         self._significant_seen = False
         self._active = True
         self._last_flush = 0.0
@@ -281,6 +298,20 @@ class ProgressReporter:
             # flush per step is what produced a progress message per tool call.
             self._last_flush = 0.0
 
+    def narrate(self, text: Any) -> None:
+        """Record the model's running commentary for this round.
+
+        The card already says which tool ran. Narration adds the part a reader
+        actually wants — what the agent believes it found and what it is doing
+        about it — so a long turn reads as a story instead of a log tail. The
+        latest round wins: one message, so older sentences would displace work.
+        """
+        if not self._active:
+            return
+        line = _narration_text(text)
+        if line:
+            self._narration = line
+
     def set_iteration(self, iteration: int, *, max_iterations: int | None = None) -> None:
         """Declare an iterative execution context, e.g. `iter 3/10`.
 
@@ -318,8 +349,8 @@ class ProgressReporter:
         """
         lines: list[str] = []
         for line in self._steps:
-            # The row is `❯ `shell` `cmd``: the coalescing key is the tool label
-            # inside its code span, not the first word (which is now a glyph).
+            # The row is `✓ `shell` `cmd``: the coalescing key is the tool label
+            # inside its code span, not the first word (which is the outcome marker).
             label = _row_label(line)
             for index in range(len(lines) - 1, -1, -1):
                 prior = lines[index]
@@ -327,18 +358,18 @@ class ProgressReporter:
                     count = 2
                     if "×" in prior:
                         try:
-                            # The row is `❯ `shell` ×2 · `git status``, so the
+                            # The row is `✓ `shell` ×2 · `git status``, so the
                             # count sits between `×` and the middot.
                             count = int(prior.split("×", 1)[1].split("·", 1)[0].strip()) + 1
                         except (IndexError, ValueError):
                             count = 2
                     # Rebuild the row in the same shape as a single step: the
-                    # glyph and label of the newest call, then the count and the
+                    # marker and label of the newest call, then the count and the
                     # detail. Reusing the raw line tail would print the label
                     # twice (`shell ×2 · `shell` `git status``).
-                    glyph = line.split(" ", 1)[0]
+                    marker = line.split(" ", 1)[0]
                     detail = re.sub(r"^\S+\s+`[a-z_]+`\s*", "", line)
-                    lines[index] = f"{glyph} `{label}` ×{count} · {detail}".rstrip()
+                    lines[index] = f"{marker} `{label}` ×{count} · {detail}".rstrip()
                     break
             else:
                 lines.append(line)
@@ -357,10 +388,16 @@ class ProgressReporter:
         # A one-step report already lives entirely in the header when that step
         # is the completion line; printing it again would duplicate it.
         body = [line for line in steps if line not in head]
-        return "\n".join([head, *body]) if body else head
+        lines = [head]
+        # The narration sits between the status and the raw rows: the reader
+        # gets the story first, then the evidence for it.
+        if self._narration:
+            lines.append(f"📍 {self._narration}")
+        lines.extend(body)
+        return "\n".join(lines)
 
     def _status_line(self, steps: list[str]) -> str:
-        """One bold status line: `**⏳ 12s** · 3 steps`.
+        """One bold status line: `🛠 **12s** · 3 steps`.
 
         Bold on the elapsed time, not on the whole line: the eye lands on how
         long the work has been running, and the step count reads as secondary.
@@ -383,7 +420,7 @@ class ProgressReporter:
         tail = (f" · {loop}{counted}" if counted else f" · {loop.rstrip(' ·')}") if loop else (
             f" · {counted}" if counted else ""
         )
-        return f"⏳ **{elapsed}**{tail}"
+        return f"🛠 **{elapsed}**{tail}"
 
     async def _flush(self, *, force: bool = False) -> None:
         if not (self._active or force) or not self._target:

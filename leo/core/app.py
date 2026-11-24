@@ -2411,6 +2411,9 @@ class LeoApp:
                     pending_calls = calls
                     break
                 pending_calls = []  # this round's results are about to be fed back
+                # The model's own sentence for this working round is the human
+                # half of the progress card (what it found, what it is doing).
+                self.progress.narrate(content)
                 # Normalize every call with a stable id BEFORE persisting. Legacy
                 # calls may carry only `tool_call_id` (or no id at all) while the
                 # executor generates its own id; without this step the assistant
@@ -2851,6 +2854,9 @@ class LeoApp:
                     pending_calls = calls
                     break
                 pending_calls = []  # this round's results are about to be fed back
+                # Same narration contract as ask(): the streaming turn's card
+                # carries the model's own status sentence, not only tool rows.
+                self.progress.narrate(content)
                 # Stable, unique ids let cancellation pair every persisted
                 # assistant tool call with an explicit result row. Duplicate
                 # ids from the model are rewritten here so both calls survive.
