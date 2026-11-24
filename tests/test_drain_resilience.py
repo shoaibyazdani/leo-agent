@@ -114,3 +114,42 @@ async def test_the_loop_helper_only_reports_real_shutdown() -> None:
     with pytest.raises(asyncio.CancelledError):
         await asyncio.sleep(0)
     await asyncio.sleep(0)  # swallow the pending cancellation for the fixture
+
+
+@pytest.mark.asyncio
+async def test_a_hung_turn_is_timed_out_instead_of_holding_the_queue(outbox_db) -> None:
+    """The live five-hour stall: a turn that never returns, nothing else drains."""
+    gateway = make_gateway()
+    await gateway.receive(msg("hangs", "m-10"))
+    await gateway.receive(msg("after", "m-11"))
+
+    seen: list[str] = []
+
+    async def consumer(payload: dict[str, Any]) -> dict[str, Any]:
+        seen.append(str(payload.get("text")))
+        if payload.get("text") == "hangs":
+            await asyncio.sleep(5)  # never returns in time
+        return {"status": "sent", "success": True, "delivered": True}
+
+    summary = await gateway.drain_outbox(consumer, limit=10, per_row_timeout=0.2)
+    assert seen == ["hangs", "after"], "the row behind a hung turn must still run"
+    assert summary["processed"] == 1
+    row = await db.fetchone(
+        "SELECT status, coalesce(last_error,'') AS err FROM gateway_outbox "
+        "WHERE coalesce(last_error,'') LIKE '%Timeout%'"
+    )
+    assert row is not None, "a hung row must be recorded, not lost"
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_never_reclaims_a_turn_that_is_still_running(outbox_db) -> None:
+    """Sweeping at 300s would double-run a legitimate 20-minute turn."""
+    gateway = make_gateway()
+    await gateway.receive(msg("long turn", "m-12"))
+    recent = utcnow()
+    await db.execute(
+        "UPDATE gateway_outbox SET status='processing', updated_at=?", (recent,)
+    )
+
+    assert await gateway.recover_stale_outbox(older_than_seconds=2400.0) == 0
+    assert (await gateway.outbox_stats())["processing"] == 1

@@ -801,6 +801,7 @@ class Gateway:
         limit: int = 10,
         channel: str | None = None,
         max_attempts: int = 3,
+        per_row_timeout: float = 1980.0,
     ) -> dict[str, int]:
         """Public draining API: run one reply turn per claimed outbox record.
 
@@ -844,7 +845,14 @@ class Gateway:
                     continue
                 typing_task = asyncio.create_task(self._typing_heartbeat(payload))
                 try:
-                    result = await consumer(payload)
+                    # A turn that never returns would hold this loop — the only
+                    # consumer of the channel outbox — for as long as it hangs.
+                    # Live: one row sat in `processing` for five hours and every
+                    # later message went unanswered. The turn has its own cap, so
+                    # timing out slightly above it only catches a real hang.
+                    result = await asyncio.wait_for(
+                        consumer(payload), timeout=max(1.0, float(per_row_timeout))
+                    )
                 finally:
                     typing_task.cancel()
                     with suppress(asyncio.CancelledError):
