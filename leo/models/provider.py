@@ -24,11 +24,15 @@ from ..config import ModelProviderConfig
 from ..contracts import ModelRequest, ModelResponse, StreamChunk, Usage, new_id
 from ..logging import get_logger
 from .reasoning import (
+    ANTHROPIC_EFFORT_WIRE,
     ANTHROPIC_WIRE_EFFORTS,
     OPENAI_WIRE_EFFORTS,
+    applied_note,
     clamp_effort,
+    is_reasoning_rejection,
     parse_effort,
     thinking_budget,
+    uses_adaptive_effort,
 )
 
 log = get_logger("models.provider")
@@ -90,6 +94,75 @@ def _openai_reasoning_parts(source: Mapping[str, Any]) -> list[str]:
     if isinstance(content, (list, tuple)):
         return reasoning_text(content)
     return []
+
+
+SUMMARY_MARKERS: tuple[str, ...] = ("summary", "summary_text", "reasoning.summary")
+
+
+def _is_summary_marker(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return any(marker in text for marker in SUMMARY_MARKERS)
+
+
+def _openai_summary_parts(source: Mapping[str, Any]) -> list[str]:
+    """Extract only text a gateway explicitly marks as a reasoning SUMMARY.
+
+    ``reasoning``/``reasoning_content``/``thinking`` carry raw chain-of-thought
+    on many gateways, so they are deliberately not read here. A summary is
+    exposed only through an explicit summary field or a summary-typed part.
+    """
+    pieces: list[str] = []
+
+    explicit = source.get("reasoning_summary")
+    if explicit is not None:
+        pieces.extend(reasoning_text(explicit))
+
+    reasoning = source.get("reasoning")
+    if isinstance(reasoning, Mapping):
+        if "summary" in reasoning:
+            pieces.extend(reasoning_text(reasoning["summary"]))
+        for key in ("reasoning_summary", "summary_text"):
+            if key in reasoning:
+                pieces.extend(reasoning_text(reasoning[key]))
+    elif isinstance(reasoning, (list, tuple)):
+        for item in reasoning:
+            if not isinstance(item, Mapping):
+                continue
+            if _is_summary_marker(item.get("type")) or _is_summary_marker(item.get("kind")):
+                pieces.extend(reasoning_text(item.get("text") or item.get("summary")))
+
+    details = source.get("reasoning_details")
+    if isinstance(details, (list, tuple)):
+        for item in details:
+            if not isinstance(item, Mapping):
+                continue
+            if _is_summary_marker(item.get("type")) or _is_summary_marker(item.get("kind")):
+                pieces.extend(reasoning_text(item.get("text") or item.get("summary")))
+
+    content = source.get("content")
+    if isinstance(content, (list, tuple)):
+        for item in content:
+            if isinstance(item, Mapping) and _is_summary_marker(item.get("type")):
+                pieces.extend(reasoning_text(item.get("text")))
+    return pieces
+
+
+def _separate_glued_summary(previous: str, delta: str) -> str:
+    """Insert a paragraph break when two summary parts would glue together.
+
+    Summary models stream one delta per completed summary part, each opening with
+    a bold heading. Plain concatenation produces ``**One****Two**`` on the chat
+    wire, which renders as one malformed paragraph.
+    """
+    if (
+        previous
+        and delta
+        and not previous[-1].isspace()
+        and delta.startswith("**")
+        and "**" in delta[2:]
+    ):
+        return "\n\n" + delta
+    return delta
 
 
 def _openai_text(value: Any) -> str:
@@ -439,6 +512,19 @@ class BaseHTTPProvider:
         self.last_content: str = ""
         # Provider-supplied reasoning only. Never logged or persisted here.
         self.last_reasoning: str = ""
+        # The most recent reasoning translation, for truthful status output.
+        # ``last_reasoning_applied`` is None when nothing was sent.
+        self.last_reasoning_requested: str | None = None
+        self.last_reasoning_applied: str | None = None
+        self.last_reasoning_style: str | None = None
+        self.last_reasoning_note: str = ""
+        self.last_reasoning_summary: str = ""
+        # A provider that rejected a reasoning parameter is never sent one
+        # again in this process. The next request keeps working instead of
+        # paying a 400 on every turn. A rejected *disable* token is remembered
+        # separately: that gateway may still accept real effort levels.
+        self._reasoning_rejected: bool = False
+        self._reasoning_disable_rejected: bool = False
         self._token: str | None = None
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=self.timeout)
@@ -452,6 +538,75 @@ class BaseHTTPProvider:
     def supports(self, capability: str) -> bool:
         return capability in self.capabilities
 
+    def _reasoning_raw(self, request: ModelRequest) -> str | None:
+        """The highest-priority effort source for this request, unparsed."""
+        return (
+            getattr(request, "reasoning_effort", None)
+            or getattr(self.config, "reasoning_effort", None)
+            or getattr(self, "default_effort", None)
+        )
+
+    def _reasoning_style(self, request: ModelRequest | None = None, *, model: str | None = None) -> str | None:
+        """How this provider expresses reasoning, or None when it is off."""
+        configured = str(getattr(self.config, "reasoning_style", "auto") or "auto").lower()
+        if configured == "off":
+            return None
+        if configured in ("effort", "budget"):
+            return configured
+        # ``auto``: modern Claude models use adaptive effort; every other
+        # Anthropic-compatible model keeps the broadly-supported budget shape.
+        if self.style == "anthropic-compatible":
+            chosen = model or getattr(request, "model", None) or self.model
+            return "effort" if uses_adaptive_effort(chosen) else "budget"
+        if self.style == "openai-compatible":
+            return "effort"
+        return None
+
+    def _wire_for(self, style: str) -> tuple[str, ...]:
+        return ANTHROPIC_WIRE_EFFORTS if style == "budget" else (
+            ANTHROPIC_EFFORT_WIRE if style == "effort" and self.style == "anthropic-compatible"
+            else OPENAI_WIRE_EFFORTS
+        )
+
+    def describe_reasoning(self, effort: str | None) -> dict[str, Any]:
+        """Preview a level's translation without sending or mutating last-call state."""
+        level = parse_effort(effort)
+        style = self._reasoning_style(model=self.model)
+        if level is None or style is None:
+            note = (
+                f"unknown reasoning level {str(effort)[:40]!r}; no parameter will be sent"
+                if effort and level is None else ""
+            )
+            return {
+                "requested": level, "applied": None, "style": style, "note": note,
+                "rejected": self._reasoning_rejected,
+            }
+        if self._reasoning_rejected:
+            return {
+                "requested": level, "applied": None, "style": None,
+                "note": "provider rejected reasoning parameters; it is sent without them",
+                "rejected": True,
+            }
+        declared = list(getattr(self.config, "reasoning_efforts", None) or []) or list(
+            self._wire_for(style)
+        )
+        overrides = dict(getattr(self.config, "reasoning_overrides", None) or {})
+        if level == "none" and self._reasoning_disable_rejected:
+            applied = None if self._reasoning_rejected else clamp_effort("low", declared, overrides)
+            note = (
+                "provider cannot disable reasoning; it will receive the effort floor"
+                if applied else "provider rejected both disable and the effort floor"
+            )
+            return {
+                "requested": level, "applied": applied, "style": style,
+                "note": note, "rejected": bool(self._reasoning_rejected),
+            }
+        applied = "none" if level == "none" else clamp_effort(level, declared, overrides)
+        return {
+            "requested": level, "applied": applied, "style": style,
+            "note": applied_note(level, applied), "rejected": False,
+        }
+
     def _effort_for(self, request: ModelRequest, wire: tuple[str, ...]) -> str | None:
         """Resolve and clamp the reasoning effort for one request.
 
@@ -460,18 +615,102 @@ class BaseHTTPProvider:
         parameter. The resolved level is clamped onto ``wire`` (or the
         provider's declared ``reasoning_efforts``) without escalating cost.
         """
-        raw = (
-            getattr(request, "reasoning_effort", None)
-            or getattr(self.config, "reasoning_effort", None)
-            or getattr(self, "default_effort", None)
-        )
-        if not raw:
+        self.last_reasoning_requested = None
+        self.last_reasoning_applied = None
+        self.last_reasoning_note = ""
+        self.last_reasoning_style = None
+        raw = self._reasoning_raw(request)
+        if not raw or self._reasoning_rejected:
+            if raw and self._reasoning_rejected:
+                self.last_reasoning_note = (
+                    "provider rejected reasoning parameters earlier; "
+                    "request sent without them"
+                )
+            return None
+        style = self._reasoning_style(request)
+        if style is None:
             return None
         level = parse_effort(raw)
         if level is None:
+            self.last_reasoning_note = (
+                f"unknown reasoning level {str(raw)[:40]!r}; no reasoning parameter sent"
+            )
+            log.warning(
+                "unknown reasoning level; request sent without it",
+                extra={"provider": self.name, "value": str(raw)[:40]},
+            )
             return None
         declared = list(getattr(self.config, "reasoning_efforts", None) or []) or list(wire)
-        return clamp_effort(level, declared)
+        overrides = dict(getattr(self.config, "reasoning_overrides", None) or {})
+        if level == "none" and self._reasoning_disable_rejected:
+            self.last_reasoning_requested = level
+            if self._reasoning_rejected:
+                self.last_reasoning_note = (
+                    "provider rejected the reasoning-disable token and the effort floor; "
+                    "no parameter sent"
+                )
+                return None
+            # The endpoint understands reasoning but refuses to turn it off. Sending
+            # nothing would let the provider choose its own (often higher) default, so
+            # ask for the lowest real level instead.
+            floor = clamp_effort("low", declared, overrides)
+            if not floor or floor == "none":
+                self.last_reasoning_note = (
+                    "provider rejected the reasoning-disable token; no lower level available"
+                )
+                return None
+            self.last_reasoning_applied = floor
+            self.last_reasoning_style = style
+            self.last_reasoning_note = (
+                f"provider cannot disable reasoning; sending the {floor} floor"
+            )
+            return floor
+        # ``none`` is an explicit disable, not an effort to clamp upward.
+        applied = "none" if level == "none" else clamp_effort(level, declared, overrides)
+        self.last_reasoning_requested = level
+        self.last_reasoning_applied = applied
+        self.last_reasoning_style = style
+        self.last_reasoning_note = applied_note(level, applied)
+        return applied
+
+    def _show_reasoning_summary(self, request: ModelRequest) -> bool:
+        """Whether a readable provider summary may be returned to the caller."""
+        if not bool(getattr(request, "reasoning_show", False)):
+            return False
+        if not bool(getattr(self.config, "reasoning_summaries", True)):
+            return False
+        return not self._reasoning_rejected
+
+    def _is_reasoning_rejection(self, exc: BaseException, request: ModelRequest) -> bool:
+        """True when this 400 is about reasoning and a clean retry is possible."""
+        return (
+            not self._reasoning_rejected
+            and bool(self._reasoning_raw(request))
+            and isinstance(exc, ModelHTTPError)
+            and is_reasoning_rejection(exc.status_code, str(exc))
+        )
+
+    def _mark_reasoning_rejected(self, level: str | None = None) -> None:
+        """Remember which reasoning shape this provider refuses.
+
+        A rejected ``none`` disable token only blocks future disable attempts;
+        real effort levels may still be supported and are retried. Any other
+        rejection disables reasoning parameters for this provider entirely, so
+        an unsupported gateway pays a 400 once, not on every turn.
+        """
+        self.last_reasoning_applied = None
+        self.last_reasoning_style = None
+        if str(level or "").lower() == "none" and not self._reasoning_disable_rejected:
+            self._reasoning_disable_rejected = True
+            self.last_reasoning_note = (
+                "provider rejected the reasoning-disable token; retrying at the lowest "
+                "effort instead of its own default"
+            )
+            return
+        self._reasoning_rejected = True
+        self.last_reasoning_note = (
+            "provider rejected reasoning parameters; retried without them and will skip them"
+        )
 
     @property
     def base_url(self) -> str:
@@ -528,6 +767,14 @@ class BaseHTTPProvider:
         self.last_tool_calls = list(state.get("tool_calls") or [])
         self.last_content = "".join(state.get("text") or [])
         self.last_reasoning = "".join(state.get("reasoning") or [])
+        # Only an effort-style stream carries summary text; budget-style
+        # thinking is raw and must never be labeled a summary.
+        self.last_reasoning_summary = (
+            self.last_reasoning
+            if bool(getattr(request, "reasoning_show", False))
+            and self.last_reasoning_style == "effort"
+            else ""
+        )
 
     def _redact(self, text: str) -> str:
         if self._token:
@@ -660,10 +907,15 @@ class BaseHTTPProvider:
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         """Send one completion request with bounded retries and backoff."""
-        body = self._body(request, stream=False)
         headers = self._with_extra_headers(self._headers())
         started = time.perf_counter()
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        max_attempts = self.max_retries + 1
+        while attempt < max_attempts:
+            attempt += 1
+            # Rebuilt per attempt: a rejected reasoning parameter is removed
+            # for the retry without changing the caller's request.
+            body = self._body(request, stream=False)
             try:
                 response = await self._client.post(self._url, headers=headers, json=body, timeout=self.timeout)
                 self._raise_for_status(response)
@@ -690,13 +942,14 @@ class BaseHTTPProvider:
                 self.last_tool_calls = list(result.tool_calls)
                 self.last_content = result.content
                 self.last_reasoning = result.reasoning
+                self.last_reasoning_summary = result.reasoning_summary
                 log.info(
                     "model complete",
                     extra={
                         "provider": self.name,
                         "task_id": request.task_id,
                         "agent_id": request.agent_id,
-                        "attempt": attempt + 1,
+                        "attempt": attempt,
                         "latency_ms": round(elapsed_ms, 2),
                     },
                 )
@@ -706,6 +959,18 @@ class BaseHTTPProvider:
                 error.__cause__ = exc
             except (httpx.HTTPError, ModelHTTPError, ModelTimeoutError) as exc:
                 error = exc if isinstance(exc, ModelError) else ModelError(self._redact(str(exc)))
+            if self._is_reasoning_rejection(error, request):
+                # A provider that does not understand the reasoning parameter
+                # must still answer. Retry once without it, and remember the
+                # rejection for every later call to this provider.
+                self._mark_reasoning_rejected(self.last_reasoning_requested)
+                max_attempts += 1
+                log.warning(
+                    "model reasoning parameter rejected; retrying without it",
+                    extra={"provider": self.name, "attempt": attempt,
+                           "error": self._redact(str(error))[:200]},
+                )
+                continue
             retry_after = getattr(error, "retry_after", None)
             if (
                 retry_after is not None
@@ -714,11 +979,11 @@ class BaseHTTPProvider:
             ):
                 # Too long to wait interactively: let the router fail over now.
                 raise error
-            if not self._is_retryable(error) or attempt >= self.max_retries:
+            if not self._is_retryable(error) or attempt >= max_attempts:
                 raise error
             log.warning(
                 "model request retry",
-                extra={"provider": self.name, "attempt": attempt + 1, "error": self._redact(str(error))[:200]},
+                extra={"provider": self.name, "attempt": attempt, "error": self._redact(str(error))[:200]},
             )
             await self._backoff(attempt, retry_after)
         raise ModelError(f"{self.name}: retries exhausted")
@@ -727,12 +992,14 @@ class BaseHTTPProvider:
         """Stream typed text and reasoning deltas; retries stop after any output.
 
         Reasoning chunks are emitted only when the provider actually supplied
-        thinking text. They are separate from text chunks so consumers can show
-        them in their own channel without contaminating answer content.
+        a readable summary. Raw chain-of-thought is never forwarded.
         """
-        body = self._body(request, stream=True)
         headers = self._with_extra_headers(self._headers())
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        max_attempts = self.max_retries + 1
+        while attempt < max_attempts:
+            attempt += 1
+            body = self._body(request, stream=True)
             state = self._new_state(request)
             emitted = False
             started = time.perf_counter()
@@ -773,21 +1040,30 @@ class BaseHTTPProvider:
                     raise ModelEmptyOutputError(self.name, blank_reason)
                 log.info(
                     "model stream complete",
-                    extra={"provider": self.name, "task_id": request.task_id, "attempt": attempt + 1},
+                    extra={"provider": self.name, "task_id": request.task_id, "attempt": attempt},
                 )
                 return
+            if not emitted and self._is_reasoning_rejection(error, request):
+                self._mark_reasoning_rejected(self.last_reasoning_requested)
+                max_attempts += 1
+                log.warning(
+                    "model stream reasoning parameter rejected; retrying without it",
+                    extra={"provider": self.name, "attempt": attempt,
+                           "error": self._redact(str(error))[:200]},
+                )
+                continue
             retry_after = getattr(error, "retry_after", None)
             too_long = (
                 retry_after is not None
                 and self.max_retry_after > 0
                 and retry_after > self.max_retry_after
             )
-            if too_long or emitted or not self._is_retryable(error) or attempt >= self.max_retries:
+            if too_long or emitted or not self._is_retryable(error) or attempt >= max_attempts:
                 self._record_stream_state(state, request, (time.perf_counter() - started) * 1000)
                 raise error
             log.warning(
                 "model stream retry",
-                extra={"provider": self.name, "attempt": attempt + 1, "error": self._redact(str(error))[:200]},
+                extra={"provider": self.name, "attempt": attempt, "error": self._redact(str(error))[:200]},
             )
             await self._backoff(attempt, retry_after)
 
@@ -896,12 +1172,35 @@ class AnthropicProvider(BaseHTTPProvider):
         if request.response_format is not None:
             # Forward the caller-supplied format unchanged; no schema is invented.
             body["output_config"] = {"format": dict(request.response_format)}
-        # Reasoning effort -> Anthropic thinking block. Only sent when a level
-        # was explicitly requested; the budget is clamped below max_tokens.
-        effort = self._effort_for(request, ANTHROPIC_WIRE_EFFORTS)
-        budget = thinking_budget(effort, body["max_tokens"])
-        if budget is not None:
-            body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        style = self._reasoning_style(request)
+        # Legacy Anthropic models take a thinking budget; modern Claude models
+        # take adaptive thinking plus output_config.effort. The provider's
+        # declared wire and the automatic model detection decide which.
+        effort = self._effort_for(
+            request,
+            ANTHROPIC_WIRE_EFFORTS if style == "budget" else ANTHROPIC_EFFORT_WIRE,
+        )
+        if effort is not None:
+            if style == "budget":
+                budget = thinking_budget(effort, body["max_tokens"])
+                if budget is not None:
+                    body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            elif style == "effort":
+                if effort == "none":
+                    # Explicit disable where the model allows it. Models that
+                    # always think reject this; the provider retries without
+                    # the parameter and reports the degradation.
+                    body["thinking"] = {"type": "disabled"}
+                else:
+                    body["thinking"] = {
+                        "type": "adaptive",
+                        # Summarized returns a readable summary, never the raw
+                        # chain of thought. Omitted hides the text entirely.
+                        "display": "summarized" if self._show_reasoning_summary(request) else "omitted",
+                    }
+                    output_config = dict(body.get("output_config") or {})
+                    output_config["effort"] = effort
+                    body["output_config"] = output_config
         if stream:
             body["stream"] = True
         return body
@@ -918,6 +1217,14 @@ class AnthropicProvider(BaseHTTPProvider):
             if isinstance(block, Mapping) and block.get("type") in THINKING_BLOCK_TYPES
             for piece in reasoning_text(block)
         )
+        # Only an adaptive-thinking model asked for display=summarized returns a
+        # summary. Budget-style thinking blocks are raw chain-of-thought and are
+        # kept internal, never surfaced as a summary.
+        summary = (
+            reasoning
+            if self.last_reasoning_style == "effort" and self._show_reasoning_summary(request)
+            else ""
+        )
         usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
         measured = usage.get("input_tokens"), usage.get("output_tokens")
         result_usage = usage_from_counts(
@@ -928,6 +1235,7 @@ class AnthropicProvider(BaseHTTPProvider):
             model=str(payload.get("model") or request.model or self.model),
             provider=self.name,
             reasoning=reasoning,
+            reasoning_summary=summary,
             tool_calls=normalize_tool_calls(tools, "anthropic"),
             usage=result_usage,
             finish_reason=payload.get("stop_reason"),
@@ -1009,6 +1317,16 @@ class AnthropicProvider(BaseHTTPProvider):
         # Thinking deltas arrive keyed by content-block index; concatenation in
         # arrival order preserves the provider's sequence. Signatures and
         # redacted data are intentionally left out by _anthropic_reasoning_parts.
+        request = state.get("request")
+        # Only adaptive thinking with display=summarized yields readable
+        # summary text. Budget-style thinking is raw chain-of-thought and is
+        # deliberately never yielded to a caller.
+        if (
+            request is None
+            or self.last_reasoning_style != "effort"
+            or not self._show_reasoning_summary(request)
+        ):
+            return []
         pieces = _anthropic_reasoning_parts(event)
         if pieces:
             state.setdefault("reasoning", []).extend(pieces)
@@ -1104,7 +1422,8 @@ class OpenAIProvider(BaseHTTPProvider):
                 raise ModelUnsupportedError(f"{self.name}: structured output is not a configured capability")
             body["response_format"] = dict(request.response_format)
         # Reasoning effort -> OpenAI-compatible reasoning_effort field. Only
-        # sent when a level was explicitly requested; ``none`` disables it.
+        # sent when a level was explicitly requested; ``none`` is forwarded as
+        # the disable token where the gateway understands it.
         effort = self._effort_for(request, OPENAI_WIRE_EFFORTS)
         if effort is not None:
             body["reasoning_effort"] = effort
@@ -1122,6 +1441,10 @@ class OpenAIProvider(BaseHTTPProvider):
         message = choice.get("message") if isinstance(choice.get("message"), Mapping) else {}
         content = _openai_text(message.get("content"))
         reasoning = "".join(_openai_reasoning_parts(message))
+        summary = ""
+        if self._show_reasoning_summary(request):
+            for part in _openai_summary_parts(message):
+                summary += _separate_glued_summary(summary, part)
         usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
         result_usage = usage_from_counts(
             usage.get("prompt_tokens"), usage.get("completion_tokens"), self.config, request, content, latency_ms
@@ -1131,6 +1454,7 @@ class OpenAIProvider(BaseHTTPProvider):
             model=str(payload.get("model") or request.model or self.model),
             provider=self.name,
             reasoning=reasoning,
+            reasoning_summary=summary,
             tool_calls=normalize_tool_calls(message.get("tool_calls"), "openai"),
             usage=result_usage,
             finish_reason=choice.get("finish_reason"),
@@ -1195,6 +1519,12 @@ class OpenAIProvider(BaseHTTPProvider):
         return chunks
 
     def _event_reasoning(self, event: Mapping[str, Any], state: dict[str, Any]) -> list[str]:
+        request = state.get("request")
+        if request is None or not self._show_reasoning_summary(request):
+            return []
+        # Only explicit summary payloads are exposed. A gateway's generic
+        # ``reasoning``/``reasoning_content`` field is raw chain-of-thought and
+        # stays internal.
         pieces: list[str] = []
         choices = event.get("choices")
         if isinstance(choices, list):
@@ -1206,12 +1536,20 @@ class OpenAIProvider(BaseHTTPProvider):
                     source = choice.get("message")
                 if not isinstance(source, Mapping):
                     source = choice
-                pieces.extend(_openai_reasoning_parts(source))
+                pieces.extend(_openai_summary_parts(source))
         if not pieces:
-            # Some compatible gateways emit reasoning at the top level.
-            pieces.extend(_openai_reasoning_parts(event))
+            # Some compatible gateways emit summary parts at the top level.
+            pieces.extend(_openai_summary_parts(event))
         if pieces:
-            state.setdefault("reasoning", []).extend(pieces)
+            prior = state.setdefault("reasoning", [])
+            previous = prior[-1] if prior else ""
+            adjusted: list[str] = []
+            for piece in pieces:
+                piece = _separate_glued_summary(previous, piece)
+                adjusted.append(piece)
+                previous = piece
+            prior.extend(adjusted)
+            return adjusted
         return pieces
 
     def _stream_usage(self, state: dict[str, Any], request: ModelRequest, latency_ms: float) -> Usage:

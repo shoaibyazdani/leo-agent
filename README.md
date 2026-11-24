@@ -25,9 +25,10 @@ uv pip install -e .
 uv run python -m leo.interfaces.cli chat
 ```
 
-`leo chat` (alias `leo tui`) streams replies and reasoning, shows tool rows and
-approval gates live, and accepts `/help`, `/new`, `/model`, `/tools`,
-`/agents`, `/approvals`, `/approve <id>`, `/deny <id>`. Resume a session with
+`leo chat` (alias `leo tui`) streams replies (and concise reasoning summaries
+when enabled), shows tool rows and approval gates live, and accepts `/help`, `/new`, `/model`,
+`/reasoning` (interactive effort/scope/display menu), `/tools`, `/agents`,
+`/approvals`, `/approve <id>`, `/deny <id>`. Resume a session with
 `leo chat --conversation <id>`. `leo serve` starts the dashboard and API on
 <http://127.0.0.1:8765>; `leo --help` lists every command.
 
@@ -108,6 +109,7 @@ durable memory writes stay in the SQLite memory module.
 - [LEO_DECISIONS.md](LEO_DECISIONS.md) — engineering decisions
 - [LEO_INTEGRATIONS.md](LEO_INTEGRATIONS.md) — real vs blocked integrations; [channel matrix](LEO_INTEGRATIONS.md#channel-matrix-2026-11-18) (22 auto-registered adapters appear in Connected Surfaces; live delivery blocked until credentials are supplied)
 - [LEO_SECURITY.md](LEO_SECURITY.md) — permissions, approvals, audit
+- [docs/REASONING.md](docs/REASONING.md) — `/reasoning` levels, scopes, provider mapping and display privacy
 - [docs/TESTING.md](docs/TESTING.md) — how to run the suite
 - [LEO_KNOWN_ISSUES.md](LEO_KNOWN_ISSUES.md) — honest limitations
 - [NOTICE](NOTICE) — upstream license attribution

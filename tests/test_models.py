@@ -998,7 +998,12 @@ async def test_complete_populates_last_tool_calls_and_content(monkeypatch) -> No
 # --- first-class reasoning streaming -----------------------------------
 @pytest.mark.asyncio
 async def test_openai_stream_reasoning_fields_are_typed_and_text_unchanged(monkeypatch) -> None:
-    """OpenAI reasoning_content/reasoning/thinking deltas never become text."""
+    """Raw OpenAI reasoning fields never become text and are not displayed.
+
+    ``reasoning_content``/``reasoning``/``thinking`` are raw chain-of-thought.
+    They stay internal (``last_reasoning``) unless the provider explicitly marks
+    a payload as a summary. Answer text is unchanged.
+    """
     monkeypatch.setenv("LEO_TEST_OPENAI_KEY", OPENAI_TOKEN)
     events = [
         {"choices": [{"delta": {"reasoning_content": "Think "}, "index": 0}]},
@@ -1017,20 +1022,49 @@ async def test_openai_stream_reasoning_fields_are_typed_and_text_unchanged(monke
         provider = OpenAIProvider(_openai_config(), name="openai", client=client)
         plain = [chunk async for chunk in provider.stream(_request())]
         typed = [chunk async for chunk in provider.stream_events(_request())]
+        typed_reasoning = provider.last_reasoning
+        shown = [chunk async for chunk in provider.stream_events(_request(reasoning_show=True))]
 
     assert plain == ["a", "b"]  # existing string stream is unchanged
     assert all(isinstance(chunk, StreamChunk) for chunk in typed)
-    assert [(chunk.kind, chunk.text) for chunk in typed] == [
-        ("reasoning", "Think "),
-        ("text", "a"),
-        ("reasoning", "step"),
-        ("reasoning", " by step"),
-        ("text", "b"),
-    ]
+    # No summary was declared, so display-on still exposes no raw thought.
+    assert [(chunk.kind, chunk.text) for chunk in typed] == [("text", "a"), ("text", "b")]
+    assert [(chunk.kind, chunk.text) for chunk in shown] == [("text", "a"), ("text", "b")]
     assert provider.last_content == "ab"
-    assert provider.last_reasoning == "Think step by step"
+    # Raw thought stays out of even the internal stream view when hidden.
+    assert typed_reasoning == ""
+    assert provider.last_reasoning_summary == ""
     assert "Think" not in provider.last_content
     assert (provider.last_usage.input_tokens, provider.last_usage.output_tokens) == (5, 3)
+
+
+@pytest.mark.asyncio
+async def test_openai_explicit_summary_is_displayed_but_raw_reasoning_is_not(monkeypatch) -> None:
+    """Only explicit summary fields reach a display channel."""
+    monkeypatch.setenv("LEO_TEST_OPENAI_KEY", OPENAI_TOKEN)
+    events = [
+        {"choices": [{"delta": {"reasoning_content": "RAW "}, "index": 0}]},
+        {"choices": [{"delta": {"reasoning_summary": "Checked the inputs."}, "index": 0}]},
+        {"choices": [{"delta": {"content": "done"}, "index": 0}]},
+    ]
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text=_sse(*events), headers={"content-type": "text/event-stream"}, request=http_request
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = OpenAIProvider(_openai_config(), name="openai", client=client)
+        shown = [chunk async for chunk in provider.stream_events(
+            _request(reasoning_show=True, reasoning_effort="medium")
+        )]
+
+    assert [(chunk.kind, chunk.text) for chunk in shown] == [
+        ("reasoning", "Checked the inputs."),
+        ("text", "done"),
+    ]
+    assert provider.last_reasoning_summary == "Checked the inputs."
+    assert "RAW" not in provider.last_reasoning_summary
 
 
 @pytest.mark.asyncio
@@ -1064,13 +1098,10 @@ async def test_openai_stream_structured_thinking_parts_are_separated(monkeypatch
         typed = [chunk async for chunk in provider.stream_events(_request())]
 
     assert plain == ["Hi"]
-    assert [(chunk.kind, chunk.text) for chunk in typed] == [
-        ("text", "Hi"),
-        ("reasoning", "Hidden "),
-        ("reasoning", "trace"),
-    ]
+    # Structured thinking parts are raw chain-of-thought, not a summary.
+    assert [(chunk.kind, chunk.text) for chunk in typed] == [("text", "Hi")]
     assert provider.last_content == "Hi"
-    assert provider.last_reasoning == "Hidden trace"
+    assert provider.last_reasoning == ""
 
 
 @pytest.mark.asyncio
@@ -1098,15 +1129,44 @@ async def test_anthropic_stream_thinking_blocks_and_opaque_fields(monkeypatch) -
         typed = [chunk async for chunk in provider.stream_events(_request())]
 
     assert plain == ["Answer"]
+    # Budget-style thinking is raw chain-of-thought: never yielded to callers.
+    assert [(chunk.kind, chunk.text) for chunk in typed] == [("text", "Answer")]
+    assert provider.last_content == "Answer"
+    assert provider.last_reasoning == ""
+    assert (provider.last_usage.input_tokens, provider.last_usage.output_tokens) == (10, 4)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_adaptive_summary_is_displayed_when_enabled(monkeypatch) -> None:
+    """Adaptive thinking with display=summarized is the only readable stream."""
+    monkeypatch.setenv("LEO_TEST_ANTHROPIC_KEY", ANTHROPIC_TOKEN)
+    events = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 10}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "First "}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "thought"}},
+        {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "Answer"}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}},
+    ]
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text=_sse(*events), headers={"content-type": "text/event-stream"}, request=http_request
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = AnthropicProvider(
+            _anthropic_config(reasoning_style="effort"), name="anthropic", client=client
+        )
+        typed = [chunk async for chunk in provider.stream_events(
+            _request(reasoning_show=True, reasoning_effort="high")
+        )]
+
     assert [(chunk.kind, chunk.text) for chunk in typed] == [
         ("reasoning", "First "),
         ("reasoning", "thought"),
         ("text", "Answer"),
     ]
-    assert provider.last_content == "Answer"
-    assert provider.last_reasoning == "First thought"
-    assert ANTHROPIC_TOKEN not in provider.last_reasoning
-    assert (provider.last_usage.input_tokens, provider.last_usage.output_tokens) == (10, 4)
+    assert provider.last_reasoning_summary == "First thought"
 
 
 @pytest.mark.asyncio
@@ -1201,12 +1261,12 @@ async def test_no_reasoning_never_produces_reasoning_chunks_or_text(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_reasoning_only_partial_stream_is_not_replayed(monkeypatch) -> None:
-    """A reasoning delta counts as output: no retry after a mid-stream failure."""
+    """A visible reasoning summary counts as output: no retry after a failure."""
     monkeypatch.setenv("LEO_TEST_OPENAI_KEY", OPENAI_TOKEN)
 
     class ThinkingStream(httpx.AsyncByteStream):
         async def __aiter__(self):
-            yield b'data: {"choices":[{"delta":{"reasoning_content":"partial thought"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{"reasoning_summary":"partial summary"}}]}\n\n'
             raise httpx.ReadTimeout("mid-stream")
 
     calls = {"n": 0}
@@ -1222,10 +1282,12 @@ async def test_reasoning_only_partial_stream_is_not_replayed(monkeypatch) -> Non
             _openai_config(max_retries=1), name="openai", client=client, backoff_base=0
         )
         with pytest.raises(ModelTimeoutError):
-            _ = [chunk async for chunk in provider.stream_events(_request())]
+            _ = [chunk async for chunk in provider.stream_events(
+                _request(reasoning_show=True, reasoning_effort="medium")
+            )]
 
     assert calls["n"] == 1
-    assert provider.last_reasoning == "partial thought"
+    assert provider.last_reasoning == "partial summary"
     assert provider.last_content == ""
 
 

@@ -13,6 +13,7 @@
 | 9 | Webhook verification fails closed; HMAC covers exact raw bytes | Default no-secret configuration previously accepted arbitrary messages. | 2026-11-18 |
 | 10 | Non-loopback API binds require `LEO_API_TOKEN`; local-only remains tokenless | Keeps the product usable locally while removing an unauthenticated remote-control surface. | 2026-11-18 |
 | 11 | Imported external skills are inert until a sandboxed execution model exists | Parsing SKILL.md is not evidence that third-party scripts are safe or runnable. | 2026-11-18 |
+| 12 | Reasoning effort is resolved per turn (session > global > config), translated per provider, and clamped downward; display uses only provider-declared summaries | Raw chain-of-thought is never shown or persisted; an unsupported level must not escalate cost, and a refused disable steps up to the lowest real effort rather than accepting the provider's default. | 2026-11-24 |
 
 Open assumptions: local-only mode is the default; network integrations remain
 DISCONNECTED/BLOCKED until credentials are supplied by the user. The web

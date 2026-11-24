@@ -24,6 +24,7 @@
   // A disclosure panel is created only by a real thinking.delta. When no delta
   // arrives, the truthful verdict is one short line, never invented reasoning.
   const NO_REASONING_NOTE = 'No reasoning streamed';
+  const NO_REASONING_HIDDEN_NOTE = 'Reasoning display is off';
 
   const state = {
     activeId: localStorage.getItem('leo_chat_conversation') || null,
@@ -42,6 +43,9 @@
     turnReasoningStreams: [],
     turnReasoningSeen: false,
     noReasoningNote: false,
+    // The backend reports whether summaries were intentionally hidden. When
+    // they were, the terminal one-liner says "display is off", not "none".
+    reasoningHidden: false,
     // Per-run latch: once a run reaches a terminal event (or is superseded),
     // its reasoning channel is closed forever. A late delta from that run must
     // never reopen a panel or create a fresh assistant message.
@@ -173,7 +177,7 @@
     // failure already explain themselves; only successful/incomplete answers
     // get the extra one-line verdict.
     if (state.noReasoningNote && (terminal === 'completed' || terminal === 'incomplete')) {
-      setTurnStatus(NO_REASONING_NOTE);
+      setTurnStatus(state.reasoningHidden ? NO_REASONING_HIDDEN_NOTE : NO_REASONING_NOTE);
     }
   }
 
@@ -815,6 +819,7 @@
     state.turnReasoningStreams = [];
     state.turnReasoningSeen = false;
     state.noReasoningNote = false;
+    state.reasoningHidden = false;
     state.reasoningClosedRuns = new Set();
     state.turnNodes = [];
     state.pendingApprovals.clear();
@@ -1030,14 +1035,15 @@
   }
 
   function noteNoReasoning(stream) {
+    const text = state.reasoningHidden ? NO_REASONING_HIDDEN_NOTE : NO_REASONING_NOTE;
     state.noReasoningNote = true;
-    setTurnStatus(NO_REASONING_NOTE);
+    setTurnStatus(text);
     if (!stream || !stream.node) return;
     // One line on this message, never a large card and never invented text.
     stream.node.querySelectorAll('.chat-reasoning-none').forEach((note) => note.remove());
     const note = document.createElement('span');
     note.className = 'chat-reasoning-none';
-    note.textContent = NO_REASONING_NOTE;
+    note.textContent = text;
     stream.node.appendChild(note);
   }
 
@@ -1254,6 +1260,7 @@
     } else if (event.type === 'message.finished') {
       // The backend's flag is authoritative, independent of client deltas.
       if (event.reasoning_seen === true) markReasoningSeen();
+      state.reasoningHidden = event.reasoning_display === 'hidden';
       closeReasoning(eventRunId);
       sealStream();
       removeStreamingCarets();
@@ -1343,6 +1350,7 @@
     state.turnReasoningStreams = [];
     state.turnReasoningSeen = false;
     state.noReasoningNote = false;
+    state.reasoningHidden = false;
     state.reasoningClosedRuns = new Set();
     state.turnNodes = [];
     state.terminalStatus = null;

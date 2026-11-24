@@ -1073,6 +1073,25 @@ class AgentEngine:
             k: v for k, v in context.items() if k in ("shared_state", "dependencies", "messages")
         }
         context_text = self._bounded_context(context_data, spec.context_budget)
+        # Inherit the parent turn's effective reasoning unless this delegation
+        # explicitly overrides it. Background work outside a turn falls back to
+        # the provider/global default (no request override).
+        from ..models.reasoning_state import (
+            current_reasoning,
+            selection_from_context,
+        )
+
+        explicit = request.context.get("reasoning")
+        if explicit is None and (
+            request.context.get("reasoning_effort") is not None
+            or request.context.get("reasoning_show") is not None
+        ):
+            explicit = {
+                "effort": request.context.get("reasoning_effort"),
+                "show": request.context.get("reasoning_show"),
+                "source": "context",
+            }
+        reasoning = selection_from_context(explicit) or current_reasoning()
         llm_request = ModelRequest(
             messages=[ChatMessage(role="user", content=(
                 f"You are {spec.name}. {spec.purpose}\nObjective: {request.objective}\n"
@@ -1082,6 +1101,9 @@ class AgentEngine:
             task_id=context.get("task_id"),
             agent_id=spec.id,
             tools=tool_specs,
+            reasoning_effort=reasoning.get("effort") if reasoning else None,
+            reasoning_show=bool(reasoning.get("show")) if reasoning else False,
+            reasoning_source=str(reasoning.get("source") or "") if reasoning else None,
             metadata={
                 # Provider names still take priority, but every capability tag
                 # must reach the router: tags such as ``structured``/``tools``

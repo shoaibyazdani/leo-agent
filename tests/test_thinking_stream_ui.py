@@ -215,8 +215,9 @@ def test_empty_state_is_truthful_and_only_finalized_at_termination() -> None:
     assert "the model thought" not in CHAT_JS.lower()
 
     note = block(CHAT_JS, "function noteNoReasoning(stream)", "\n  // The backend's message.finished")
-    assert "setTurnStatus(NO_REASONING_NOTE)" in note
-    assert "note.textContent = NO_REASONING_NOTE" in note
+    assert "NO_REASONING_HIDDEN_NOTE" in note
+    assert "setTurnStatus(text)" in note
+    assert "note.textContent = text" in note
     assert "createElement('span')" in note  # one line, not a card
 
     # Authoritative flags are consumed without fabricating any panel text.
@@ -395,3 +396,13 @@ applyStreamEvent(E('thinking.delta', 'r3', { delta: 'now a real late delta' }));
 ok(saw('appendReasoning'), 'thinking.state wrongly closed an open run');
 """
     run_node(JS_ASSERTIONS + "\n\n" + EVENT_FUNCTIONS + "\n" + driver)
+
+
+def test_display_hidden_uses_its_own_terminal_note():
+    """An intentionally hidden channel must not read as "the model sent none"."""
+    assert "const NO_REASONING_HIDDEN_NOTE = 'Reasoning display is off';" in CHAT_JS
+    finished = block(CHAT_JS, "} else if (event.type === 'message.finished') {", "} else if (event.type === 'run.finished') {")
+    assert "event.reasoning_display === 'hidden'" in finished
+    assert "state.reasoningHidden" in finished
+    note = block(CHAT_JS, "function noteNoReasoning(stream)", "\n  // The backend's message.finished")
+    assert "NO_REASONING_HIDDEN_NOTE" in note

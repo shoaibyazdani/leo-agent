@@ -119,6 +119,14 @@ async def agent_delegate(args: dict[str, Any], ctx: dict[str, Any], fallback: An
     correlation_id = ctx.get("correlation_id")
     if correlation_id and not context.get("correlation_id"):
         context["correlation_id"] = str(correlation_id)
+    # A delegated turn inherits the parent's effective reasoning settings.
+    # An explicit context value still wins; this only fills an empty slot.
+    from ..models.reasoning_state import current_reasoning, inheritance_payload
+
+    if context.get("reasoning") is None:
+        inherited = inheritance_payload(current_reasoning())
+        if inherited:
+            context["reasoning"] = inherited
 
     result = await engine.delegate(
         args["objective"],

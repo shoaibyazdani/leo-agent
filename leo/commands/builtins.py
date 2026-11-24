@@ -223,10 +223,22 @@ async def status_command(ctx: CommandContext) -> CommandResult:
     pending = await app.permissions.pending_approvals()
     reported = getattr(getattr(app, "router", None), "status", None)
     model = reported() if callable(reported) else app.settings.model_status()
+    reasoning: dict[str, Any] = {}
+    selector = getattr(app, "reasoning_selection", None)
+    if callable(selector):
+        try:
+            selection = await selector(ctx.conversation_id)
+            reasoning = {
+                key: selection.get(key)
+                for key in ("effort", "effort_source", "show", "show_source", "scope")
+            }
+        except Exception:  # status must survive a broken settings read
+            reasoning = {}
     data = {
         "health": health,
         "pending_approvals": len(pending),
         "model": {k: model.get(k) for k in ("status", "simulated", "default", "routable_live_providers") if k in model},
+        "reasoning": reasoning,
     }
     message = (
         f"LEO {health.get('status', 'unknown')} (v{health.get('version', '?')}); "
@@ -234,6 +246,12 @@ async def status_command(ctx: CommandContext) -> CommandResult:
         f"agents={health.get('agents', '?')}; pending approvals={len(pending)}; "
         f"model={model.get('status', 'unknown')}"
     )
+    if reasoning:
+        display = "on" if reasoning.get("show") else "off"
+        message += (
+            f"; reasoning={reasoning.get('effort') or 'unset'}"
+            f" ({reasoning.get('effort_source') or 'unset'}), display={display}"
+        )
     return _summary(ctx, "status", message, data)
 
 
@@ -268,6 +286,8 @@ _CONFIG_KEYS = {
     "environment": lambda s: s.environment,
     "default_provider": lambda s: s.models.default,
     "fallback_provider": lambda s: s.models.fallback,
+    "reasoning_effort": lambda s: s.models.reasoning_effort,
+    "reasoning_show": lambda s: s.models.reasoning_show,
     "db_path": lambda s: str(s.db_path),
     "workspace_only": lambda s: s.security.workspace_only,
     "allow_medium_risk": lambda s: s.security.allow_medium_risk,
@@ -505,96 +525,298 @@ async def model_command(ctx: CommandContext) -> CommandResult:
     )
 
 
-async def reasoning_command(ctx: CommandContext) -> CommandResult:
-    """Set/show reasoning effort and thinking display (session-scoped by default).
+def _reasoning_keyboard(selection: Mapping[str, Any]) -> dict[str, Any]:
+    """Inline keyboard for the full /reasoning menu.
 
-    Mirrors Hermes' /reasoning: an effort ladder wider than any one provider
-    wire, clamped per provider so a request never escalates cost; display
-    toggles for showing/clamping thinking; ``--global`` persists the effort.
+    Every button sends a plain action token back through the gateway; the brain
+    turns it into the same slash command a typed request uses. No tap writes
+    state directly, so CLI, API and Telegram share one mutation path.
+    """
+    from ..models.reasoning import EFFORT_LADDER
+
+    rows: list[list[dict[str, str]]] = []
+    active = selection.get("effort")
+    levels = list(EFFORT_LADDER)
+    for index in range(0, len(levels), 2):
+        row: list[dict[str, str]] = []
+        for level in levels[index:index + 2]:
+            label = ("✓ " if level == active else "") + level
+            row.append({"text": label[:48], "callback_data": f"rsn:level:{level}"[:64]})
+        rows.append(row)
+    scope = str(selection.get("scope") or "session")
+    other = "global" if scope == "session" else "session"
+    rows.append([{
+        "text": f"Scope: {scope} → {other}"[:48],
+        "callback_data": f"rsn:scope:{other}"[:64],
+    }])
+    if selection.get("show"):
+        rows.append([{"text": "Hide summaries", "callback_data": "rsn:hide"}])
+    else:
+        rows.append([{"text": "Show summaries", "callback_data": "rsn:show"}])
+    rows.append([{
+        "text": "Detail: detailed" if selection.get("full") else "Detail: concise",
+        "callback_data": "rsn:detail",
+    }])
+    rows.append([{"text": "Reset session overrides", "callback_data": "rsn:reset"}])
+    rows.append([{"text": "Reset global default", "callback_data": "rsn:reset-global"}])
+    return {"inline_keyboard": rows}
+
+
+def _reasoning_message(app: Any, selection: Mapping[str, Any]) -> str:
+    """Truthful status: effective value, its source, edit scope and display."""
+    effort = selection.get("effort") or "unset"
+    source = selection.get("effort_source") or "unset"
+    show = "summaries on" if selection.get("show") else "summaries off"
+    detail = "detailed" if selection.get("full") else "concise"
+    lines = [
+        "🧠 Reasoning",
+        f"Active effort: {effort} ({source})",
+        f"Display: {show} ({selection.get('show_source') or 'config'}); detail: {detail}",
+        f"Edit scope: {selection.get('scope') or 'session'}",
+        "Levels: " + ", ".join(selection.get("levels") or []),
+    ]
+    provider = _reasoning_provider_line(app, selection)
+    if provider:
+        lines.append(provider)
+    return "\n".join(lines)
+
+
+def _reasoning_provider_line(app: Any, selection: Mapping[str, Any]) -> str:
+    """What the configured default provider will do with the next request."""
+    try:
+        models = app.settings.models
+        name = str(getattr(models, "default", "") or "")
+        cfg = (getattr(models, "providers", {}) or {}).get(name)
+        provider = (getattr(getattr(app, "router", None), "providers", {}) or {}).get(name)
+        parts = [f"Provider: {name or 'unset'}"]
+        if cfg is not None:
+            model = str(getattr(cfg, "model", "") or "")
+            if model:
+                parts.append(model)
+        describe = getattr(provider, "describe_reasoning", None)
+        preview_note = ""
+        if callable(describe):
+            preview = describe(selection.get("effort")) or {}
+            applied = preview.get("applied")
+            style = preview.get("style")
+            parts.append(
+                f"sends: {applied or 'nothing'}" + (f" ({style})" if style else "")
+            )
+            preview_note = str(preview.get("note") or "")
+            if preview_note:
+                parts.append(preview_note)
+        elif cfg is not None:
+            parts.append(f"style={getattr(cfg, 'reasoning_style', 'auto')}")
+
+        reporter = getattr(getattr(app, "router", None), "reasoning_report", None)
+        report = reporter() if callable(reporter) else {}
+        requested = report.get("requested") if isinstance(report, Mapping) else None
+        if requested:
+            applied = report.get("applied")
+            last = f"last request: {requested}"
+            if applied and applied != requested:
+                last += f" → {applied}"
+            if report.get("style"):
+                last += f" ({report['style']})"
+            parts.append(last)
+            note = str(report.get("note") or "")
+            if note and note != preview_note:
+                parts.append(note)
+        return " · ".join(parts)
+    except Exception:  # status rendering must never break the menu
+        return ""
+
+
+async def reasoning_command(ctx: CommandContext) -> CommandResult:
+    """Show/set reasoning effort, scope and summary display.
+
+    Session changes apply only to the current conversation; global changes are
+    persisted in the database and survive a restart. Effort is translated to
+    each provider's own parameter at request time, and an unsupported level is
+    clamped downward and reported rather than silently escalated.
     """
     from ..models.reasoning import EFFORT_LADDER, parse_effort
 
-    state = getattr(ctx.app, "reasoning_state", None)
+    app = ctx.app
+    state = getattr(app, "reasoning_state", None)
     if state is None:
         return CommandResult.unsupported(
             "reasoning", "Reasoning state service is not available; nothing was changed."
         )
     argv = list(ctx.argv)
-    global_scope = "--global" in argv
-    argv = [a for a in argv if a != "--global"]
-    conversation_id = ctx.conversation_id or "cli"
+    global_flag = "--global" in argv
+    session_flag = "--session" in argv
+    argv = [a for a in argv if a not in ("--global", "--session")]
+    conversation_id = ctx.conversation_id or ""
 
-    # No args: show current state (session effort, effective effort, display).
-    if not argv:
-        session = await state.get(conversation_id)
-        effective = await state.effort_for(conversation_id)
-        configured = getattr(ctx.app.settings.models, "reasoning_effort", None)
-        display = "on" if session.get("show") else "off"
-        detail = "full" if session.get("full") else "clamped"
-        message = (
-            f"reasoning effort: {effective or 'unset'} "
-            f"(session: {session.get('effort') or 'unset'}, config: {configured or 'unset'}); "
-            f"thinking display: {display} ({detail})"
+    async def resolve() -> dict[str, Any]:
+        # Read the config default at call time: clearing the global value
+        # restores the YAML default, and the menu must show that immediately.
+        return await state.resolve(
+            conversation_id or None,
+            default_effort=getattr(app.settings.models, "reasoning_effort", None),
+            default_show=bool(getattr(app.settings.models, "reasoning_show", False)),
         )
-        return _summary(ctx, "reasoning", message, {
-            "effort": effective, "session_effort": session.get("effort"),
-            "config_effort": configured, "show": session.get("show"),
-            "full": session.get("full"), "levels": list(EFFORT_LADDER),
-        })
 
-    arg = argv[0].lower()
+    def respond(message: str, selection: Mapping[str, Any], **extra: Any) -> CommandResult:
+        data = dict(selection)
+        data.update(extra)
+        data["reply_markup"] = _reasoning_keyboard(selection)
+        # Every mutation also re-renders the current state. A one-line
+        # confirmation alone would leave the human guessing what the menu now
+        # says, especially after a scope switch.
+        status = _reasoning_message(app, selection)
+        text = f"{message}\n\n{status}" if message.strip() else status
+        return _summary(ctx, "reasoning", text, data)
 
-    # Display toggles (always session-scoped, never global).
-    if arg in ("show", "on"):
-        result = await state.set_display(conversation_id, show=True)
-        await _audit(ctx, "slash.reasoning.display", "show", "thinking display enabled")
-        return _summary(ctx, "reasoning", "Thinking display: on", {"show": result["show"]})
-    if arg in ("hide", "off"):
-        result = await state.set_display(conversation_id, show=False)
-        await _audit(ctx, "slash.reasoning.display", "hide", "thinking display disabled")
-        return _summary(ctx, "reasoning", "Thinking display: off", {"show": result["show"]})
-    if arg in ("full", "all"):
-        result = await state.set_display(conversation_id, show=True, full=True)
-        await _audit(ctx, "slash.reasoning.display", "full", "full thinking display enabled")
-        return _summary(ctx, "reasoning", "Thinking display: on (full)", {
-            "show": result["show"], "full": result["full"],
-        })
-    if arg in ("clamp", "collapse", "short"):
-        result = await state.set_display(conversation_id, full=False)
-        await _audit(ctx, "slash.reasoning.display", "clamp", "thinking display clamped")
-        return _summary(ctx, "reasoning", "Thinking display: clamped", {
-            "show": result["show"], "full": result["full"],
-        })
+    selection = await resolve()
+    target_scope = "global" if global_flag else "session" if session_flag else str(
+        selection.get("scope") or "session"
+    )
 
-    if arg in ("reset", "clear", "none"):
-        if global_scope:
-            await state.set_global(None)
-            await _audit(ctx, "slash.reasoning.global", "reset", "global reasoning effort cleared")
-            return _summary(ctx, "reasoning", "Global reasoning effort: unset (config default applies)")
+    def session_required() -> CommandResult | None:
+        """Refuse a session write with no conversation instead of widening it.
+
+        Silently turning a session-scoped tap into a global write would leak
+        one user's choice into every other conversation.
+        """
+        if target_scope != "session" or conversation_id:
+            return None
+        return CommandResult.unsupported(
+            "reasoning",
+            "This surface has no conversation id, so a session change cannot be stored. "
+            "Use --global to change the global default.",
+            data={"reply_markup": _reasoning_keyboard(selection)},
+        )
+
+    arg = argv[0].lower() if argv else ""
+
+    # -- read-only menu / status -----------------------------------------
+    if arg in ("", "status", "menu", "list"):
+        return respond("", selection)
+
+    # -- edit scope -------------------------------------------------------
+    if arg in ("scope", "config", "target"):
+        desired = argv[1].lower() if len(argv) > 1 else (
+            "global" if selection.get("scope") == "session" else "session"
+        )
+        if desired not in ("global", "session"):
+            return CommandResult.unsupported(
+                "reasoning", "scope must be global or session", data={
+                    "reply_markup": _reasoning_keyboard(selection)})
+        if not conversation_id:
+            return CommandResult.unsupported(
+                "reasoning",
+                "This surface has no conversation id, so the edit scope cannot be stored. "
+                "Pass --global to edit the global default.",
+                data={"reply_markup": _reasoning_keyboard(selection)},
+            )
+        await state.set_scope(conversation_id, desired)
+        selection = await resolve()
+        await _audit(ctx, "slash.reasoning.scope", desired, "reasoning edit scope changed")
+        return respond(f"Reasoning edit scope: {desired}", selection)
+    if arg in ("global", "session"):
+        if not conversation_id and arg == "session":
+            return CommandResult.unsupported(
+                "reasoning", "This surface has no conversation id; session scope is unavailable.",
+                data={"reply_markup": _reasoning_keyboard(selection)},
+            )
+        await state.set_scope(conversation_id, arg)
+        selection = await resolve()
+        await _audit(ctx, "slash.reasoning.scope", arg, "reasoning edit scope changed")
+        return respond(f"Reasoning edit scope: {arg}", selection)
+
+    # -- display ----------------------------------------------------------
+    if arg in ("show", "on", "hide", "off"):
+        refused = session_required()
+        if refused is not None:
+            return refused
+        show = arg in ("show", "on")
+        if target_scope == "global":
+            await state.set_global_display(show)
+            await _audit(ctx, "slash.reasoning.display.global", str(show),
+                         "global reasoning summary display changed")
+        else:
+            await state.set_display(conversation_id, show=show)
+            await _audit(ctx, "slash.reasoning.display", "show" if show else "hide",
+                         "reasoning summary display changed")
+        selection = await resolve()
+        where = "global" if target_scope == "global" else "this session"
+        return respond(f"Reasoning summaries: {'on' if show else 'off'} ({where})", selection)
+    if arg in ("full", "all", "detailed", "clamp", "collapse", "short", "detail", "concise"):
+        if not conversation_id:
+            return CommandResult.unsupported(
+                "reasoning", "Detail is a per-session display setting; no conversation id here.",
+                data={"reply_markup": _reasoning_keyboard(selection)},
+            )
+        if arg in ("full", "all", "detailed"):
+            full = True
+        elif arg in ("clamp", "collapse", "short", "concise"):
+            full = False
+        else:
+            full = not bool(selection.get("full"))
+        await state.set_display(conversation_id, full=full)
+        selection = await resolve()
+        await _audit(ctx, "slash.reasoning.display.detail", str(full),
+                     "reasoning summary detail changed")
+        return respond(f"Reasoning detail: {'detailed' if full else 'concise'}", selection)
+
+    # -- reset ------------------------------------------------------------
+    if arg in ("reset", "clear"):
+        if target_scope == "global":
+            await state.clear_global()
+            sync = getattr(app, "sync_reasoning_defaults", None)
+            if callable(sync):
+                await sync()
+            await _audit(ctx, "slash.reasoning.global.reset", "global",
+                         "global reasoning settings cleared")
+            selection = await resolve()
+            return respond("Global reasoning settings cleared (config default applies).", selection)
+        if not conversation_id:
+            return CommandResult.unsupported(
+                "reasoning", "No active conversation to reset.",
+                data={"reply_markup": _reasoning_keyboard(selection)},
+            )
         await state.clear(conversation_id)
-        await _audit(ctx, "slash.reasoning.reset", conversation_id, "session reasoning state cleared")
-        return _summary(ctx, "reasoning", "Session reasoning state cleared")
+        await _audit(ctx, "slash.reasoning.reset", conversation_id,
+                     "session reasoning overrides cleared")
+        selection = await resolve()
+        return respond("Session reasoning overrides cleared (global default applies).", selection)
 
+    # -- effort -----------------------------------------------------------
     level = parse_effort(arg)
     if level is None:
         return CommandResult.unsupported(
             "reasoning",
             f"unknown reasoning level {arg!r}; valid: {', '.join(EFFORT_LADDER)} "
-            "(aliases: off, min, med, hi, xh, extreme)",
+            "(aliases: off, min, med, hi, xh, extreme). Nothing was changed.",
+            data={"reply_markup": _reasoning_keyboard(selection)},
         )
 
-    if global_scope:
-        await state.set_global(level)
-        await _audit(ctx, "slash.reasoning.global", level, "global reasoning effort set")
-        return _summary(ctx, "reasoning", f"Global reasoning effort: {level} (applies to new sessions)", {
-            "effort": level, "scope": "global",
-        })
+    if target_scope == "session":
+        refused = session_required()
+        if refused is not None:
+            return refused
 
-    result = await state.set_effort(conversation_id, level)
+    if target_scope == "global":
+        await state.set_global(level)
+        sync = getattr(app, "sync_reasoning_defaults", None)
+        if callable(sync):
+            await sync()
+        await _audit(ctx, "slash.reasoning.global", level, "global reasoning effort set")
+        selection = await resolve()
+        return respond(
+            f"Global reasoning effort: {level} (persisted; applies to this and new sessions)",
+            selection, scope="global",
+        )
+
+    await state.set_effort(conversation_id, level)
     await _audit(ctx, "slash.reasoning.effort", level, "session reasoning effort set")
-    return _summary(ctx, "reasoning", f"Reasoning effort: {level} (this session)", {
-        "effort": level, "scope": "session", "show": result.get("show"),
-    })
+    selection = await resolve()
+    return respond(
+        f"Reasoning effort: {level} (this session only; applies to the next request)",
+        selection, scope="session",
+    )
 
 
 async def usage_command(ctx: CommandContext) -> CommandResult:
@@ -2087,13 +2309,15 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
     ))
     from ..models.reasoning import EFFORT_LADDER
     reasoning_choices = tuple(EFFORT_LADDER) + (
-        "show", "hide", "full", "clamp", "reset", "--global",
+        "status", "menu", "scope", "session", "global", "show", "hide",
+        "detail", "full", "clamp", "reset", "--global", "--session",
     )
     registry.register(_spec(
-        "reasoning", "Set/show reasoning effort and thinking display (session or --global)",
+        "reasoning", "Reasoning effort, scope and summary display (interactive menu)",
         reasoning_command, aliases=("think", "thinking", "t"),
-        args_hint="[level|show|hide|full|clamp|reset] [--global]", category="models",
-        args=(ArgumentSpec("level", "effort level or display toggle", variadic=True,
+        args_hint="[level|scope <global|session>|show|hide|detail|reset] [--global]",
+        category="models",
+        args=(ArgumentSpec("level", "effort level, scope or display action", variadic=True,
                            choices=reasoning_choices),),
     ))
     registry.register(_spec(

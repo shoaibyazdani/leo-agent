@@ -1659,6 +1659,8 @@ async def test_stream_emits_reasoning_without_mixing_it_into_the_answer() -> Non
     router = _ReasoningStreamRouter()
     app.router = router
     conversation_id = "conv-reasoning-test"
+    # Reasoning display is opt-in; the separation test turns it on explicitly.
+    await app.reasoning_state.set_display(conversation_id, show=True)
     events = [event async for event in app.ask_stream("Think then answer", conversation_id=conversation_id)]
 
     thoughts = [event["delta"] for event in events if event["type"] == "thinking.delta"]

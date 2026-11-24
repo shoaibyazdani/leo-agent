@@ -8,7 +8,7 @@ narrative changelog.
 - Provider-independent agent platform: streaming chat in the dashboard and in
   the terminal (`leo chat`), durable tasks, layered memory, specialist agents,
   native tools and skills, approvals with audit, integrations adapters.
-- Measured from the live `LeoApp.initialize()` composition root: 96
+- Measured from the live `LeoApp.initialize()` composition root: 100
   registered tools, 39 available slash commands (126 registered slash
   commands in total) and 24 specialist agents.
 - Durable conversation compaction: older turns are summarized once, the summary
@@ -24,6 +24,12 @@ narrative changelog.
   in `leo.yaml` controls source kinds and categories, and setting
   `learning.auto_notes.enabled: false` restores a HIGH-risk approval for every
   note. Superseding an existing memory always requires an approval.
+- `/reasoning`: an interactive Telegram/CLI menu for effort
+  (`none`…`ultra`), global vs session scope, persisted global defaults and
+  opt-in concise summary display. Effort is translated to each provider's own
+  reasoning parameter, clamped downward when unsupported, and inherited by
+  subagents. Raw chain-of-thought is never shown. See
+  [docs/REASONING.md](docs/REASONING.md).
 - Local-first security model: loopback bind by default, `LEO_API_TOKEN`
   required for any non-loopback bind, HIGH-risk actions gated by approvals.
 
