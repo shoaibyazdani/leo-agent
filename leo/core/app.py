@@ -183,6 +183,7 @@ class LeoApp:
         self.initialized = False
         self._scheduler_task: asyncio.Task[Any] | None = None
         self._gateway_task: asyncio.Task[Any] | None = None
+        self._outbox_sweep_task: asyncio.Task[Any] | None = None
         self._inbound_task: asyncio.Task[Any] | None = None
         self._heartbeat_tasks: set[asyncio.Task[Any]] = set()
         # Engines are attached by initialize(); declared here for discoverability.
@@ -601,8 +602,34 @@ class LeoApp:
             self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="leo-scheduler")
         if self._gateway_task is None or self._gateway_task.done():
             self._gateway_task = asyncio.create_task(self._gateway_loop(), name="leo-gateway-outbox")
+        if self._outbox_sweep_task is None or self._outbox_sweep_task.done():
+            self._outbox_sweep_task = asyncio.create_task(
+                self._outbox_sweeper(), name="leo-outbox-sweeper"
+            )
         if inbound and (self._inbound_task is None or self._inbound_task.done()):
             self._inbound_task = asyncio.create_task(self._inbound_loop(), name="leo-gateway-inbound")
+
+    async def _outbox_sweeper(self) -> None:
+        """Requeue rows a dead consumer left in ``processing``.
+
+        Separate task on purpose: a hung drain must not delay the sweep, which is
+        exactly how one row sat in ``processing`` for five hours. The threshold
+        is above the turn cap, so a turn that is genuinely still running is never
+        claimed a second time.
+        """
+        while True:
+            try:
+                await asyncio.sleep(60)
+                recovered = await self.gateway.recover_stale_outbox(
+                    older_than_seconds=2400.0
+                )
+                if recovered:
+                    _LOG.warning("stale outbox rows recovered", extra={"rows": recovered})
+            except asyncio.CancelledError:
+                if _task_is_shutting_down():
+                    raise
+            except Exception as exc:  # noqa: BLE001 - the sweep must not die
+                _LOG.warning("outbox sweep failed", extra={"error": str(exc)})
 
     async def _inbound_loop(self) -> None:
         """Pull inbound from poll-capable channels (Telegram, IMAP, IRC, ...).
@@ -667,17 +694,9 @@ class LeoApp:
         raised inside a turn (the turn cap cancels turns), which is not a reason
         to stop consuming.
         """
-        sweeps = 0
         while True:
             try:
                 await self.gateway.drain_outbox(limit=10)
-                # Rows stranded by a consumer that died mid-turn are invisible to
-                # the claim query; sweep them back to ``pending`` periodically.
-                sweeps += 1
-                if sweeps % 60 == 0:
-                    recovered = await self.gateway.recover_stale_outbox()
-                    if recovered:
-                        _LOG.info("stale outbox rows recovered", extra={"rows": recovered})
             except asyncio.CancelledError:
                 if _task_is_shutting_down():
                     raise
@@ -687,11 +706,13 @@ class LeoApp:
             await asyncio.sleep(0.5)
 
     async def shutdown(self) -> None:
-        for task in (self._gateway_task, self._inbound_task, self._scheduler_task, *tuple(self._heartbeat_tasks)):
+        for task in (self._gateway_task, self._outbox_sweep_task, self._inbound_task,
+                     self._scheduler_task, *tuple(self._heartbeat_tasks)):
             if task is None:
                 continue
             task.cancel()
-        for task in (self._gateway_task, self._inbound_task, self._scheduler_task, *tuple(self._heartbeat_tasks)):
+        for task in (self._gateway_task, self._outbox_sweep_task, self._inbound_task,
+                     self._scheduler_task, *tuple(self._heartbeat_tasks)):
             if task is None:
                 continue
             try:
@@ -701,6 +722,7 @@ class LeoApp:
             except Exception as exc:  # shutdown must not fail because a loop errored
                 _LOG.warning("background task failed during shutdown", extra={"error": str(exc)})
         self._gateway_task = None
+        self._outbox_sweep_task = None
         self._inbound_task = None
         self._scheduler_task = None
         self._heartbeat_tasks.clear()
