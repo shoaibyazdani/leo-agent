@@ -127,7 +127,7 @@ async def _last_chat(app: Any) -> tuple[str, str] | None:
 
 async def announce_restart_if_pending(
     app: Any, *, wait_seconds: float = 0.0, poll_seconds: float = 1.0,
-    restarted: bool | None = None,
+    restarted: bool | None = None, previous_boot_age: float | None = None,
 ) -> str | None:
     """Say the restart landed, once, to the chat that asked for it.
 
@@ -136,12 +136,15 @@ async def announce_restart_if_pending(
     instead of dropping a message the operator is expecting.
     """
     payload = await _read_marker()
+    # The caller passes the age measured BEFORE this boot overwrote the stamp:
+    # reading it here would always see "0 seconds ago" and every notice would be
+    # mistaken for a crash loop. Callers that pass nothing get a fresh read.
+    age = previous_boot_age if previous_boot_age is not None else await _seconds_since_previous_boot()
     if restarted is None:
-        restarted = await _previous_boot_was_recent()
+        restarted = age is not None and age <= RESTART_WINDOW.total_seconds()
     # "Tell me when it is up" applies to every start, not only to a /restart:
     # the operator restarts LEO from the shell too. The only boot that stays
     # silent is a crash loop's second start within a minute.
-    age = await _seconds_since_previous_boot()
     if age is not None and age <= CRASH_LOOP_FLOOR.total_seconds():
         _LOG.info("boot too close to the previous one; not announcing")
         await _take_marker()

@@ -197,3 +197,26 @@ async def test_a_crash_loop_second_start_stays_quiet(notice_db) -> None:
 
     assert await announce_restart_if_pending(_app(adapter)) is None
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_age_is_measured_before_the_stamp_is_overwritten(notice_db) -> None:
+    """The live bug: after record_boot() the fresh stamp read as a crash loop.
+
+    Booting stamps `runtime:last_boot` at initialize(); the notice runs later as a
+    task. Reading the stamp inside the task therefore always saw "0 s ago", so
+    every notice was suppressed as a crash loop.
+    """
+    adapter = _Adapter()
+    await db.execute(
+        "INSERT INTO conversations(id, channel, subject, created_at, updated_at) "
+        "VALUES(?,?,?,?,?)",
+        ("conv_t4", "telegram", "525083981",
+         datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+    )
+    await record_boot()  # this boot just overwrote the stamp
+
+    text = await announce_restart_if_pending(_app(adapter), previous_boot_age=300.0)
+
+    assert text == RESTART_ANNOUNCEMENT, "a 5-minute-old previous boot is a restart"
+    assert adapter.sent == [("525083981", RESTART_ANNOUNCEMENT)]
