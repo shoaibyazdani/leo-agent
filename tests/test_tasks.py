@@ -761,6 +761,60 @@ async def test_recovery_skips_concurrently_modified_task(env, monkeypatch):
     assert (await env.engine.get(second.id)).status is TaskStatus.READY
 
 
+def test_cron_accepts_month_and_weekday_names():
+    """'mon-fri' used to die in int(); names are accepted case-insensitively."""
+    assert parse_cron("0 9 * * mon-fri")[4] == {1, 2, 3, 4, 5}
+    assert parse_cron("0 9 * * MON-FRI")[4] == {1, 2, 3, 4, 5}
+    assert parse_cron("0 0 * * sun")[4] == {0}
+    assert parse_cron("0 0 * * fri,1")[4] == {1, 5}
+    assert parse_cron("0 0 1 jan,apr *")[3] == {1, 4}
+    # Numbers and the 7==Sunday alias must keep working alongside names.
+    assert parse_cron("0 0 * * 7")[4] == {0}
+    assert parse_cron("0 0 * * 0-7")[4] == set(range(7))
+    with pytest.raises(ValueError, match="invalid cron field value"):
+        parse_cron("0 9 * * xyz")
+
+
+def test_cron_weekday_name_range_schedules_next_workday():
+    after = datetime(2026, 11, 28, 12, tzinfo=timezone.utc)  # Saturday
+    assert next_run("cron", "0 9 * * mon-fri", after) == datetime(
+        2026, 11, 30, 9, tzinfo=timezone.utc
+    )
+
+
+def test_every_accepts_day_and_week_units():
+    assert every_interval("@every 1d") == timedelta(days=1)
+    assert every_interval("@every 1w") == timedelta(days=7)
+    assert every_interval("@every 2 days") == timedelta(days=2)
+    # The minute/hour units must not be shadowed by the new day/week ones.
+    assert every_interval("@every 90m") == timedelta(minutes=90)
+    assert every_interval("@every 3h") == timedelta(hours=3)
+    assert every_interval("@every 30s") == timedelta(seconds=30)
+    assert next_run(
+        "cron", "@every 1d", datetime(2026, 11, 24, 3, tzinfo=timezone.utc)
+    ) == datetime(2026, 11, 25, 3, tzinfo=timezone.utc)
+
+
+def test_cron_leap_day_is_schedulable():
+    """A 366-day minute sweep could never reach Feb 29."""
+    assert next_run("cron", "0 0 29 2 *", datetime(2026, 3, 1, tzinfo=timezone.utc)) == datetime(
+        2028, 2, 29, tzinfo=timezone.utc
+    )
+    # Strictly after: an occurrence exactly at `after` rolls to the next cycle.
+    assert next_run("cron", "0 0 29 2 *", datetime(2028, 2, 29, tzinfo=timezone.utc)) == datetime(
+        2032, 2, 29, tzinfo=timezone.utc
+    )
+    with pytest.raises(ValueError, match="no matching time found"):
+        next_run("cron", "0 0 30 2 *", datetime(2026, 3, 1, tzinfo=timezone.utc))
+
+
+def test_cron_next_run_unchanged_for_ordinary_expressions():
+    base = datetime(2026, 11, 24, 3, 20, tzinfo=timezone.utc)
+    assert next_run("cron", "0 * * * *", base) == datetime(2026, 11, 24, 4, tzinfo=timezone.utc)
+    assert next_run("cron", "*/15 * * * *", base) == datetime(2026, 11, 24, 3, 30, tzinfo=timezone.utc)
+    assert next_run("cron", "0 4 * * *", base) == datetime(2026, 11, 24, 4, tzinfo=timezone.utc)
+
+
 def test_cron_sunday_alias_and_step():
     assert parse_cron("0 0 * * 7")[4] == {0}
     assert parse_cron("0 0 * * 7/2")[4] == {0, 2, 4, 6}
