@@ -1138,6 +1138,7 @@ class AnthropicProvider(BaseHTTPProvider):
             else:
                 if message.role == "user" and message.images:
                     content: list[dict[str, Any]] = []
+                    # Anthropic's native shape IS the stored block: emit as-is.
                     for image in message.images:
                         if isinstance(image, Mapping):
                             content.append(dict(image))
@@ -1355,6 +1356,32 @@ def _declared_tool_ids(message: Any) -> set[str]:
     return {str(call.get("id") or "") for call in (getattr(message, "tool_calls", None) or [])}
 
 
+def _openai_image_part(image: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Translate a stored image block into the OpenAI wire shape.
+
+    The store hands out Anthropic-shaped blocks (``{"type": "image", "source":
+    {...}}``) because that is what the attachment contract records. Copying that
+    into an OpenAI ``content`` list asks for nothing: the upstream ignores the
+    part, so the vision model answers "please upload the image" while the request
+    itself succeeds. OpenAI wants ``image_url`` with a data URL or a link.
+    """
+    if str(image.get("type") or "") == "image_url":
+        return dict(image)  # already in the right shape
+    source = image.get("source")
+    if not isinstance(source, Mapping):
+        return None
+    if source.get("type") == "base64":
+        data = str(source.get("data") or "")
+        if not data:
+            return None
+        media = str(source.get("media_type") or "image/png")
+        return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}}
+    url = source.get("url")
+    if source.get("type") == "url" and url:
+        return {"type": "image_url", "image_url": {"url": str(url)}}
+    return None
+
+
 class OpenAIProvider(BaseHTTPProvider):
     """Adapter for ``POST {base_url}/v1/chat/completions`` (Chat Completions shape)."""
 
@@ -1400,6 +1427,20 @@ class OpenAIProvider(BaseHTTPProvider):
                     }
                     for call in message.tool_calls
                 ]
+            if item["role"] == "user" and message.images:
+                # An image needs the OpenAI part shape; a stored Anthropic block
+                # copied into this list is ignored upstream and the model then
+                # answers "please upload the image" while the call looks healthy.
+                parts: list[dict[str, Any]] = []
+                for image in message.images:
+                    if not isinstance(image, Mapping):
+                        continue
+                    part = _openai_image_part(image)
+                    if part is not None:
+                        parts.append(part)
+                if parts:
+                    parts.append({"type": "text", "text": str(message.content or "")})
+                    item["content"] = parts
             messages.append(item)
         return messages
 
