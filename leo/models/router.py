@@ -160,10 +160,19 @@ class ModelRouter:
         # It is deliberately separate from last_stream_content: callers must
         # never fold it into an answer or a tool round.
         self.last_stream_reasoning: str = ""
+        self.last_stream_reasoning_summary: str = ""
         self.last_stream_usage: Any | None = None
         # Streaming finish reason (e.g. "length", "stop") so the caller can
         # distinguish a truncated answer from a completed one.
         self.last_stream_finish_reason: str | None = None
+        # Truthful reasoning translation for the most recent call, read by
+        # /reasoning and by usage metadata. Never claims a parameter was sent
+        # when the provider rejected or omitted it.
+        self.last_reasoning_provider: str | None = None
+        self.last_reasoning_requested: str | None = None
+        self.last_reasoning_applied: str | None = None
+        self.last_reasoning_style: str | None = None
+        self.last_reasoning_note: str = ""
         if not self.providers and self._mock_fallback_allowed:
             cfg = self.settings.models.providers.get("mock") or ModelProviderConfig(kind="mock", model="mock-1")
             self.providers["mock"] = MockProvider(cfg, name="mock")
@@ -585,6 +594,34 @@ class ModelRouter:
             raise self._no_route_error()
         return ranked[0]
 
+    def _reset_reasoning_view(self) -> None:
+        self.last_reasoning_provider = None
+        self.last_reasoning_requested = None
+        self.last_reasoning_applied = None
+        self.last_reasoning_style = None
+        self.last_reasoning_note = ""
+
+    def _capture_reasoning(self, name: str, provider: Any, request: ModelRequest) -> None:
+        """Publish what this attempt actually sent, never what was requested."""
+        self.last_reasoning_provider = name
+        self.last_reasoning_requested = (
+            getattr(provider, "last_reasoning_requested", None)
+            or getattr(request, "reasoning_effort", None)
+        )
+        self.last_reasoning_applied = getattr(provider, "last_reasoning_applied", None)
+        self.last_reasoning_style = getattr(provider, "last_reasoning_style", None)
+        self.last_reasoning_note = str(getattr(provider, "last_reasoning_note", "") or "")
+
+    def reasoning_report(self) -> dict[str, Any]:
+        """The most recent reasoning translation, for status surfaces."""
+        return {
+            "provider": self.last_reasoning_provider,
+            "requested": self.last_reasoning_requested,
+            "applied": self.last_reasoning_applied,
+            "style": self.last_reasoning_style,
+            "note": self.last_reasoning_note,
+        }
+
     async def _record(
         self,
         name: str,
@@ -607,7 +644,14 @@ class ModelRouter:
             "task_category": classify_task(request),
             "attempt": attempt,
             "stream": stream,
+            "reasoning_requested": getattr(provider, "last_reasoning_requested", None)
+            or getattr(request, "reasoning_effort", None),
+            "reasoning_applied": getattr(provider, "last_reasoning_applied", None),
+            "reasoning_style": getattr(provider, "last_reasoning_style", None),
         }
+        reasoning_note = str(getattr(provider, "last_reasoning_note", "") or "")
+        if reasoning_note:
+            metadata["reasoning_note"] = reasoning_note[:200]
         if error is not None:
             metadata["error"] = self._scrub(str(error))[:200]
         try:
@@ -709,6 +753,7 @@ class ModelRouter:
         tool-free final-answer request before the error reaches the caller.
         """
         self._apply_request_defaults(request)
+        self._reset_reasoning_view()
         if self._is_blocked():
             raise self._no_route_error()
         stats = await self._measured_stats()
@@ -735,6 +780,7 @@ class ModelRouter:
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 response.usage.latency_ms = elapsed_ms
                 self._note_success(name)
+                self._capture_reasoning(name, provider, request)
                 return response
             except Exception as exc:
                 attempt_error = exc
@@ -746,6 +792,8 @@ class ModelRouter:
                     extra={"provider": name, "attempt": attempt, "error": self._scrub(str(exc))[:200]},
                 )
             finally:
+                if self.last_reasoning_provider is None:
+                    self._capture_reasoning(name, provider, request)
                 await self._record(
                     name,
                     provider,
@@ -786,6 +834,7 @@ class ModelRouter:
         self.last_stream_content = ""
         self.last_stream_usage = None
         self.last_stream_finish_reason = None
+        self._reset_reasoning_view()
         self._apply_request_defaults(request)
         if self._is_blocked():
             raise self._no_route_error()
@@ -816,6 +865,7 @@ class ModelRouter:
                 self.last_stream_usage = getattr(provider, "last_usage", None)
                 self.last_stream_finish_reason = getattr(provider, "last_finish_reason", None)
                 self._note_success(name)
+                self._capture_reasoning(name, provider, request)
                 return
             except Exception as exc:
                 attempt_error = exc
@@ -830,6 +880,8 @@ class ModelRouter:
                     # Output already delivered to the caller: replay would duplicate it.
                     raise
             finally:
+                if self.last_reasoning_provider is None:
+                    self._capture_reasoning(name, provider, request)
                 await self._record(
                     name,
                     provider,
@@ -886,8 +938,10 @@ class ModelRouter:
         self.last_stream_tool_calls = []
         self.last_stream_content = ""
         self.last_stream_reasoning = ""
+        self.last_stream_reasoning_summary = ""
         self.last_stream_usage = None
         self.last_stream_finish_reason = None
+        self._reset_reasoning_view()
         if self._stream_hook_overridden():
             # Respect an injected text-only stream implementation. It already
             # publishes last_stream_provider/content/tool_calls/usage itself;
@@ -956,9 +1010,15 @@ class ModelRouter:
                 self.last_stream_reasoning = "".join(typed_reasoning) or str(
                     getattr(provider, "last_reasoning", "") or ""
                 )
+                self.last_stream_reasoning_summary = (
+                    self.last_stream_reasoning
+                    if bool(getattr(request, "reasoning_show", False))
+                    else ""
+                )
                 self.last_stream_usage = getattr(provider, "last_usage", None)
                 self.last_stream_finish_reason = getattr(provider, "last_finish_reason", None)
                 self._note_success(name)
+                self._capture_reasoning(name, provider, request)
                 return
             except Exception as exc:
                 attempt_error = exc
@@ -974,6 +1034,8 @@ class ModelRouter:
                     # through the next provider would duplicate text/thoughts.
                     raise
             finally:
+                if self.last_reasoning_provider is None:
+                    self._capture_reasoning(name, provider, request)
                 await self._record(
                     name,
                     provider,

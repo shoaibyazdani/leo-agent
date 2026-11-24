@@ -8,7 +8,7 @@ import json
 import os
 import re
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -190,6 +190,15 @@ class LeoApp:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or Settings.load()
         self.settings.ensure_dirs()
+        # The YAML default is remembered separately: a live global /reasoning
+        # write updates settings.models.reasoning_effort, and clearing it must
+        # restore this value rather than leave the last live write in place.
+        self._configured_reasoning_effort = getattr(
+            self.settings.models, "reasoning_effort", None
+        )
+        self._configured_reasoning_show = bool(
+            getattr(self.settings.models, "reasoning_show", False)
+        )
         # One turn's tool budget. Read once at construction: a settings change
         # needs a restart, exactly like every other budget in this app.
         configured_rounds = getattr(self.settings, "max_chat_tool_rounds", None)
@@ -438,6 +447,10 @@ class LeoApp:
         )
         self.evaluation = Evaluation()
         self.router = ModelRouter(self.settings)
+        # A global /reasoning value persisted in the database is the runtime
+        # default; it must reach providers built from config before the first
+        # turn, not only chat requests that carry an explicit selection.
+        await self.sync_reasoning_defaults()
         # Smart mode's reviewer: allow/deny/ask before a human is asked. It is
         # wired here so the permission manager never imports the model layer.
         self.permissions.set_reviewer(self._review_approval)
@@ -1084,14 +1097,32 @@ class LeoApp:
         answer goes back to the chat that was tapped. Without this the picker
         replied "this process cannot switch models" and the buttons were inert.
         """
+        # A tap belongs to the conversation the chat is currently routed to.
+        # Session-scoped settings (for example /reasoning in session scope)
+        # must land there, not in a synthetic key shared by every chat.
+        conversation_id = None
+        if subject:
+            try:
+                row = await db.fetchone(
+                    "SELECT id FROM conversations WHERE channel=? AND subject=? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (channel, subject),
+                )
+                conversation_id = str(row["id"]) if row is not None else None
+            except Exception:  # a lookup failure must not leave the tap inert
+                conversation_id = None
         result = await self.commands.dispatch(
             text, app=self, principal=f"channel:{subject}",
-            surface="chat", channel=channel,
+            surface="chat", channel=channel, conversation_id=conversation_id,
         )
         reply = str(getattr(result, "message", "") or "")
         adapter = self.gateway.adapters.get(channel)
         if reply and adapter is not None:
-            await adapter.send(subject, reply)
+            markup = getattr(result, "data", {}).get("reply_markup")
+            await adapter.send(
+                subject, reply,
+                reply_markup=dict(markup) if isinstance(markup, Mapping) else None,
+            )
 
     async def _store_channel_attachment(self, channel: str, descriptor: dict[str, Any]) -> str | None:
         """Download a channel's file and store it, returning the attachment id.
@@ -1173,6 +1204,36 @@ class LeoApp:
         for pattern in self.settings.security.redact_patterns:
             text = re.sub(pattern, "[REDACTED]", text)
         return text
+
+    async def sync_reasoning_defaults(self) -> str | None:
+        """Push the persisted global reasoning effort into live providers.
+
+        The database value is the operator's live global default. A provider
+        also keeps its own config ``reasoning_effort`` (higher precedence), so
+        this only changes the lowest-priority fallback.
+        """
+        try:
+            global_effort = await self.reasoning_state.global_effort()
+        except Exception:  # a broken kv read must not block startup
+            global_effort = None
+        self.settings.models.reasoning_effort = (
+            global_effort or self._configured_reasoning_effort
+        )
+        self.settings.models.reasoning_show = self._configured_reasoning_show
+        for provider in (getattr(getattr(self, "router", None), "providers", {}) or {}).values():
+            try:
+                provider.default_effort = self.settings.models.reasoning_effort
+            except Exception:  # a test double may be immutable; never fail startup
+                pass
+        return self.settings.models.reasoning_effort
+
+    async def reasoning_selection(self, conversation_id: str | None) -> dict[str, Any]:
+        """The effective reasoning settings for one conversation."""
+        return await self.reasoning_state.resolve(
+            conversation_id,
+            default_effort=self.settings.models.reasoning_effort,
+            default_show=bool(getattr(self.settings.models, "reasoning_show", False)),
+        )
 
     def _model_provenance(self) -> tuple[bool, dict[str, Any]]:
         """Truthful model provenance, tolerant of lightweight test routers."""
@@ -2431,6 +2492,42 @@ class LeoApp:
             return "incomplete", _NO_ANSWER_TEXT
         return "completed", content
 
+    def _reasoning_reply_footer(
+        self,
+        selection: dict[str, Any],
+        *,
+        summary: str = "",
+        tool_names: Iterable[str] = (),
+        model_calls: int = 0,
+    ) -> str:
+        """A concise, user-visible reasoning/execution summary.
+
+        This is deliberately not chain-of-thought: it names the effort that was
+        sent, includes only a provider-declared SUMMARY (never raw thinking),
+        and lists the operations performed. Returns "" when display is off.
+        """
+        if not selection or not selection.get("show"):
+            return ""
+        effort = str(selection.get("effort") or "none")
+        source = str(selection.get("effort_source") or "unset")
+        limit = 1_200 if selection.get("full") else 360
+        lines = [f"🧠 Reasoning: {effort} ({source})"]
+        clean = self._redact(str(summary or "")).strip()
+        if clean:
+            lines.append(clean if len(clean) <= limit else clean[:limit].rstrip() + "…")
+        detail = f"{max(0, int(model_calls))} model call(s)"
+        tools: list[str] = []
+        for name in tool_names:
+            value = str(name or "").strip()
+            if value and value not in tools:
+                tools.append(value)
+        if tools:
+            detail += "; tools: " + ", ".join(tools[:8])
+            if len(tools) > 8:
+                detail += f" (+{len(tools) - 8} more)"
+        lines.append(detail)
+        return "\n\n" + "\n".join(lines)
+
     @staticmethod
     def _model_error_content(exc: BaseException) -> tuple[str, str]:
         """Return a sanitized, stable (code, user-facing message) pair."""
@@ -2508,7 +2605,10 @@ class LeoApp:
         spellings. None of it belongs in a persisted assistant row or in usage
         metadata, even redacted: thinking is a live UI channel only.
         """
-        reasoning_keys = {"reasoning", "reasoning_content", "thinking", "thinking_delta"}
+        reasoning_keys = {
+            "reasoning", "reasoning_content", "reasoning_summary",
+            "thinking", "thinking_delta",
+        }
         if isinstance(value, dict):
             return {
                 str(key): LeoApp._without_reasoning(item)
@@ -2696,6 +2796,11 @@ class LeoApp:
         system = self._conversation_system_prompt()
         tool_specs = [spec.model_dump(mode="json") for spec in self.registry.list_specs()]
         user_message = ChatMessage(role="user", content=turn_text, images=images)
+        # One effective selection per turn: session override > global default >
+        # config. The same selection is inherited by subagents through the
+        # context variable, and it is applied to every model request here.
+        selection = await self.reasoning_selection(conversation_id)
+        from ..models.reasoning_state import reset_current_reasoning, set_current_reasoning
         request = ModelRequest(
             messages=[
                 *history,
@@ -2705,7 +2810,9 @@ class LeoApp:
             task_category="conversation",
             tools=tool_specs,
             task_id=conversation_id,
-            reasoning_effort=await self.reasoning_state.effort_for(conversation_id),
+            reasoning_effort=selection["effort"],
+            reasoning_show=selection["show"],
+            reasoning_source=selection["effort_source"],
         )
         # Durable compaction runs before the per-turn optimizer so the summary
         # replaces history instead of being re-derived on every request.
@@ -2723,6 +2830,7 @@ class LeoApp:
         # fresh provider id still reuses the first result.
         executed_results: dict[tuple[str, str], str] = {}
         force_final = False
+        reasoning_token = set_current_reasoning(selection)
         try:
             # MAX_CHAT_TOOL_ROUNDS executions + one reserved model call to
             # consume the final tool results (the N+1 invariant). A stall nudge
@@ -2885,11 +2993,20 @@ class LeoApp:
             assistant_meta["content"] = content
             assistant_meta["reasoning"] = ""
             final_status, final_content = self._final_answer(content, pending_names)
+            final_content += self._reasoning_reply_footer(
+                selection,
+                summary=str(getattr(response, "reasoning_summary", "") or ""),
+                tool_names=[str(item.get("name") or "") for item in tool_results],
+                model_calls=model_calls,
+            )
             # Only the final allowed model turn can leave calls unexecuted. Record
             # terminal status on every final row so blocking and streaming
             # transports persist identical, truthful metadata.
             assistant_meta["tool_calls_pending"] = pending_names
             assistant_meta["run_status"] = final_status
+            assistant_meta["reasoning_effort"] = selection["effort"]
+            assistant_meta["reasoning_source"] = selection["effort_source"]
+            assistant_meta["reasoning_display"] = "summary" if selection["show"] else "hidden"
             await db.execute(
                 "INSERT INTO messages(conversation_id,role,content,metadata,created_at) VALUES(?,?,?,?,?)",
                 (conversation_id, "assistant", final_content, json.dumps(assistant_meta, default=str), utcnow()),
@@ -2947,6 +3064,8 @@ class LeoApp:
             return await self._terminal_model_error(
                 conversation_id, channel, exc, memories, budget
             )
+        finally:
+            reset_current_reasoning(reasoning_token)
 
     async def ask_stream(
         self,
@@ -3002,6 +3121,7 @@ class LeoApp:
         # The try covers the whole turn, including history/attachment/model
         # setup. A failure there must still produce error + run.finished and
         # must not leave the run registered as "running" forever.
+        reasoning_token = None
         try:
             if text.lstrip().startswith("/"):
                 cancellation_guard()
@@ -3122,6 +3242,10 @@ class LeoApp:
             system = self._conversation_system_prompt()
             tool_specs = [spec.model_dump(mode="json") for spec in self.registry.list_specs()]
             user_message = ChatMessage(role="user", content=prompt, images=images)
+            selection = await self.reasoning_selection(conversation_id)
+            from ..models.reasoning_state import reset_current_reasoning, set_current_reasoning
+
+            reasoning_token = set_current_reasoning(selection)
             request = ModelRequest(
                 messages=[
                     *history,
@@ -3129,7 +3253,9 @@ class LeoApp:
                     user_message,
                 ],
                 task_category="conversation", tools=tool_specs, task_id=conversation_id,
-                reasoning_effort=await self.reasoning_state.effort_for(conversation_id),
+                reasoning_effort=selection["effort"],
+                reasoning_show=selection["show"],
+                reasoning_source=selection["effort_source"],
             )
             # Durable compaction runs once, before the per-turn optimizer.
             request.messages = await self._maybe_auto_compact(
@@ -3207,6 +3333,11 @@ class LeoApp:
                     if str(getattr(chunk, "kind", "text") or "text") == "reasoning":
                         if not delta:
                             continue
+                        # Display is opt-in. When off, no reasoning event is
+                        # emitted at all; the provider should already have sent
+                        # only an omitted/summary channel, never raw thought.
+                        if not selection.get("show"):
+                            continue
                         # Reasoning has its own redaction state and 128-char
                         # tail. It is NEVER appended to `pieces`, `tail`,
                         # content or a message.delta event.
@@ -3225,10 +3356,11 @@ class LeoApp:
                         yield ev(type="message.delta", delta=chunk_text, message_id=conversation_id)
                     else:
                         tail = safe
-                if reason_tail:
+                if reason_tail and selection.get("show"):
                     round_reasoning_seen = True
+                    final_thought = self._redact(reason_tail)
                     yield ev(
-                        type="thinking.delta", delta=self._redact(reason_tail),
+                        type="thinking.delta", delta=final_thought,
                         message_id=conversation_id,
                     )
                 if tail:
@@ -3242,6 +3374,8 @@ class LeoApp:
                 yield ev(
                     type="thinking.state", delta="", final=True,
                     seen=round_reasoning_seen, empty=not round_reasoning_seen,
+                    hidden=not selection.get("show"),
+                    display="summary" if selection.get("show") else "hidden",
                     message_id=conversation_id,
                 )
                 content = "".join(pieces) or self._redact(self.router.last_stream_content)
@@ -3420,6 +3554,10 @@ class LeoApp:
             # A tool round ending the budget is not an answer even when the
             # model emitted narration; a blank answer is never "completed".
             final_status, content = self._final_answer(content, pending_names)
+            # The streaming path renders summaries in its dedicated thinking
+            # channel. Keeping them out of `content` preserves the existing
+            # contract that an answer never contains reasoning text; the
+            # blocking path (messaging channels) adds the summary footer instead.
             # (c) immediately before persisting the final assistant row and
             # emitting terminal events: a cancelled run must leave no durable
             # completed answer, even when the model streamed a full reply.
@@ -3435,6 +3573,9 @@ class LeoApp:
                      "tool_calls": [],
                      "tool_calls_pending": pending_names,
                      "run_status": final_status,
+                     "reasoning_effort": selection["effort"],
+                     "reasoning_source": selection["effort_source"],
+                     "reasoning_display": "summary" if selection["show"] else "hidden",
                  }, default=str), utcnow()),
             )
             final_row_id = getattr(final_row, "lastrowid", None)
@@ -3462,9 +3603,12 @@ class LeoApp:
                 tool_results=tool_results,
                 tool_calls_pending=pending_names,
                 status=final_status,
-                # Truthful reasoning state for clients: no thought was streamed
+                # Truthful reasoning state for clients: no summary was streamed
                 # unless a real reasoning delta was observed this turn.
                 reasoning_seen=reasoning_seen,
+                reasoning_effort=selection["effort"],
+                reasoning_scope=selection["effort_source"],
+                reasoning_display="summary" if selection["show"] else "hidden",
                 simulated=self._model_provenance()[0],
                 model_status=self._model_provenance()[1],
             )
@@ -3533,6 +3677,9 @@ class LeoApp:
                 _LOG.debug("stream error row persistence failed", exc_info=True)
             yield ev(type="error", code=code, message=message, status=status)
             yield ev(type="run.finished", status=status)
+        finally:
+            if reasoning_token is not None:
+                reset_current_reasoning(reasoning_token)
 
     async def operator_resolve_approval(
         self, approval_id: str, approved: bool, *, actor: str = "operator:cli"

@@ -28,6 +28,11 @@ models:
       cost_per_million_input: 0.15
       cost_per_million_output: 0.6
       capabilities: [text, streaming, tools, structured, usage, vision]
+      # /reasoning maps an effort level to this gateway's own wire shape.
+      # auto: modern Claude models use adaptive thinking + output_config.effort;
+      # other models use a thinking budget. A gateway that rejects the field is
+      # retried without it once and then skipped (see docs/REASONING.md).
+      reasoning_style: auto
       # OpenCode Go requires a stable session ID per LEO instance.
       extra_header_env:
         x-opencode-session: LEO_OPENCODE_SESSION

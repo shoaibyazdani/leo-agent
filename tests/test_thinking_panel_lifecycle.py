@@ -197,9 +197,10 @@ def test_no_empty_disclosure_card_at_terminal() -> None:
 
     assert "const NO_REASONING_NOTE = 'No reasoning streamed';" in CHAT_JS
     note = block(CHAT_JS, "function noteNoReasoning(stream)", "\n  // The backend's message.finished")
-    assert "setTurnStatus(NO_REASONING_NOTE)" in note
+    assert "NO_REASONING_HIDDEN_NOTE" in note
+    assert "setTurnStatus(text)" in note
     assert "createElement('span')" in note
-    assert "note.textContent = NO_REASONING_NOTE" in note  # a plain text node
+    assert "note.textContent = text" in note  # a plain text node
     assert "chat-reasoning-none" in note
     assert "stream.node.querySelectorAll('.chat-reasoning-none')" in note  # one line per message
 

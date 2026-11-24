@@ -9,7 +9,8 @@ adapter at the edge, not a prerequisite for local operation.
 ```
 interfaces/   CLI, FastAPI, web dashboard, messaging gateways
 core/         composition root, runtime configuration helpers
-models/       provider adapters, router, escalation, context optimizer
+models/       provider adapters, router, escalation, context optimizer,
+              reasoning effort/scope/summary settings
 memory/       working/episodic/semantic/procedural/personal/project/org memory
 tools/        registry, validation, execution, permission enforcement
 tasks/        durable task engine, checkpoints, recovery, scheduler, webhooks

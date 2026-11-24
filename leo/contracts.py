@@ -157,6 +157,11 @@ class ModelRequest(BaseRecord):
     # Reasoning effort for this request (none|minimal|low|medium|high|xhigh|
     # max|ultra). None means no reasoning parameter is sent to the provider.
     reasoning_effort: str | None = None
+    # Ask the provider for a readable reasoning SUMMARY. Raw chain-of-thought
+    # is never forwarded: providers that cannot summarize send no text.
+    reasoning_show: bool = False
+    # Where the effective effort came from: session | global | config | context.
+    reasoning_source: str | None = None
 
 
 class StreamChunk(BaseRecord):
@@ -176,8 +181,13 @@ class ModelResponse(BaseRecord):
     model: str
     provider: str
     # Provider-supplied thinking/reasoning, kept separate from `content` so it
-    # cannot leak into tool rounds or durable assistant messages.
+    # cannot leak into tool rounds or durable assistant messages. This may be
+    # raw chain-of-thought and must never be rendered to a user.
     reasoning: str = ""
+    # A readable summary the provider explicitly returned (Anthropic adaptive
+    # thinking with display=summarized, or an OpenAI-compatible summary field).
+    # Empty when the provider supplied only raw or no reasoning.
+    reasoning_summary: str = ""
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
     finish_reason: str | None = None

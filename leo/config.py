@@ -278,9 +278,22 @@ class ModelProviderConfig(BaseModel):
     # is a config default; /reasoning overrides it live for the session.
     reasoning_effort: str | None = None
     # Optional narrowing of the wire vocabulary this model accepts. When unset,
-    # the widest OpenAI-compatible set is assumed and the level is clamped onto
+    # the widest wire for the adapter is assumed and the level is clamped onto
     # it. Declare the real set when a gateway rejects a level with HTTP 400.
     reasoning_efforts: list[str] = Field(default_factory=list)
+    # Optional vendor mapping applied before nearest-level clamping, for wires
+    # where a level's positional meaning differs (e.g. {"medium": "high"}).
+    reasoning_overrides: dict[str, str] = Field(default_factory=dict)
+    # How effort is expressed on the wire:
+    #   auto   - adaptive effort for modern Claude models, thinking budget for
+    #            other Anthropic-compatible models, reasoning_effort for OpenAI
+    #   effort - adaptive effort / output_config.effort
+    #   budget - thinking.budget_tokens (legacy Anthropic models)
+    #   off    - never send a reasoning parameter for this provider
+    reasoning_style: Literal["auto", "effort", "budget", "off"] = "auto"
+    # Whether the provider may return a readable reasoning SUMMARY. Raw
+    # chain-of-thought is never forwarded to a reply.
+    reasoning_summaries: bool = True
 
     @field_validator("api_key_env")
     @classmethod
@@ -312,6 +325,9 @@ class ModelConfig(BaseModel):
     # Global default reasoning effort. Unset means no reasoning parameter is
     # sent; a per-provider reasoning_effort or a live /reasoning overrides it.
     reasoning_effort: str | None = None
+    # Global default for concise reasoning summaries in replies. Never exposes
+    # raw chain-of-thought: only provider summaries and execution notes.
+    reasoning_show: bool = False
     # Opt-in for *automatic* mock injection when nothing live is routable.
     # An explicit ``kind: mock`` provider in config is itself an opt-in and
     # remains legal without this flag.

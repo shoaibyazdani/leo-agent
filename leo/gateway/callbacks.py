@@ -36,6 +36,46 @@ ResolveFn = Callable[[str, bool, str], Awaitable[Mapping[str, Any]]]
 AdmitFn = Callable[[str, str, str], Awaitable[None]]
 
 MODEL_TAP_PREFIX = "mdl:"
+REASONING_TAP_PREFIX = "rsn:"
+
+# Only these tokens may become part of a relayed slash command. A button's
+# callback payload is external input; it is parsed as data, never concatenated
+# into an arbitrary command.
+_REASONING_LEVELS = frozenset({
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+})
+_REASONING_ACTIONS = {
+    "show": "/reasoning show",
+    "hide": "/reasoning hide",
+    "detail": "/reasoning detail",
+    # The menu labels are explicit: one resets this conversation, the other
+    # clears the durable global default. Never let a scope toggle silently
+    # change which one a button does.
+    "reset": "/reasoning reset --session",
+    "reset-global": "/reasoning reset --global",
+    "menu": "/reasoning",
+    "status": "/reasoning status",
+}
+
+
+def reasoning_tap_command(payload: str) -> str | None:
+    """Translate a reasoning-button payload into its slash command.
+
+    Returns None for anything not explicitly supported, so a crafted callback
+    cannot smuggle another command through this prefix.
+    """
+    token = str(payload or "").strip()
+    if not token:
+        return None
+    if token in _REASONING_ACTIONS:
+        return _REASONING_ACTIONS[token]
+    if token.startswith("level:"):
+        level = token[len("level:"):].strip().lower()
+        return f"/reasoning {level}" if level in _REASONING_LEVELS else None
+    if token.startswith("scope:"):
+        scope = token[len("scope:"):].strip().lower()
+        return f"/reasoning scope {scope}" if scope in ("global", "session") else None
+    return None
 
 
 def approval_senders(settings: Any, channel: str) -> list[str]:
@@ -139,6 +179,23 @@ async def handle_tap(
         return {"ok": False, "reason": "not authorized"}
 
     raw_data = str(descriptor.get("data") or "")
+    if raw_data.startswith(REASONING_TAP_PREFIX):
+        command = reasoning_tap_command(raw_data[len(REASONING_TAP_PREFIX):])
+        if command is None:
+            await reply("Unrecognised reasoning setting")
+            return {"ok": False, "reason": "unrecognised reasoning payload"}
+        if admit is None:
+            await reply("This process cannot change reasoning; run /reasoning")
+            return {"ok": False, "reason": "no admission path"}
+        # The command runs in the process that owns settings and the current
+        # conversation route, so a session-scoped tap lands in the right
+        # conversation. Its reply carries the refreshed menu.
+        await admit(command, channel, chat_id or sender_id)
+        await reply("Applying…")
+        _LOG.info("reasoning tap relayed", extra={
+            "channel": channel, "command": command.split()[1] if len(command.split()) > 1 else "menu",
+            "sender_id": sender_id})
+        return {"ok": True, "command": command}
     if raw_data.startswith(MODEL_TAP_PREFIX):
         return await _model_tap(
             raw_data[len(MODEL_TAP_PREFIX):], adapter=adapter, reply=reply,
