@@ -31,6 +31,9 @@ RESTART_MARKER_TTL = timedelta(minutes=15)
 # A boot this soon after the previous one is a restart, not a cold start: the
 # operator asked, systemd corrected a crash, or a deploy bounced the unit.
 RESTART_WINDOW = timedelta(minutes=15)
+# A boot this soon after the previous one is a crash loop, not a restart the
+# operator asked for: one notice is enough.
+CRASH_LOOP_FLOOR = timedelta(seconds=60)
 
 
 async def mark_restart_pending(channel: str, subject: str, *, units: list[str] | None = None) -> None:
@@ -78,17 +81,22 @@ def _is_fresh(payload: dict[str, Any]) -> bool:
     return datetime.now(timezone.utc) - asked_at <= RESTART_MARKER_TTL
 
 
-async def _previous_boot_was_recent() -> bool:
+async def _seconds_since_previous_boot() -> float | None:
     row = await db.fetchone("SELECT value FROM kv WHERE key=?", (LAST_BOOT_KEY,))
     if row is None:
-        return False
+        return None
     try:
         previous = datetime.fromisoformat(str(row["value"]))
     except (TypeError, ValueError):
-        return False
+        return None
     if previous.tzinfo is None:
         previous = previous.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) - previous <= RESTART_WINDOW
+    return (datetime.now(timezone.utc) - previous).total_seconds()
+
+
+async def _previous_boot_was_recent() -> bool:
+    age = await _seconds_since_previous_boot()
+    return age is not None and age <= RESTART_WINDOW.total_seconds()
 
 
 async def record_boot() -> None:
@@ -130,11 +138,15 @@ async def announce_restart_if_pending(
     payload = await _read_marker()
     if restarted is None:
         restarted = await _previous_boot_was_recent()
-    if payload is None and not restarted:
+    # "Tell me when it is up" applies to every start, not only to a /restart:
+    # the operator restarts LEO from the shell too. The only boot that stays
+    # silent is a crash loop's second start within a minute.
+    age = await _seconds_since_previous_boot()
+    if age is not None and age <= CRASH_LOOP_FLOOR.total_seconds():
+        _LOG.info("boot too close to the previous one; not announcing")
+        await _take_marker()
         return None
     if payload is None:
-        # No request, but this boot followed one within minutes: systemd or a
-        # deploy bounced the unit. The operator still wants to know it is back.
         target = await _last_chat(app)
         if target is None:
             return None
