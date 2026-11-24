@@ -387,6 +387,20 @@ async def test_gateway_reply_is_idempotent_and_truthful(app: LeoApp, monkeypatch
     assert result["status"] == "sent" and result["success"] is True
     assert result["delivered"] is True
     assert sends[0]["idempotency_key"] == "idem-1"
+    assert sends[0]["reply_markup"] is None
+
+    async def fake_picker_ask(text, **kwargs):
+        keyboard = {"inline_keyboard": [[{"text": "beam-free", "callback_data": "mdl:beam-free"}]]}
+        return {
+            "content": "pick one", "conversation_id": kwargs.get("conversation_id"),
+            "command_result": {"command": "model", "status": "ok", "data": {"reply_markup": keyboard}},
+        }
+
+    monkeypatch.setattr(app, "ask", fake_picker_ask)
+    await app._gateway_reply({**payload, "outbox_id": "outbox-picker", "idempotency_key": "idem-2"})
+    assert sends[1]["reply_markup"] == {
+        "inline_keyboard": [[{"text": "beam-free", "callback_data": "mdl:beam-free"}]]
+    }
 
     async def failing_send(channel, target, text, **kwargs):
         return {"success": False, "error": "provider down"}

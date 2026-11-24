@@ -192,7 +192,14 @@ async def test_app_health_composes_same_fields_from_live_engines(base):
     assert result.output == {
         "status": "ok", "version": __version__, "db": base.db_path,
         "providers": {"local": "local-1", "mock": "mock-1"},
-        "default_provider": "mock", "source": "composed",
+        "default_provider": "mock",
+        "provider": None,
+        "model": "mock-1",
+        "catalog": [
+            {"name": "local", "model": "local-1", "provider": None, "enabled": True},
+            {"name": "mock", "model": "mock-1", "provider": None, "enabled": True},
+        ],
+        "source": "composed",
         "tools": 2, "skills": 3, "agents": 2, "pending_approvals": 1,
     }
 
@@ -208,7 +215,14 @@ async def test_app_health_reports_not_initialized_without_count_fabrication(base
     assert result.output == {
         "status": "not-initialized", "version": __version__, "db": base.db_path,
         "providers": {"local": "local-1", "mock": "mock-1"},
-        "default_provider": "mock", "source": "composed",
+        "default_provider": "mock",
+        "provider": None,
+        "model": "mock-1",
+        "catalog": [
+            {"name": "local", "model": "local-1", "provider": None, "enabled": True},
+            {"name": "mock", "model": "mock-1", "provider": None, "enabled": True},
+        ],
+        "source": "composed",
     }
     assert "tools" not in result.output
 
@@ -220,7 +234,14 @@ async def test_app_health_reports_not_initialized_from_ctx_without_services(base
     assert result.output == {
         "status": "not-initialized", "version": __version__, "db": base.db_path,
         "providers": {"local": "local-1", "mock": "mock-1"},
-        "default_provider": "mock", "source": "composed",
+        "default_provider": "mock",
+        "provider": None,
+        "model": "mock-1",
+        "catalog": [
+            {"name": "local", "model": "local-1", "provider": None, "enabled": True},
+            {"name": "mock", "model": "mock-1", "provider": None, "enabled": True},
+        ],
+        "source": "composed",
     }
 
 

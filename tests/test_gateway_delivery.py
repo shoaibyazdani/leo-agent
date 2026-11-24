@@ -406,6 +406,40 @@ async def test_stale_processing_outbox_rows_are_requeued():
     assert (await gateway.drain_outbox())["processed"] == 1
 
 
+async def test_send_forwards_an_inline_keyboard_to_a_capable_adapter():
+    """The /model picker's buttons ride the same send as its text."""
+
+    class KeyboardAdapter(FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__(channel="keyboard")
+            self.markup: dict | None = None
+
+        async def send(self, target, text, *, reply_markup=None):
+            self.markup = reply_markup
+            return await super().send(target, text)
+
+    adapter = KeyboardAdapter()
+    gateway = make_gateway(adapters={"keyboard": adapter})
+    keyboard = {"inline_keyboard": [[{"text": "beam-free", "callback_data": "mdl:beam-free"}]]}
+
+    result = await gateway.send("keyboard", "chat-1", "pick one", reply_markup=keyboard)
+
+    assert result["success"] is True
+    assert adapter.markup == keyboard
+
+
+async def test_a_keyboard_never_breaks_an_adapter_that_cannot_render_one():
+    """Older adapters take (target, text) only: the text must still arrive."""
+    adapter = FakeAdapter()
+    gateway = make_gateway(adapters={"fake": adapter})
+    keyboard = {"inline_keyboard": [[{"text": "x", "callback_data": "mdl:x"}]]}
+
+    result = await gateway.send("fake", "chat-1", "pick one", reply_markup=keyboard)
+
+    assert result["success"] is True
+    assert adapter.sent == [("chat-1", "pick one")]
+
+
 def test_channel_specs_expose_tls_and_jwt_settings_with_honest_capabilities():
     specs = channel_specs()
     feishu = specs["feishu"].description

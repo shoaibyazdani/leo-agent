@@ -19,6 +19,7 @@ from collections import Counter
 from typing import Any, Mapping
 
 from .. import __version__, db
+from ..config import upstream_provider
 from ..contracts import RiskLevel, ToolSpec
 from .registry import ToolRegistry
 
@@ -235,6 +236,20 @@ async def _app_health(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, An
             str(name): str(_field(provider, "model", "")) for name, provider in providers.items()
         },
         "default_provider": str(_field(models, "default", "")),
+        "provider": upstream_provider(providers.get(str(_field(models, "default", "")))),
+        "model": str(
+            _field(providers.get(str(_field(models, "default", ""))), "model", "")
+            or _field(models, "default", "")
+        ),
+        "catalog": [
+            {
+                "name": str(name),
+                "model": str(_field(provider, "model", "") or name),
+                "provider": upstream_provider(provider),
+                "enabled": bool(_field(provider, "enabled", True)),
+            }
+            for name, provider in sorted(providers.items(), key=lambda item: str(item[0]))
+        ],
         "source": "composed",
     }
     if report["status"] == "ok":
