@@ -178,6 +178,11 @@ class Gateway:
         # Optional app-level hook used by drain_outbox(). Set from the
         # composition root after the agent engine exists.
         self._reply_handler: OutboxHandler | None = None
+        # Interrupt-class commands (/stop) are answered at admission time, out of
+        # band: the outbox is drained serially, so a queued /stop would only run
+        # after the turn it targets. Both hooks are supplied by the app.
+        self._interrupt_classifier: Callable[[str], bool] | None = None
+        self._interrupt_handler: Callable[[str, str], Awaitable[None]] | None = None
         if getattr(self.admission, "events", None) is None:
             self.admission.events = self.events
 
@@ -209,6 +214,21 @@ class Gateway:
     def set_reply_handler(self, handler: OutboxHandler | None) -> None:
         """Register (or clear with ``None``) the durable outbox consumer hook."""
         self._reply_handler = handler
+
+    def set_interrupt_handler(
+        self,
+        classifier: Callable[[str], bool] | None,
+        handler: Callable[[str, str], Awaitable[None]] | None,
+    ) -> None:
+        """Register the out-of-band hook for interrupt-class commands.
+
+        ``classifier`` decides whether an admitted message is an interrupt (for
+        LEO: a command whose ``busy_policy`` is ``interrupt``). ``handler`` is
+        called with ``(conversation_id, text)`` after the batch commits, so a
+        mid-turn ``/stop`` never waits behind the serial outbox drain.
+        """
+        self._interrupt_classifier = classifier
+        self._interrupt_handler = handler
 
     def register(self, adapter: MessagingAdapter) -> None:
         self.adapters[adapter.channel] = adapter
@@ -403,6 +423,7 @@ class Gateway:
         await self._ensure_outbox()
         results: list[dict[str, Any]] = []
         to_publish: list[tuple[dict[str, Any], NormalizedMessage]] = []
+        interrupts: list[tuple[str, str]] = []
         async with db.transaction() as conn:
             for item in prepared:
                 message = item.message
@@ -417,6 +438,12 @@ class Gateway:
                         results.append({**prior, "duplicate": True})
                         continue
                 conversation_id = await self._conversation_in(conn, message.channel, item.subject)
+                if (
+                    self._interrupt_handler is not None
+                    and self._interrupt_classifier is not None
+                    and self._interrupt_classifier(message.text)
+                ):
+                    interrupts.append((conversation_id, message.text))
                 reply_target = message.reply_target
                 metadata = {
                     "channel": message.channel,
@@ -483,6 +510,17 @@ class Gateway:
                 )
                 results.append(payload)
                 to_publish.append((payload, message))
+        # Interrupts fire after the commit and outside the write transaction:
+        # the handler writes its own durable row, and a second writer inside the
+        # transaction would deadlock against SQLite's single writer.
+        for interrupt_conversation, interrupt_text in interrupts:
+            try:
+                await self._interrupt_handler(interrupt_conversation, interrupt_text)  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001 - the admitted row must survive
+                _LOG.warning(
+                    "interrupt command handling failed",
+                    extra={"conversation_id": str(interrupt_conversation)[:24], "error": str(exc)},
+                )
         for payload, message in to_publish:
             await self.events.publish(
                 Event(

@@ -1418,20 +1418,30 @@ async def title_command(ctx: CommandContext) -> CommandResult:
 
 
 async def stop_command(ctx: CommandContext) -> CommandResult:
-    """Stop work. With no id, stop the turn that is running right now.
+    """Stop the turn that is running in this conversation.
 
-    A slash command can arrive while another worker is busy with a long turn, so
-    "stop" is a request the live turn observes between steps - not a process kill
-    and not a promise that an in-flight tool call is interrupted mid-command.
+    Bare ``/stop`` always targets the conversation, never ``ctx.run_id``: when a
+    slash command is dispatched through a streaming turn, ``ctx.run_id`` is the
+    stop command's *own* run, so treating it as the target cancelled the request
+    itself and left the working turn untouched. An explicit id
+    (``/stop <run_id>``) remains the way to cancel a specific run.
+
+    The stop is also in-process immediate: the live turn's model call, stream and
+    tool wait all wake on the app's stop event, while the durable ``turn_cancels``
+    row keeps it working across workers.
     """
-    run_id = ctx.argv[0] if ctx.argv else ctx.run_id
-    if run_id:
-        outcome = await ctx.app.cancel_run(run_id)
+    if ctx.argv:
+        run_id = ctx.argv[0]
+        outcome = await ctx.app.cancel_run(run_id, exclude_run_id=ctx.run_id)
         return _summary(ctx, "stop", f"Run {run_id}: {outcome}", {"run_id": run_id, "status": outcome})
     conversation_id = ctx.conversation_id
     if not conversation_id:
         raise ValueError("/stop needs a run id here; no conversation is attached to this surface")
-    await ctx.app.request_turn_stop(conversation_id, requested_by=f"slash:{ctx.principal or ctx.channel}")
+    await ctx.app.request_turn_stop(
+        conversation_id,
+        requested_by=f"slash:{ctx.principal or ctx.channel}",
+        exclude_run_id=ctx.run_id,
+    )
     await _audit(ctx, "slash.stop", conversation_id, "turn stop requested via slash")
     return _summary(
         ctx, "stop",
@@ -2771,9 +2781,9 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
         risk=RiskLevel.MEDIUM,
     ))
     registry.register(_spec(
-        "stop", "Cancel a live run by id (or the current streaming run)",
+        "stop", "Stop the turn that is running in this conversation (or a run by id)",
         stop_command, aliases=("cancel",), args_hint="[run_id]", category="session",
-        risk=RiskLevel.MEDIUM,
+        risk=RiskLevel.MEDIUM, busy_policy="interrupt",
     ))
     registry.register(_spec(
         "diff", "Read workspace git changes through the audited git_diff tool",

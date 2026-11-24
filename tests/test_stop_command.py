@@ -113,3 +113,55 @@ async def test_slash_stop_without_an_id_stops_the_turn(app) -> None:
     assert result is not None
     assert "Stopping" in str(getattr(result, "message", "") or getattr(result, "text", "") or result)
     assert await app._turn_stop_requested("conv-slash", "2000-01-01T00:00:00+00:00") is True
+
+
+async def test_bare_stop_never_cancels_the_command_run_itself(app) -> None:
+    """A /stop dispatched through a streaming turn carries that turn's run id.
+
+    Treating it as the target (the old behaviour) cancelled the stop request
+    itself and left the working turn running. The id may only exclude the
+    carrier — never become the thing that is stopped.
+    """
+    conversation_id = "conv-self"
+    app._start_run("run-stop-command", conversation_id)
+    ctx = CommandContext(
+        app=app, principal="chat", surface="chat", channel="dashboard",
+        argv=[], raw="/stop", registry=CommandRegistry(),
+        conversation_id=conversation_id, run_id="run-stop-command",
+    )
+
+    result = await stop_command(ctx)
+
+    assert "Stopping" in str(getattr(result, "message", "") or "")
+    assert app._runs["run-stop-command"]["status"] == "running"
+    assert "run-stop-command" not in app._cancelled_runs
+    assert await app._turn_stop_requested(conversation_id, "2000-01-01T00:00:00+00:00") is True
+
+
+async def test_a_streaming_turn_observes_a_stop_request(app) -> None:
+    """The streaming path must end as cancelled, persist one truthful row, and
+    close its run — the dashboard's /stop targets this path."""
+    conversation_id = "conv-stream-stop"
+    events: list[dict] = []
+    requested = False
+
+    async for event in app.ask_stream(
+        "do something long", channel="dashboard", conversation_id=conversation_id
+    ):
+        events.append(event)
+        if event["type"] == "status" and not requested:
+            requested = True
+            await app.request_turn_stop(conversation_id, requested_by="test")
+
+    assert requested is True
+    finished = next(event for event in events if event["type"] == "run.finished")
+    assert finished["status"] == "cancelled", finished
+    assert any(event["type"] == "message.finished" and event["status"] == "cancelled"
+               for event in events)
+    row = await db.fetchone(
+        "SELECT content FROM messages WHERE conversation_id=? AND role='assistant' "
+        "ORDER BY id DESC LIMIT 1", (conversation_id,)
+    )
+    assert row is not None and "Stopped" in row["content"]
+    assert all(info["status"] != "running" for info in app._runs.values())
+    assert await db.fetchone("SELECT requested_at FROM turn_cancels LIMIT 1") is None

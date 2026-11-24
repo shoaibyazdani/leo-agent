@@ -1327,6 +1327,43 @@
     }
   }
 
+  // A command whose busy policy is "interrupt" (/stop) must run while a turn is
+  // live — Hermes's interrupt_then_dispatch. It goes to the dedicated endpoint
+  // so the running stream keeps its state instead of being replaced or queued.
+  function commandName(text) {
+    const match = /^\s*\/([a-z][a-z0-9_-]*)/i.exec(text || '');
+    return match ? match[1].toLowerCase() : null;
+  }
+
+  function isInterruptCommand(text) {
+    const name = commandName(text);
+    if (!name) return false;
+    // The backend's catalog is authoritative when it has loaded; before that,
+    // the built-in stop aliases are the known interrupt commands.
+    const catalog = Array.isArray(state.commands) ? state.commands : [];
+    const row = catalog.find(
+      (cmd) => cmd.name === name || (Array.isArray(cmd.aliases) && cmd.aliases.includes(name)),
+    );
+    if (row) return row.busy_policy === 'interrupt';
+    return name === 'stop' || name === 'cancel';
+  }
+
+  async function requestStop(text) {
+    const thread = threadEl();
+    thread.appendChild(messageNode({ role: 'user', content: text }));
+    if (!state.activeId) {
+      thread.appendChild(noticeNode('nothing is running in this conversation'));
+      return;
+    }
+    try {
+      await api(`/conversations/${encodeURIComponent(state.activeId)}/stop`, { method: 'POST' });
+      thread.appendChild(noticeNode('stop requested — the turn ends at its next step'));
+      maybeScroll(true);
+    } catch (error) {
+      toast(error.message || 'stop failed', 'danger');
+    }
+  }
+
   async function streamChat(text) {
     const ids = state.attachments.map((record) => record.id);
     const userNode = messageNode({ role: 'user', content: text, meta: ids.length ? `${ids.length} attachment(s)` : '' });
@@ -1869,9 +1906,19 @@
     // composer
     $('chat-form').addEventListener('submit', async (e) => {
       e.preventDefault();
-      if (state.running) return;
       const input = $('message');
       const text = input.value.trim();
+      if (state.running) {
+        // Interrupt-class input is handled inline; anything else typed mid-turn
+        // is left in the composer (there is no prompt queue on this surface).
+        if (isInterruptCommand(text)) {
+          input.value = '';
+          hideCommandPalette();
+          autosize();
+          await requestStop(text);
+        }
+        return;
+      }
       if (!text && !state.attachments.length) return;
       input.value = '';
       hideCommandPalette();

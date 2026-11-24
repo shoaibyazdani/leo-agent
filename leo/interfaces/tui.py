@@ -12,8 +12,10 @@ Operator commands (``/approve``, ``/deny``) run as the trusted
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
+import threading
 import time
 from typing import Any, Callable
 
@@ -36,6 +38,7 @@ HELP = """\
   /approvals         pending high-risk approvals
   /approve <id>      approve a pending gate (operator principal)
   /deny <id>         deny a pending gate
+  /stop              stop the turn that is running now
   /quit or /exit     leave the chat
 """
 
@@ -78,12 +81,21 @@ class ChatTUI:
         self._input = input_fn or input
         self._streamed_text = False
         self._thinking_open = False
+        self._turning = False
+        self._eof = False
 
     # ------------------------------------------------------------------ run
     async def run(self) -> int:
-        """Read lines until EOF or /quit. Returns a process exit code."""
+        """Read lines until EOF or /quit. Returns a process exit code.
+
+        Input is read by a persistent worker while a turn streams, so ``/stop``
+        (and Ctrl+C) reach the turn that is running. Any other line typed
+        mid-turn is queued for the next turn — the same busy policy Hermes's
+        input loop implements with ``interrupt_then_dispatch``.
+        """
         await self.app.initialize()
         interactive = sys.stdin.isatty() and self._input is input
+        prompt = "\x1b[36myou ›\x1b[0m " if interactive else ""
         if interactive:
             try:
                 import readline  # noqa: F401 - history and line editing
@@ -92,12 +104,18 @@ class ChatTUI:
             self.console.print(Text.from_markup(
                 f"[bold cyan]LEO[/bold cyan] terminal chat · conversation "
                 f"[dim]{self.conversation_id or '(new)'}[/dim]\n"
-                "[dim]Type /help for commands. Ctrl+C interrupts a turn.[/dim]\n"
+                "[dim]Type /help for commands. /stop or Ctrl+C interrupts a turn.[/dim]\n"
             ))
+        self._lines: asyncio.Queue[str | None] = asyncio.Queue()
+        self._queued: list[str] = []
+        self._start_reader(prompt)
         while True:
             try:
-                line = self._input("\x1b[36myou ›\x1b[0m " if interactive else "")
-            except (EOFError, KeyboardInterrupt):
+                line = await self._next_line()
+            except KeyboardInterrupt:
+                self.console.print()
+                return 0
+            if line is None:
                 self.console.print()
                 return 0
             text = line.strip()
@@ -112,13 +130,99 @@ class ChatTUI:
                     continue
                 self.console.print(f"[yellow]unknown command /{name}[/yellow] — /help")
                 continue
+            await self._turn_with_interrupts(text)
+
+    def _start_reader(self, prompt: str) -> None:
+        """Read stdin on a daemon thread so a turn keeps streaming while waiting.
+
+        A daemon thread (not ``asyncio.to_thread``) matters: the built-in
+        executor is joined at loop shutdown, and a worker still blocked in
+        ``input()`` would hang the process on exit.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _deliver(value: str | None) -> None:
             try:
-                await self.turn(text)
-            except KeyboardInterrupt:
-                self.console.print("\n[yellow]interrupted[/yellow] — the turn was cancelled client-side.")
-            except Exception as exc:  # noqa: BLE001 - a TUI must not crash the session
+                loop.call_soon_threadsafe(self._lines.put_nowait, value)
+            except RuntimeError:  # loop already closed at process exit
+                pass
+
+        def _read() -> None:
+            while True:
+                try:
+                    line = self._input(prompt)
+                except (EOFError, KeyboardInterrupt):
+                    _deliver(None)
+                    return
+                _deliver(line)
+
+        threading.Thread(target=_read, name="leo-tui-input", daemon=True).start()
+
+    async def _next_line(self) -> str | None:
+        if self._queued:
+            return self._queued.pop(0)
+        if self._eof:
+            return None
+        return await self._lines.get()
+
+    async def _turn_with_interrupts(self, text: str) -> None:
+        """Stream one turn while watching input for an interrupt-class command."""
+        self._turning = True
+        task = asyncio.create_task(self.turn(text))
+        try:
+            while not task.done():
+                getter = asyncio.create_task(self._lines.get())
+                try:
+                    done, _ = await asyncio.wait(
+                        {task, getter}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                except KeyboardInterrupt:
+                    getter.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await getter
+                    await self._request_stop()
+                    continue
+                if getter in done:
+                    # Process the line even when the turn finished at the same
+                    # moment: discarding it would lose user input (or the EOF
+                    # sentinel) and park the next prompt forever.
+                    line = getter.result()
+                    if line is None:
+                        self._eof = True
+                    else:
+                        parsed = parse_command(line)
+                        if parsed is not None and parsed[0] in {"stop", "cancel"}:
+                            await self._request_stop()
+                        else:
+                            self._queued.append(line)
+                            self.console.print(Text("  (queued for the next turn)", style="dim"))
+                    continue
+                getter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await getter
+                break
+            await task
+        except KeyboardInterrupt:
+            await self._request_stop()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
                 self.console.print(f"[red]error:[/red] {type(exc).__name__}: {exc}")
-        return 0  # pragma: no cover - loop returns above
+        except Exception as exc:  # noqa: BLE001 - a TUI must not crash the session
+            self.console.print(f"[red]error:[/red] {type(exc).__name__}: {exc}")
+        finally:
+            self._turning = False
+
+    async def _request_stop(self) -> None:
+        """Ask the live turn to stop; the server owns the truthful final row."""
+        if not self._turning:
+            self.console.print(Text("no turn is running", style="dim"))
+            return
+        if not self.conversation_id:
+            self.console.print(Text("nothing is running yet", style="dim"))
+            return
+        await self.app.request_turn_stop(self.conversation_id, requested_by="tui:operator")
+        self.console.print(Text("⏹ stop requested — this turn ends at its next step", style="yellow"))
 
     # ---------------------------------------------------------------- turns
     async def turn(self, text: str) -> dict[str, Any]:
@@ -230,6 +334,11 @@ class ChatTUI:
                     f"requested_by={row.get('requested_by')}",
                     style="yellow",
                 ))
+        elif name in {"stop", "cancel"}:
+            if args:
+                self.console.print(Text(f"usage: /{name}", style="yellow"))
+                return True
+            await self._request_stop()
         elif name in {"approve", "deny"}:
             if not args:
                 self.console.print(Text(f"usage: /{name} <approval_id>", style="yellow"))

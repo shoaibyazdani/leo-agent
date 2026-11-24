@@ -1617,3 +1617,36 @@ async def test_command_catalog_uses_the_chat_dispatch_surface(offline_app: LeoAp
     assert by_name["help"]["allowed_for_caller"] is True
     assert by_name["approve"]["allowed_for_caller"] is False
     assert by_name["approve"]["operator_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_stop_while_a_run_is_active_is_not_rejected(offline_app: LeoApp) -> None:
+    """Typed /stop on the dashboard must reach the turn it is meant to stop.
+
+    The normal stream guard owns one run per conversation; an interrupt-class
+    command is dispatched out of band and must not be refused with 409.
+    """
+    conversation_id = "conv-busy"
+    offline_app._active_conversations.add(conversation_id)
+    transport = httpx.ASGITransport(app=api_module.api)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            stopped = await client.post(f"/conversations/{conversation_id}/stop")
+            assert stopped.status_code == 200
+            assert stopped.json()["stopping"] is True
+            assert await offline_app._turn_stop_requested(
+                conversation_id, "2000-01-01T00:00:00+00:00"
+            )
+
+            ordinary = await client.post(
+                "/chat/stream", json={"message": "hello", "conversation_id": conversation_id}
+            )
+            assert ordinary.status_code == 409
+
+            interrupt = await client.post(
+                "/chat/stream", json={"message": "/stop", "conversation_id": conversation_id}
+            )
+            assert interrupt.status_code == 200
+            assert offline_app._active_conversations == {conversation_id}
+    finally:
+        offline_app._active_conversations.discard(conversation_id)

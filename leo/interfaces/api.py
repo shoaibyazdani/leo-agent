@@ -724,9 +724,15 @@ async def chat_stream(request: Request, req: ChatStreamRequest) -> StreamingResp
         raise HTTPException(400, "empty message")
     app = get_app()
     conversation_id = req.conversation_id
-    if conversation_id and conversation_id in app._active_conversations:
+    # An interrupt-class command (/stop) is dispatched inline even while a turn
+    # runs. It is not a turn itself, so it neither collides with the active-run
+    # guard nor becomes the conversation's tracked stream.
+    commands = getattr(app, "commands", None)
+    interrupt = bool(commands and commands.is_interrupt(req.message))
+    if conversation_id and conversation_id in app._active_conversations and not interrupt:
         raise HTTPException(409, "a run is already active for this conversation")
-    if conversation_id:
+    tracked = bool(conversation_id) and not interrupt
+    if tracked:
         app._active_conversations.add(conversation_id)
 
     async def generate():
@@ -741,7 +747,7 @@ async def chat_stream(request: Request, req: ChatStreamRequest) -> StreamingResp
                 payload = sanitize_message_payload(event, request)
                 yield "data: " + json.dumps(payload, default=str, ensure_ascii=False) + "\n\n"
         finally:
-            if conversation_id:
+            if tracked:
                 app._active_conversations.discard(conversation_id)
 
     return StreamingResponse(
@@ -764,6 +770,18 @@ async def cancel_run(run_id: str) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(409, str(exc))
     return {"cancelled": outcome == "cancelled", "status": outcome}
+
+
+@api.post("/conversations/{conversation_id}/stop")
+async def stop_conversation(conversation_id: str) -> dict[str, Any]:
+    """Request that the live turn in this conversation stop now.
+
+    The dashboard sends a typed ``/stop`` here while its stream is open: the
+    normal chat endpoint owns one run per conversation, so routing the command as
+    a turn would reject it (409) or queue it behind the turn it is meant to stop.
+    """
+    stopping = await get_app().request_turn_stop(conversation_id, requested_by="dashboard:stop")
+    return {"stopping": bool(stopping), "conversation_id": conversation_id}
 
 
 @api.get("/conversations")
