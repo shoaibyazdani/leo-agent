@@ -718,13 +718,8 @@ async def test_single_process_telegram_tap_changes_the_session_and_returns_a_men
     assert adapter.sent == []
     assert adapter.edited and adapter.edited[-1]["message_id"] == "9"
     assert "Active effort: high" in adapter.edited[-1]["text"]
-    markup = adapter.edited[-1].get("reply_markup") or {}
-    callbacks = {
-        button.get("callback_data")
-        for row in markup.get("inline_keyboard") or []
-        for button in row
-    }
-    assert "rsn:level:medium" in callbacks
+    # The tap consumed the choice: the status text remains, buttons go away.
+    assert adapter.edited[-1]["reply_markup"] == {"inline_keyboard": []}
 
 
 def test_route_preview_reports_clamping_before_a_request_is_sent():

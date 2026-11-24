@@ -194,7 +194,9 @@ def create_api(
                         edited = bool(await asyncio.wait_for(
                             adapter.edit_message_text(
                                 admission["subject"], request.edit_message_id,
-                                request.answer, request.reply_markup,
+                                # The tap consumed the choice: keep the result
+                                # text, remove the buttons.
+                                request.answer, {"inline_keyboard": []},
                             ),
                             timeout=DELIVERY_TIMEOUT_SECONDS,
                         ))
@@ -205,9 +207,13 @@ def create_api(
                         # A hung platform call must not keep the turn (and its typing
                         # pulse) alive forever: the worker renews the lease until this
                         # returns, so an unbounded send is an endless "still typing".
-                        # Only pass the keyboard when the answer has one, so a
-                        # text-only adapter keeps its own send() signature.
-                        extra = {"reply_markup": request.reply_markup} if request.reply_markup else {}
+                        # A failed tap edit falls back to text-only, never a second
+                        # live menu.
+                        extra = (
+                            {"reply_markup": request.reply_markup}
+                            if request.reply_markup and not request.edit_message_id
+                            else {}
+                        )
                         await asyncio.wait_for(
                             adapter.send(admission["subject"], request.answer, **extra),
                             timeout=DELIVERY_TIMEOUT_SECONDS,

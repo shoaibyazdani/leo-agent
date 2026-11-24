@@ -26,6 +26,10 @@ translated level. Every level has a button. There are buttons for switching
 scope, toggling summaries, toggling summary detail, resetting session overrides
 and clearing the global default.
 
+After a button tap the card keeps the resulting status text and removes its
+buttons, so the consumed choice cannot be tapped twice and no second menu is
+posted. Run `/reasoning` again to reopen the menu.
+
 ## Levels
 
 From least to most effort:
