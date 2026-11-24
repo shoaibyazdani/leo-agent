@@ -81,7 +81,7 @@ PROTOCOL = "whatsapp-bridge/1"
 _APP_REPO_ROOT = Path(__file__).resolve().parents[3]
 _PACKAGE_DIR = Path(__file__).resolve().parent
 # SHA-256 of the shipped bridge.js. Recompute when bridge.js is changed.
-_BRIDGE_JS_SHA256 = "72ee82783a3dab5efa2c9852817f84c6c355ee4459bc9796a549f05de3a71937"
+_BRIDGE_JS_SHA256 = "d0782b9158a05008c1a2bc9d8fd5994848b5f50f486c9161555a49a6ba83d220"
 _BRIDGE_SCRIPT_MAX_BYTES = 1_000_000
 _NODE_COMMAND_ALLOWLIST = frozenset({"node"})
 # Only the first bytes of `node --version` are read; a hostile binary cannot
@@ -102,7 +102,15 @@ _NODE_MAGIC = (
 )
 ACTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _JID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
+# WhatsApp JIDs are opaque provider ids. Modern LID/device forms can contain
+# characters outside the legacy alphabet, so accept any non-whitespace,
+# non-control string that carries an "@domain".
+_JID_OPAQUE_RE = re.compile(r"^[^\s\x00-\x1f]{3,128}$")
 _CODE_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def _is_jid(value: Any) -> bool:
+    return isinstance(value, str) and "@" in value and bool(_JID_OPAQUE_RE.fullmatch(value))
 _SAFE_TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -133,6 +141,12 @@ MAX_FORWARDED_INT = 2**31 - 1
 MAX_TIMESTAMP_CHARS = 64
 MAX_EXPIRES_MS = 300_000
 MAX_EXPIRES_EPOCH = 1e12
+# Message transport: matches bridge.js. Text is capped so a batch response
+# stays under MAX_RESPONSE_BYTES and one /send body stays under the bridge cap.
+MAX_MESSAGE_TEXT_CHARS = 2_000
+MAX_MESSAGE_BATCH = 10
+MAX_MESSAGE_TIMEOUT = 30.0
+MAX_MESSAGE_ID_CHARS = 128
 _SECRET_ENV_KEY_RE = re.compile(r"(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|PASSKEY)", re.IGNORECASE)
 _SECRET_FIELD_RE = re.compile(
     r'("(?:authorization|token|qr|qr_raw|data_uri|password|secret|api_key|session_auth)"\s*:\s*")[^"]{6,}(")',
@@ -1191,6 +1205,101 @@ class WhatsAppBridgeManager:
                 return result
             if result["sequence"] > after:
                 after = int(result["sequence"])
+
+    @staticmethod
+    def _public_message(raw: Any) -> dict[str, Any] | None:
+        """Normalize one bridge message; drop anything malformed."""
+        if not isinstance(raw, dict):
+            return None
+        message_id = raw.get("id")
+        chat = raw.get("chat")
+        sender = raw.get("sender")
+        text = raw.get("text")
+        if not isinstance(message_id, str) or not 1 <= len(message_id) <= MAX_MESSAGE_ID_CHARS:
+            return None
+        if not _is_jid(chat) or not _is_jid(sender):
+            return None
+        if not isinstance(text, str) or not text or len(text) > MAX_MESSAGE_TEXT_CHARS:
+            return None
+        timestamp = raw.get("timestamp")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+            timestamp = 0
+        chat_alt = raw.get("chat_alt")
+        sender_alt = raw.get("sender_alt")
+        return {
+            "id": message_id,
+            "chat": chat,
+            "sender": sender,
+            "chat_alt": chat_alt if _is_jid(chat_alt) else None,
+            "sender_alt": sender_alt if _is_jid(sender_alt) else None,
+            "text": text,
+            "timestamp": _bounded_int(timestamp),
+            "is_group": raw.get("is_group") is True,
+        }
+
+    async def messages(
+        self,
+        owner_id: str | None = None,
+        *,
+        after: int = 0,
+        timeout: float = 10.0,
+        limit: int = MAX_MESSAGE_BATCH,
+        auth: str | None = None,
+    ) -> dict[str, Any]:
+        """Authenticated long-poll for inbound messages after ``after``.
+
+        Content is returned only to the authenticated manager; the bridge never
+        logs it and the cursor (``sequence``) is monotonic for this process.
+        """
+        self._require_auth(owner_id, auth)
+        self._require_running()
+        if isinstance(after, bool) or not isinstance(after, int) or not 0 <= after <= MAX_FORWARDED_INT:
+            raise BridgeError("after must be a non-negative integer.", code="invalid_request")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_MESSAGE_TIMEOUT:
+            raise BridgeError("Message timeout must be between 0 and 30 seconds.", code="invalid_timeout")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_MESSAGE_BATCH:
+            raise BridgeError(f"limit must be between 1 and {MAX_MESSAGE_BATCH}.", code="invalid_request")
+        payload = await self._request("POST", "/messages", {
+            "after": after,
+            "timeout_ms": max(100, min(int(MAX_MESSAGE_TIMEOUT * 1000), int(float(timeout) * 1000))),
+            "limit": limit,
+        }, timeout=float(timeout) + 5.0) or {}
+        raw_messages = payload.get("messages")
+        messages: list[dict[str, Any]] = []
+        if isinstance(raw_messages, list):
+            for raw in raw_messages[:limit]:
+                public = self._public_message(raw)
+                if public is not None:
+                    messages.append(public)
+        return {
+            "messages": messages,
+            "sequence": _bounded_int(payload.get("sequence")),
+        }
+
+    async def send(
+        self,
+        owner_id: str | None = None,
+        *,
+        to: str,
+        text: str,
+        auth: str | None = None,
+    ) -> dict[str, Any]:
+        """Send one text message through the linked session."""
+        self._require_auth(owner_id, auth)
+        self._require_running()
+        if not _is_jid(to):
+            raise BridgeError("Invalid WhatsApp target.", code="invalid_target")
+        if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_TEXT_CHARS:
+            raise BridgeError(
+                f"WhatsApp text must be 1-{MAX_MESSAGE_TEXT_CHARS} characters.",
+                code="invalid_text",
+            )
+        payload = await self._request("POST", "/send", {"to": to, "text": text}, timeout=20.0) or {}
+        message_id = payload.get("id")
+        return {
+            "to": to,
+            "id": message_id if isinstance(message_id, str) and len(message_id) <= MAX_MESSAGE_ID_CHARS else None,
+        }
 
     async def wait_for_connection(
         self,

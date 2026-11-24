@@ -9,6 +9,13 @@ node_modules/
 .DS_Store
 *.log
 
+# WhatsApp Web device-link credentials are account bearer tokens.
+.leo/whatsapp/
+leo/integrations/whatsapp_bridge/node_modules/
+leo/integrations/whatsapp_bridge/.env
+auth_info_baileys/
+whatsapp-session*
+
 # Local secrets and credentials — never push these.
 .env
 .env.*

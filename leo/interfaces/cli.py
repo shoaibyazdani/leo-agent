@@ -25,12 +25,14 @@ grants_app = typer.Typer(help="Session and workspace approval grants")
 approval_app.add_typer(grants_app, name="grants")
 model_app = typer.Typer(help="Model providers and usage")
 agent_app = typer.Typer(help="Specialized agents")
+whatsapp_app = typer.Typer(help="WhatsApp device linking", no_args_is_help=True)
 cli.add_typer(task_app, name="task")
 cli.add_typer(skill_app, name="skill")
 cli.add_typer(memory_app, name="memory")
 cli.add_typer(approval_app, name="approval")
 cli.add_typer(model_app, name="model")
 cli.add_typer(agent_app, name="agent")
+cli.add_typer(whatsapp_app, name="whatsapp")
 
 console = Console()
 _state: dict[str, Any] = {}
@@ -563,6 +565,175 @@ def model_usage() -> None:
 @agent_app.command("list")
 def agent_list() -> None:
     show([a.model_dump(mode="json") for a in run(lambda: ready().agent_registry.list())])
+
+
+@whatsapp_app.command("link")
+def whatsapp_link(
+    owner: str = typer.Option("owner", "--owner", help="local owner id recorded for this session"),
+    timeout: float = typer.Option(600.0, "--timeout", help="seconds to wait for the QR scan"),
+    stay: bool = typer.Option(False, "--stay", help="keep the linked session open until Ctrl+C"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="print the local page URL instead of opening it"),
+) -> None:
+    """Link this computer as a WhatsApp device by scanning a QR code.
+
+    Uses the unofficial WhatsApp Web protocol (Baileys), not the Meta Cloud
+    API. This links your personal account and carries WhatsApp ToS and
+    account-ban risk; continue only if you accept that for this account.
+    Credentials stay in .leo/whatsapp/ and are never printed.
+    """
+    from ..integrations.whatsapp_link import LinkUnavailable, run_device_link, state_message
+
+    def notify(kind: str, data: Any) -> None:
+        if kind == "page":
+            console.print(f"Link page: [cyan]{data}[/cyan]")
+            console.print("Scan the code shown there with WhatsApp → Linked devices → Link a device.")
+        elif kind == "state" and isinstance(data, dict):
+            state = str(data.get("state") or "")
+            if state == "connected":
+                user = data.get("user") or {}
+                who = user.get("name") or user.get("id") or "this account"
+                console.print(f"[green]Connected[/green] as {who}. Credentials saved.")
+            elif state in {"logged_out", "error", "cancelled"}:
+                detail = data.get("error")
+                console.print(f"[yellow]{state_message(state)}[/yellow]" + (f" ({detail})" if detail else ""))
+            else:
+                console.print(state_message(state))
+        elif kind == "error":
+            console.print(f"[red]Bridge failed:[/red] {type(data).__name__}: {data}")
+
+    try:
+        result = run(
+            run_device_link,
+            owner,
+            timeout=timeout,
+            stay=stay,
+            open_page=not no_browser,
+            notify=notify,
+        )
+    except LinkUnavailable as exc:
+        fail(str(exc), code=2)
+        return
+    except ValueError as exc:
+        fail(str(exc), code=2)
+        return
+    show(result.as_dict())
+    if result.as_dict()["state"] != "connected":
+        raise typer.Exit(1)
+
+
+@whatsapp_app.command("status")
+def whatsapp_status(
+    owner: str = typer.Option("owner", "--owner", help="local owner id recorded for this session"),
+) -> None:
+    """Show bridge readiness and whether saved device credentials exist."""
+    from ..integrations.whatsapp_link import bridge_status
+
+    show(bridge_status(owner))
+
+
+@whatsapp_app.command("logout")
+def whatsapp_logout(
+    owner: str = typer.Option("owner", "--owner", help="local owner id recorded for this session"),
+    yes: bool = typer.Option(False, "--yes", help="do not prompt for confirmation"),
+) -> None:
+    """Unlink this computer and delete the saved WhatsApp credentials."""
+    from ..integrations.whatsapp_link import LinkUnavailable, ensure_ready
+    from ..integrations.whatsapp_bridge import BridgeConfig, BridgeError, WhatsAppBridgeManager
+
+    if not yes:
+        typer.confirm(
+            "Unlink this computer from WhatsApp and delete saved credentials?",
+            abort=True,
+        )
+
+    async def forget() -> dict[str, Any]:
+        ensure_ready()
+        manager = WhatsAppBridgeManager(BridgeConfig(owner_id=owner, actor="default", enabled=True))
+        auth = manager.session_auth
+        async with manager:
+            await manager.start(owner_id=owner, auth=auth)
+            return await manager.repair(owner_id=owner, forget=True, auth=auth)
+
+    try:
+        result = run(forget)
+    except LinkUnavailable as exc:
+        fail(str(exc), code=2)
+        return
+    except (ValueError, PermissionError) as exc:
+        fail(f"whatsapp logout: {exc}", code=2)
+        return
+    except BridgeError as exc:
+        fail(f"whatsapp logout: {exc}")
+        return
+    show({"unlinked": True, "state": result.get("state"), "linked": bool(result.get("linked"))})
+
+
+@whatsapp_app.command("serve")
+def whatsapp_serve(
+    owner: str = typer.Option("owner", "--owner", help="local owner id recorded for this session"),
+    allow: list[str] = typer.Option(None, "--allow", help="phone number allowed to chat (repeatable, with country code)"),
+    allow_all: bool = typer.Option(False, "--allow-all", help="answer ANY sender — explicit, risky opt-in"),
+    groups: bool = typer.Option(False, "--groups", help="also answer group chats (sender must still be allowed)"),
+    debug: bool = typer.Option(False, "--debug", help="print sanitized bridge diagnostics (never message text)"),
+) -> None:
+    """Answer WhatsApp messages with LEO until Ctrl+C.
+
+    Requires a linked session (`leo whatsapp link`). Inbound text is treated as
+    untrusted content; high-risk tool calls still require approval. Without
+    --allow or --allow-all this refuses to answer anyone.
+    """
+    from ..integrations.whatsapp_msg import run_message_agent
+    from ..integrations.whatsapp_bridge import BridgeError
+    from ..integrations.whatsapp_link import LinkUnavailable
+
+    def notify(kind: str, data: Any) -> None:
+        if kind == "warning" and isinstance(data, dict):
+            names = ", ".join(str(name) for name in (data.get("missing") or []))
+            console.print(
+                f"[yellow]Model environment incomplete:[/yellow] {names} is unset. "
+                "Replies will fail until the same provider variables as `leo chat` are exported."
+            )
+        elif kind == "status" and isinstance(data, dict):
+            user = data.get("user") or {}
+            who = user.get("name") or user.get("id") or "this account"
+            console.print(f"[green]Connected[/green] as {who}. Listening for messages…")
+            if allow_all:
+                console.print("[yellow]--allow-all: ANY WhatsApp sender can talk to LEO.[/yellow]")
+            else:
+                console.print("Allowed numbers: " + ", ".join(allow or []))
+        elif kind == "message" and isinstance(data, dict):
+            console.print(f"Message from {data.get('sender')} ({data.get('chars')} chars) — answering…")
+        elif kind == "replied" and isinstance(data, dict):
+            console.print(f"[green]Replied[/green] to {data.get('sender')} ({data.get('chars')} chars).")
+        elif kind == "ignored" and isinstance(data, dict):
+            console.print(f"Ignored message from {data.get('sender')} (not allowed).")
+        elif kind == "failed" and isinstance(data, dict):
+            console.print(f"[yellow]Turn failed[/yellow] for {data.get('sender')}: {data.get('error')}")
+        elif kind == "diagnostic":
+            console.print(f"[dim][diag] {data}[/dim]")
+
+    try:
+        result = run(
+            run_message_agent,
+            owner,
+            allow=list(allow or []),
+            allow_all=allow_all,
+            include_groups=groups,
+            debug=debug,
+            notify=notify,
+        )
+    except LinkUnavailable as exc:
+        fail(str(exc), code=2)
+        return
+    except BridgeError as exc:
+        fail(f"whatsapp serve: {exc}", code=2)
+        return
+    except KeyboardInterrupt:
+        console.print("\nStopped.")
+        return
+    show(result.as_dict())
+    if result.as_dict()["state"] != "connected":
+        raise typer.Exit(1)
 
 
 @cli.command("events")
