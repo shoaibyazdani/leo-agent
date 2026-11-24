@@ -23,6 +23,7 @@ Design constraints, all deliberate:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from ..config import Settings
@@ -30,11 +31,30 @@ from ..events import Event, EventBus
 from ..logging import get_logger
 from datetime import datetime
 from .approval_buttons import build_keyboard
+from .notices import (
+    APPROVAL_PREFIX,
+    REVIEW_FAILED_PREFIX,
+    REVIEW_STAGED_PREFIX,
+)
 from .permissions import reason_is_trustable
 
 _LOG = get_logger("security.notifier")
 
 REQUESTED_TOPIC = "approval.requested"
+# A background review/learn pass writes nothing an operator sees: its skill
+# writes are staged in SQLite and its memory proposals only exist behind
+# ``/skills pending``. The completion event carried no subscriber at all, so a
+# staged write sat unnoticed until someone happened to ask. These topics are the
+# announcement seam; the notifier still decides nothing on the operator's behalf.
+REVIEW_TOPICS = (
+    "review.completed",
+    "review.failed",
+    "learn.completed",
+    "learn.failed",
+)
+# Cap how many staged writes one notice names: the rest are still listed by
+# ``/skills pending`` and a chat message must stay readable on a phone.
+MAX_NAMED_STAGED = 3
 
 
 class ApprovalNotifier:
@@ -120,6 +140,8 @@ class ApprovalNotifier:
             return False
         if not self._subscribed:
             self.events.subscribe(REQUESTED_TOPIC, self._on_requested)
+            for topic in REVIEW_TOPICS:
+                self.events.subscribe(topic, self._on_review)
             self._subscribed = True
             channel, target = self._resolved()  # type: ignore[misc]
             _LOG.info(
@@ -131,6 +153,8 @@ class ApprovalNotifier:
     def stop(self) -> None:
         if self._subscribed and self.events is not None:
             self.events.unsubscribe(REQUESTED_TOPIC, self._on_requested)
+            for topic in REVIEW_TOPICS:
+                self.events.unsubscribe(topic, self._on_review)
         self._subscribed = False
 
     # -- rendering ---------------------------------------------------------
@@ -144,7 +168,7 @@ class ApprovalNotifier:
         timeout = int(getattr(self.settings.security, "approval_timeout_seconds", 900))
         minutes = max(1, timeout // 60)
         lines = [
-            "🔐 Approval needed",
+            APPROVAL_PREFIX,
             f"action: {action}",
         ]
         if command:
@@ -260,6 +284,79 @@ class ApprovalNotifier:
             extra={"channel": channel, "approval_id": payload.get("approval_id")},
         )
 
+    # -- review announcements ----------------------------------------------
+    @staticmethod
+    def _review_message(payload: dict[str, Any]) -> str | None:
+        """One short line for a finished background pass, or None to stay quiet.
+
+        Silence is the default: a review that wrote nothing is not news, and an
+        announcement for every turn would train the operator to ignore the ones
+        that matter. Only a staged skill write or a real failure is announced.
+        """
+        status = str(payload.get("status") or "").strip().lower()
+        mode = str(payload.get("mode") or "review").strip().lower()
+        label = "learn" if mode == "learn" else "review"
+        if status == "failed":
+            error = " ".join(str(payload.get("error") or "").split())[:200]
+            lines = [REVIEW_FAILED_PREFIX, f"pass: {label}"]
+            if error:
+                lines.append(f"error: {error}")
+            lines.append("nothing was written; the artifact names the cause")
+            return "\n".join(lines)
+        staged = [item for item in (payload.get("staged") or []) if isinstance(item, Mapping)]
+        if not staged:
+            return None
+        shown = staged[:MAX_NAMED_STAGED]
+        lines = [REVIEW_STAGED_PREFIX]
+        for item in shown:
+            skill = " ".join(str(item.get("skill") or "?").split())[:64]
+            action = str(item.get("action") or "write").strip().lower()
+            lines.append(f"{action}: {skill} ({item.get('proposal_id')})")
+        remaining = len(staged) - len(shown)
+        if remaining > 0:
+            lines.append(f"+{remaining} more")
+        lines += [
+            "not applied yet. review and apply with:",
+            f"/skills pending",
+            f"/skills approve {shown[0].get('proposal_id')}",
+        ]
+        return "\n".join(lines)
+
+    async def _on_review(self, event: Event) -> None:
+        resolved = self._resolved()
+        if resolved is None:
+            self._skipped += 1
+            return
+        channel, target = resolved
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        text = self._review_message(payload)
+        if text is None:
+            self._skipped += 1
+            return
+        try:
+            adapter = self.gateway._adapter(channel)  # noqa: SLF001 - same package
+            await adapter.send(target, text)
+        except Exception as exc:  # noqa: BLE001 - never break the review
+            self._failed += 1
+            _LOG.warning(
+                "review notification failed",
+                extra={
+                    "channel": channel,
+                    "review_id": payload.get("review_id"),
+                    "error": str(exc),
+                },
+            )
+            return
+        self._sent += 1
+        _LOG.info(
+            "review notification sent",
+            extra={
+                "channel": channel,
+                "review_id": payload.get("review_id"),
+                "status": payload.get("status"),
+            },
+        )
+
     def stats(self) -> dict[str, int | bool]:
         return {
             "subscribed": self._subscribed,
@@ -269,4 +366,4 @@ class ApprovalNotifier:
         }
 
 
-__all__ = ["ApprovalNotifier", "REQUESTED_TOPIC"]
+__all__ = ["ApprovalNotifier", "REQUESTED_TOPIC", "REVIEW_TOPICS"]

@@ -26,6 +26,7 @@ import httpx
 from pydantic import Field
 
 from ..contracts import BaseRecord, IntegrationRecord, utcnow
+from ..security.notices import SELF_NOTICE_PREFIXES
 from .secrets import credential
 from .transport_state import TransportState
 
@@ -889,10 +890,11 @@ class TelegramAdapter(MessagingAdapter):
                     "channel": self.channel, "sender_id": _ref(sender_data.get("id"))})
                 continue
             _body = str(message.get("text") or message.get("caption") or "").lstrip()
-            if _body.startswith("🔐 Approval needed"):
+            if _body.startswith(SELF_NOTICE_PREFIXES):
                 # The approval itself is already a durable row with buttons; its
-                # notification text is not something the operator said.
-                _LOG.info("approval notice echoed back ignored", extra={"channel": self.channel})
+                # notification text is not something the operator said. The same
+                # holds for a staged-write or failed-pass notice.
+                _LOG.info("LEO notice echoed back ignored", extra={"channel": self.channel})
                 continue
             reply = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
             chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}

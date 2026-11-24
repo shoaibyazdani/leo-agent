@@ -82,6 +82,10 @@ class ReviewOutcome:
     actions: list[dict[str, Any]] = field(default_factory=list)
     transcript_digest: str = ""
     artifact_path: str | None = None
+    # Skill writes this review staged instead of applying: the exact ids an
+    # operator must approve. Carried on the outcome (and the completion event)
+    # so a channel notifier can name them without re-reading the artifact.
+    staged: list[dict[str, Any]] = field(default_factory=list)
     summary: str = ""
     error: str | None = None
     duration_ms: float = 0.0
@@ -444,6 +448,7 @@ class ReviewEngine:
             allowed_scope = allowed_scope - {"http_get"}
         actor = LEARN_ACTOR if learn_mode else REVIEW_ACTOR
         actions: list[dict[str, Any]] = []
+        staged_writes: list[dict[str, Any]] = []
         summary = ""
         rounds = 0
         budget_exhausted = False
@@ -499,14 +504,21 @@ class ReviewEngine:
                         actor=actor, scope=allowed_scope,
                     )
                     messages.append(self._tool_message(call_id, result))
-                    actions.append({
+                    action = {
                         "tool": name,
                         "mode": mode,
                         "arguments_digest": _digest(arguments)[:24],
                         "success": bool(result.get("success")),
                         "staged": bool(result.get("staged")),
                         "decision": str(result.get("decision") or ""),
-                    })
+                    }
+                    actions.append(action)
+                    if action["staged"] and str(result.get("proposal_id") or ""):
+                        staged_writes.append({
+                            "proposal_id": str(result.get("proposal_id")),
+                            "skill": str(result.get("skill") or arguments.get("name") or ""),
+                            "action": str(result.get("action") or arguments.get("action") or ""),
+                        })
 
         try:
             await asyncio.wait_for(loop(), timeout=timeout)
@@ -514,12 +526,14 @@ class ReviewEngine:
             return ReviewOutcome(
                 review_id, conversation_id, status="failed", mode=mode, rounds=rounds,
                 actions=actions, transcript_digest=transcript.digest,
+                staged=list(staged_writes),
                 error=f"{mode} exceeded {timeout:.0f}s",
             )
         except Exception as exc:  # noqa: BLE001 - model/provider failure: no writes remain
             return ReviewOutcome(
                 review_id, conversation_id, status="failed", mode=mode, rounds=rounds,
                 actions=actions, transcript_digest=transcript.digest,
+                staged=list(staged_writes),
                 error=_bounded(f"{type(exc).__name__}: {exc}", 400),
             )
 
@@ -532,6 +546,7 @@ class ReviewEngine:
             rounds=rounds,
             actions=actions,
             transcript_digest=transcript.digest,
+            staged=list(staged_writes),
             summary=summary,
             budget_exhausted=budget_exhausted,
         )
@@ -564,9 +579,18 @@ class ReviewEngine:
         except Exception as exc:  # noqa: BLE001 - tool errors are data for the next round
             return {"success": False, "error": _bounded(f"{type(exc).__name__}: {exc}", 300)}
         if hasattr(result, "model_dump"):
-            payload = result.model_dump(mode="json")
+            payload = dict(result.model_dump(mode="json"))
         else:  # pragma: no cover - defensive
             payload = {"success": bool(getattr(result, "success", False))}
+        # The handler's own result is nested under ``output``; the loop reads
+        # ``staged`` from the top level. Without this lift a staged skill write
+        # was counted as an applied one and the artifact said ``staged: false``
+        # for exactly the writes that still needed an operator.
+        output = payload.get("output")
+        if isinstance(output, Mapping):
+            for key in ("staged", "proposal_id", "skill", "action"):
+                if key in output and key not in payload:
+                    payload[key] = output[key]
         return payload
 
     @staticmethod
@@ -639,7 +663,11 @@ class ReviewEngine:
                 review_id=outcome.review_id,
                 conversation_id=outcome.conversation_id,
                 status=outcome.status,
+                mode=outcome.mode,
                 actions=len(outcome.actions),
+                # Named for a notifier: the ids an operator still has to decide
+                # on, bounded so a long run cannot bloat the event payload.
+                staged=outcome.staged[:10],
                 error=_safe_text(outcome.error, 200) if outcome.error else None,
             )
         except Exception as exc:  # noqa: BLE001 - telemetry must not fail the run
@@ -656,6 +684,7 @@ class ReviewEngine:
                 "status": outcome.status,
                 "rounds": outcome.rounds,
                 "actions": outcome.actions,
+                "staged": outcome.staged,
                 "transcript_digest": outcome.transcript_digest,
                 "summary": _safe_text(outcome.summary),
                 "error": _safe_text(outcome.error, 400) if outcome.error else None,

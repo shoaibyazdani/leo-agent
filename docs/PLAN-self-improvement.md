@@ -91,6 +91,25 @@ mechanisms into LEO's contracts (not a source copy):
   `/skills pending|diff|approve|reject`.
 - Tests: [`tests/test_skill_staging.py`](../tests/test_skill_staging.py).
 
+## P3c announcement seam
+
+A staged write is inert, so it needs to reach a human. `review.completed` /
+`learn.completed` were emitted with **no subscriber**, so a staged write could
+sit pending indefinitely — the operator only found it by running
+`/skills pending`. The existing `ApprovalNotifier` now subscribes to those
+topics too:
+
+- [`leo/security/notifier.py`](../leo/security/notifier.py): `REVIEW_TOPICS`,
+  `_review_message` (silent unless a write was staged or the pass failed),
+  `_on_review`. Same opt-in (`security.notify.*`), same channel adapter `send`
+  path as approvals, so it still cannot resolve anything.
+- [`leo/security/notices.py`](../leo/security/notices.py): the notice prefixes,
+  shared with the ingress guard so LEO's own notices are never ingested as a
+  human turn.
+- [`leo/review/engine.py`](../leo/review/engine.py): `ReviewOutcome.staged`
+  (`proposal_id`, `skill`, `action`) carried into the artifact and the
+  completion event; a staged write is no longer counted as an applied one.
+
 ## P3b / P4 file map
 
 - [`leo/review/engine.py`](../leo/review/engine.py): learn mode (`mode="learn"`)
