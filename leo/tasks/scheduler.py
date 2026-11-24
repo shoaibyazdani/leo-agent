@@ -14,11 +14,45 @@ from ..contracts import TaskRecord, new_id
 from ..events import Event, EventBus
 
 _EVERY = re.compile(
-    r"^@every\s+(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hour|hours)?$",
+    r"^@every\s+(\d+(?:\.\d+)?)\s*"
+    r"(s|sec|secs|second|seconds|m|min|mins|minute|minutes"
+    r"|h|hour|hours|d|day|days|w|week|weeks)?$",
     re.IGNORECASE,
 )
 
 _FIELD_LIMITS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6))
+# Three-letter aliases accepted in the month and weekday fields, so "mon-fri"
+# and "jan-mar" work instead of dying on int(). Sunday is 0, matching cron.
+_MONTH_NAMES = {
+    name: index
+    for index, name in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+_WEEKDAY_NAMES = {
+    name: index
+    for index, name in enumerate(("sun", "mon", "tue", "wed", "thu", "fri", "sat"))
+}
+
+
+def _field_int(token: str, index: int, expression: str) -> int:
+    """Parse one cron field token as a number, or a month/weekday name."""
+    text = token.strip().lower()
+    if not text:
+        raise ValueError(f"empty cron field in {expression!r}")
+    if index == 3 and text[:3] in _MONTH_NAMES:
+        return _MONTH_NAMES[text[:3]]
+    if index == 4 and text[:3] in _WEEKDAY_NAMES:
+        return _WEEKDAY_NAMES[text[:3]]
+    try:
+        return int(text)
+    except ValueError:
+        raise ValueError(
+            f"invalid cron field value in {expression!r}: {token!r} "
+            "(use a number, or a three-letter name such as mon or jan)"
+        ) from None
 # A tick that is late by more than this many occurrences records a truncation
 # event instead of creating an unbounded backlog of historical tasks.
 _MAX_CATCHUP = 10
@@ -43,7 +77,16 @@ def every_interval(expression: str) -> timedelta | None:
         return None
     amount = float(match.group(1))
     unit = (match.group(2) or "s").lower()
-    multiplier = 60.0 if unit.startswith("m") else (3600.0 if unit.startswith("h") else 1.0)
+    if unit.startswith("w"):
+        multiplier = 604800.0
+    elif unit.startswith("d"):
+        multiplier = 86400.0
+    elif unit.startswith("m"):
+        multiplier = 60.0
+    elif unit.startswith("h"):
+        multiplier = 3600.0
+    else:
+        multiplier = 1.0
     delta = timedelta(seconds=amount * multiplier)
     if delta <= timedelta(0):
         # A zero-length period would make next_run() return `after` itself.
@@ -70,9 +113,11 @@ def parse_cron(expression: str) -> tuple[set[int], set[int], set[int], set[int],
                 start, end = low, high
             elif "-" in base:
                 first, last = base.split("-", 1)
-                start, end = int(first), int(last)
+                start, end = _field_int(first, index, expression), _field_int(
+                    last, index, expression
+                )
             else:
-                start = int(base)
+                start = _field_int(base, index, expression)
                 if step_text and index == 4 and start == 7:
                     # Weekday 7 is Sunday (0); "7/2" must expand from 0.
                     start = 0
@@ -96,11 +141,9 @@ def parse_cron(expression: str) -> tuple[set[int], set[int], set[int], set[int],
     return tuple(parsed)  # type: ignore[return-value]
 
 
-def _cron_matches(moment: datetime, fields: tuple[set[int], ...]) -> bool:
-    minutes, hours, days, months, weekdays = fields
+def _cron_matches_day(moment: datetime, days: set[int], weekdays: set[int]) -> bool:
+    """Whether the date part of ``moment`` satisfies the day/weekday fields."""
     dow = (moment.weekday() + 1) % 7
-    if moment.minute not in minutes or moment.hour not in hours or moment.month not in months:
-        return False
     days_restricted = days != set(range(1, 32))
     dow_restricted = weekdays != set(range(7))
     if days_restricted and dow_restricted:
@@ -133,12 +176,22 @@ def next_run(kind: str, expression: str, after: datetime) -> datetime:
             raise ValueError("interval seconds must be at least one microsecond")
         return after + delta
     fields = parse_cron(expression)
-    candidate = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    deadline = candidate + timedelta(days=366)
-    while candidate <= deadline:
-        if _cron_matches(candidate, fields):
-            return candidate
-        candidate += timedelta(minutes=1)
+    minutes, hours, days, months, weekdays = fields
+    start = after.replace(second=0, microsecond=0)
+    day = start.replace(hour=0, minute=0)
+    ordered_hours = sorted(hours)
+    ordered_minutes = sorted(minutes)
+    # Walk by day, not by minute: a leap-day expression (0 0 29 2 *) can only
+    # match once every four years, so the old 366-day minute sweep made it
+    # permanently unschedulable. The window must span a full leap cycle.
+    for _ in range(366 * 4 + 1):
+        if day.month in months and _cron_matches_day(day, days, weekdays):
+            for hour in ordered_hours:
+                for minute in ordered_minutes:
+                    candidate = day.replace(hour=hour, minute=minute)
+                    if candidate > after:
+                        return candidate
+        day += timedelta(days=1)
     raise ValueError(f"no matching time found for cron expression: {expression!r}")
 
 
@@ -208,7 +261,7 @@ class Scheduler:
         else:
             schedule_id = row["id"]
             await db.execute(
-                """UPDATE schedules SET kind=?,expression=?,payload=?,enabled=1,next_run_at=?,last_run_at=NULL
+                """UPDATE schedules SET kind=?,expression=?,payload=?,enabled=1,next_run_at=?
                    WHERE id=?""",
                 (kind, expression, _dump(stored), next_at.isoformat(), schedule_id),
             )
