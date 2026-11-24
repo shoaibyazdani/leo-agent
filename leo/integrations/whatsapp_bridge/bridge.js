@@ -47,6 +47,36 @@ const RECONNECT_SLOW_MS = 3_000;
 const MAX_RECONNECTS = 10;
 const PASSKEY_REQUIRED_EXIT = 78;
 const CREDS_DRAIN_LIMIT = 64;
+// Message transport bounds. Text is capped so one JSON body (and one response
+// batch) stays well under MAX_BODY_BYTES / the manager's response cap.
+const MAX_MESSAGE_TEXT_CHARS = 2_000;
+const MAX_QUEUED_MESSAGES = 200;
+const MAX_MESSAGE_BATCH = 10;
+const MAX_MESSAGE_DEDUPE = 500;
+// WhatsApp JIDs are opaque provider ids: an account/device/group identifier
+// followed by "@domain". Accept any non-whitespace, non-control string; the
+// old strict alphabet rejected legitimate modern ids (e.g. LID/device forms).
+const JID_RE = /^[^\s\x00-\x1f]{3,128}$/;
+const MESSAGE_WAIT_MAX_MS = 30_000;
+
+function isJid(value) {
+  return typeof value === 'string' && value.includes('@') && JID_RE.test(value);
+}
+
+function jidShape(value) {
+  if (typeof value !== 'string') return { type: typeof value };
+  const at = value.lastIndexOf('@');
+  const bad = [];
+  for (const char of value) {
+    if (/[\s\x00-\x1f]/.test(char) && bad.length < 5) bad.push(char.codePointAt(0));
+  }
+  return {
+    len: value.length,
+    domain: safeCode(at >= 0 ? value.slice(at + 1) : '', 'none'),
+    has_at: at >= 0,
+    bad,
+  };
+}
 
 const ERR = {
   config: 2,
@@ -109,6 +139,13 @@ const state = {
 };
 
 const waiters = new Set();
+// Inbound direct/group messages, bounded in count and text length. Content is
+// never written to NDJSON logs; only an authenticated /messages caller reads it.
+const messageQueue = [];
+const messageWaiters = new Set();
+const messageIdOrder = [];
+const messageIds = new Set();
+let messageSequence = 0;
 let tokenBytes = Buffer.from(token, 'utf8');
 let socket = null;
 let attempt = 0;
@@ -187,6 +224,150 @@ function setPhase(phase, errorCode = null) {
       waiters.delete(waiter);
       waiter.resolve(snapshot());
     }
+  }
+}
+
+// --- Inbound message queue --------------------------------------------------
+
+function rememberMessageId(id) {
+  // Bounded FIFO dedupe: Baileys may re-deliver after a reconnect.
+  if (messageIds.has(id)) return false;
+  messageIds.add(id);
+  messageIdOrder.push(id);
+  while (messageIdOrder.length > MAX_MESSAGE_DEDUPE) {
+    messageIds.delete(messageIdOrder.shift());
+  }
+  return true;
+}
+
+function unwrapMessage(message) {
+  let current = message;
+  for (let depth = 0; depth < 3 && current; depth += 1) {
+    const wrapped = current.ephemeralMessage?.message
+      || current.viewOnceMessage?.message
+      || current.viewOnceMessageV2?.message
+      || current.documentWithCaptionMessage?.message;
+    if (!wrapped) break;
+    current = wrapped;
+  }
+  return current;
+}
+
+function extractMessageText(message) {
+  const content = unwrapMessage(message);
+  if (!content || typeof content !== 'object') return '';
+  const text = content.conversation
+    ?? content.extendedTextMessage?.text
+    ?? content.imageMessage?.caption
+    ?? content.videoMessage?.caption
+    ?? content.documentMessage?.caption
+    ?? content.buttonsResponseMessage?.selectedDisplayText
+    ?? content.listResponseMessage?.title
+    ?? '';
+  return typeof text === 'string' ? text.slice(0, MAX_MESSAGE_TEXT_CHARS) : '';
+}
+
+function drainMessages(after, limit) {
+  const pending = [];
+  for (const message of messageQueue) {
+    if (message.sequence > after) pending.push(message);
+    if (pending.length >= limit) break;
+  }
+  return pending;
+}
+
+function resolveMessageWaiters() {
+  for (const waiter of [...messageWaiters]) {
+    const messages = drainMessages(waiter.after, waiter.limit);
+    if (!messages.length) continue;
+    clearTimeout(waiter.timer);
+    messageWaiters.delete(waiter);
+    waiter.resolve({
+      messages,
+      sequence: messageSequence,
+      timed_out: false,
+    });
+  }
+}
+
+function pushMessage(message) {
+  if (!rememberMessageId(message.id)) return;
+  messageSequence += 1;
+  message.sequence = messageSequence;
+  messageQueue.push(message);
+  while (messageQueue.length > MAX_QUEUED_MESSAGES) messageQueue.shift();
+  // Never log the content, sender or chat id: only that a message arrived.
+  emit('message_received', { sequence: messageSequence });
+  resolveMessageWaiters();
+}
+
+function handleMessagesUpsert(payload) {
+  if (!payload || !Array.isArray(payload.messages)) return;
+  // 'notify' is a live message; 'append' is history/offline. Both are safe to
+  // surface, but restricted delivery receipts and protocol stubs are skipped.
+  const kind = typeof payload.type === 'string' ? payload.type : '';
+  if (kind && kind !== 'notify' && kind !== 'append') return;
+  if (!payload.messages.length) return;
+  // Sanitized counters only: never a JID, sender, or message text.
+  const stats = {
+    total: payload.messages.length,
+    accepted: 0, from_me: 0, bad_jid: 0, stub: 0, protocol: 0, no_text: 0, bad_id: 0, error: 0,
+  };
+  for (const raw of payload.messages) {
+    try {
+      const key = raw?.key;
+      if (!key) { stats.bad_jid += 1; stats.chat_shape = jidShape(undefined); continue; }
+      if (key.fromMe === true) { stats.from_me += 1; continue; }
+      const chat = isJid(key.remoteJid) ? key.remoteJid : '';
+      if (!chat) {
+        stats.bad_jid += 1;
+        stats.chat_shape = jidShape(key.remoteJid);
+        continue;
+      }
+      if (chat === 'status@broadcast' || chat.endsWith('@broadcast')) { stats.bad_jid += 1; continue; }
+      // In group messages participant is the sender; in direct chats it may be
+      // absent or a device-qualified id, so the chat JID is the safe fallback.
+      const sender = isJid(key.participant) ? key.participant : chat;
+      if (raw?.messageStubType !== undefined && raw?.messageStubType !== null) { stats.stub += 1; continue; }
+      if (raw?.message?.protocolMessage) { stats.protocol += 1; continue; }
+      const id = typeof key.id === 'string' && key.id.length <= 128 ? key.id : '';
+      if (!id) { stats.bad_id += 1; continue; }
+      const text = extractMessageText(raw.message);
+      if (!text.trim()) { stats.no_text += 1; continue; }
+      const seconds = Number(raw.messageTimestamp);
+      const timestamp = Number.isFinite(seconds) && seconds >= 0 && seconds <= MAX_JSON_NUMBER
+        ? Math.floor(seconds) : Math.floor(Date.now() / 1000);
+      // WhatsApp increasingly addresses direct chats by LID. Baileys supplies
+      // the phone-number alternative in *_Alt/senderPn; surface it so the
+      // caller can match its allowlist and reply to the PN JID when present.
+      const chatAlt = isJid(key.remoteJidAlt) ? key.remoteJidAlt : '';
+      const senderAlt = isJid(key.participantAlt) ? key.participantAlt
+        : (isJid(key.senderPn) ? key.senderPn : '');
+      pushMessage({
+        id,
+        chat,
+        sender,
+        chat_alt: chatAlt,
+        sender_alt: senderAlt,
+        text,
+        timestamp,
+        is_group: chat.endsWith('@g.us'),
+      });
+      stats.accepted += 1;
+    } catch {
+      // One malformed message must never break the socket or the stream.
+      stats.error += 1;
+    }
+  }
+  emit('upsert_summary', { kind: safeCode(kind, 'unknown'), ...stats });
+}
+
+function clearMessageQueue() {
+  messageQueue.length = 0;
+  for (const waiter of [...messageWaiters]) {
+    clearTimeout(waiter.timer);
+    messageWaiters.delete(waiter);
+    waiter.resolve({ messages: [], sequence: messageSequence, timed_out: true });
   }
 }
 
@@ -517,6 +698,13 @@ async function openSocket(reconnect = false) {
         setPhase('error', 'connection_handler_failed');
       }
     });
+    sock.ev.on('messages.upsert', (payload) => {
+      try {
+        handleMessagesUpsert(payload);
+      } catch {
+        emit('message_handler_failed', {});
+      }
+    });
     setPhase('waiting_for_qr');
     armQrWatchdog(thisAttempt);
   } catch (err) {
@@ -530,6 +718,7 @@ async function openSocket(reconnect = false) {
 async function cancelAttempt() {
   attempt += 1;
   qrRenderGeneration += 1;
+  clearMessageQueue();
   // Cancelling ends the linked session claim, not just the QR. Callers may
   // not keep reporting `linked` after cancel or re-pair.
   state.linked = false;
@@ -665,6 +854,64 @@ app.post('/wait', jsonBody, (req, res) => {
   waiters.add(waiter);
   waiter.timer = setTimeout(() => done({ ...snapshot(), timed_out: true }), timeoutMs);
   waiter.timer.unref?.();
+});
+
+app.post('/messages', jsonBody, (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const after = body.after;
+  const timeoutMs = body.timeout_ms ?? 1000;
+  const limit = body.limit ?? MAX_MESSAGE_BATCH;
+  if (!Number.isInteger(after) || after < 0 || after > MAX_JSON_NUMBER ||
+      !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > MESSAGE_WAIT_MAX_MS ||
+      !Number.isInteger(limit) || limit < 1 || limit > MAX_MESSAGE_BATCH) {
+    res.status(400).json({ error: 'invalid_request' });
+    return;
+  }
+  const pending = drainMessages(after, limit);
+  if (pending.length || state.stopping) {
+    res.json({ messages: pending, sequence: messageSequence, timed_out: false });
+    return;
+  }
+  const waiter = { after, limit, resolve: null, timer: null };
+  const done = (result) => {
+    clearTimeout(waiter.timer);
+    messageWaiters.delete(waiter);
+    res.json(result);
+  };
+  waiter.resolve = done;
+  messageWaiters.add(waiter);
+  waiter.timer = setTimeout(
+    () => done({ messages: [], sequence: messageSequence, timed_out: true }),
+    timeoutMs,
+  );
+  waiter.timer.unref?.();
+});
+
+app.post('/send', jsonBody, async (req, res, next) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const to = body.to;
+    const text = body.text;
+    if (!isJid(to) ||
+        typeof text !== 'string' || !text.trim() || text.length > MAX_MESSAGE_TEXT_CHARS) {
+      res.status(400).json({ error: 'invalid_request' });
+      return;
+    }
+    if (state.phase !== 'connected' || !state.linked || !socket) {
+      res.status(409).json({ error: 'not_connected' });
+      return;
+    }
+    const sent = await withTimeout(socket.sendMessage(to, { text }), 15_000);
+    const messageId = sent?.key?.id;
+    res.json({
+      ok: true,
+      id: typeof messageId === 'string' ? messageId.slice(0, 128) : null,
+      to,
+    });
+  } catch (err) {
+    // The generic error handler returns a code only; never echo text or JIDs.
+    next(err);
+  }
 });
 
 app.post('/start', jsonBody, (_req, res) => {

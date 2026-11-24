@@ -1,21 +1,38 @@
-# WhatsApp Web device-link bridge (opt-in, not wired in)
+# WhatsApp Web device-link bridge (opt-in)
 
 This directory contains a **standalone, explicitly enabled** bridge that can
 link a personal WhatsApp account via the unofficial WhatsApp Web protocol
 ([Baileys](https://github.com/WhiskeySockets/Baileys)). It is a reimplementation
 from observed protocol behavior, not copied source.
 
-**Status: offline-capable code only.** Nothing in LEO imports or starts this
-bridge automatically. Linking a personal account carries WhatsApp ToS and
-account-ban risk; linked-device credentials are a bearer credential for the
-whole account. A maintainer must make that policy decision before any real
-linking. The existing WhatsApp Cloud API adapter remains the official path.
+**Status: wired behind explicit operator commands.** Nothing starts this
+bridge on app startup or by importing a module. `leo whatsapp link` performs the
+device link; `leo whatsapp serve` runs a fail-closed reply loop that sends
+inbound text through LEO's normal agent turn and returns its answer. Linking a
+personal account carries WhatsApp ToS and account-ban risk; linked-device
+credentials are a bearer credential for the whole account. The existing
+WhatsApp Cloud API adapter remains the official messaging path.
+
+## Commands
+
+```sh
+npm ci                       # one-time, in this directory
+leo whatsapp status          # Node/dependency readiness + saved-credential check
+leo whatsapp link            # QR page; scan from WhatsApp → Linked devices
+leo whatsapp serve --allow +15551234567
+leo whatsapp logout          # unlink and delete saved credentials
+```
+
+`serve` refuses to answer anyone unless at least one `--allow` number (or the
+explicit `--allow-all`) is supplied. Replies use the same model provider and
+environment as `leo chat`; if the provider's env vars are missing it says so at
+startup.
 
 ## Files
 
 | File | Role |
 | --- | --- |
-| `bridge.js` | Node ESM process. Inherits the parent-bound loopback listener FD, Baileys socket, generation-checked QR lifecycle, token-gated HTTP API with no-store responses, sanitized NDJSON events on stdout. Its SHA-256 is pinned in `manager.py`. |
+| `bridge.js` | Node ESM process. Inherits the parent-bound loopback listener FD, Baileys socket, generation-checked QR lifecycle, bounded inbound-message queue and send path, token-gated HTTP API with no-store responses, sanitized NDJSON events on stdout. Its SHA-256 is pinned in `manager.py`. |
 | `package.json` | Pins `@whiskeysockets/baileys` 7.0.0-rc13, `express` 4.21.2, `qrcode` 1.5.4; `npm start` runs the bridge. |
 | `package-lock.json` | Locked transitive dependency graph. Use `npm ci`, not a floating `npm install`, when reproducing a deployment. |
 | `manager.py` | Async Python manager: binds and keeps the listener, verifies the child's FD, pins the Node binary and script digest, owns the random token and per-session auth secret, owns the QR generation/publication watermark and generation-scoped replay ledger, normalizes/stream-limits payloads. |
@@ -111,6 +128,8 @@ responses are `Cache-Control: no-store` and `Vary: Authorization`.
 | `GET /status` | State machine snapshot: `starting`, `waiting_for_qr`, `waiting_for_scan`, `connected`, `logged_out`, `passkey_required`, `error`, `cancelled`. Includes QR metadata but never the raw Baileys QR string. |
 | `GET /qr` | Current QR as a bounded PNG data URI with `expires_at`/`rotation`; 404 when expired or not yet issued. |
 | `POST /wait` | `{after: <sequence>, timeout_ms: 100..30000}` long-poll for a state change. |
+| `POST /messages` | `{after, timeout_ms, limit}` long-poll for inbound text after a monotonic sequence. Bounded queue (200 messages), 2000-char text cap, server-side message-id dedupe. Content is never written to stdout/NDJSON. |
+| `POST /send` | `{to, text}` sends one text through the linked socket; 409 when not connected, 400 on an invalid JID or text. |
 | `POST /start` | Begin a link attempt (idempotent while connected). |
 | `POST /cancel` | Abort the attempt, drop the QR, keep saved credentials. |
 | `POST /re-pair` | `{forget: true}` also removes saved credentials before restarting. Destructive; requires explicit opt-in. Answers `409 creds_drain_failed` instead of success when queued credential saves cannot be proven drained; writes are fenced and no forget is attempted. |

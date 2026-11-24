@@ -44,6 +44,37 @@ Only the environment-variable NAME is stored; the key itself stays in your
 environment (for the launcher, put `export OPENROUTER_API_KEY=...` lines in
 `~/.config/leo/env`).
 
+## WhatsApp device linking and chat (opt-in)
+
+The official WhatsApp Cloud API path needs Meta business credentials. To use a
+**personal** WhatsApp account instead:
+
+```bash
+# one-time: install the pinned Node bridge dependencies
+(cd leo/integrations/whatsapp_bridge && npm ci)
+
+leo whatsapp status                       # readiness + saved-credential check
+leo whatsapp link                         # QR page; scan from Linked devices
+leo whatsapp serve --allow +15551234567   # answer that sender (repeatable)
+```
+
+`link` serves the QR on a short-lived `127.0.0.1` page; credentials stay in
+`.leo/whatsapp/default/` (git-ignored) and are never printed. `serve` runs until
+Ctrl+C, gives each allowed sender a durable LEO conversation, and sends the
+agent's reply back through the same linked session. It is fail closed: with no
+`--allow` and no explicit `--allow-all`, it answers nobody. Messages from the
+linked account itself are ignored (no reply loops), and groups need `--groups`.
+
+Modern WhatsApp may address a contact by a privacy **LID** instead of their
+phone number. `serve` matches the phone-number alternative when Baileys supplies
+it; if the log shows `Ignored message from <digits>`, add those digits as a
+second `--allow` (repeatable). Replies need the same model-provider environment
+as `leo chat`; `LEO_OPENCODE_SESSION` is a non-secret per-instance ID, not a key.
+
+This uses the unofficial WhatsApp Web protocol (Baileys), not the Cloud API,
+and carries WhatsApp ToS/account-ban risk. Inbound text is untrusted content;
+high-risk tool calls still pass through LEO's approval gate.
+
 ## Model configuration
 
 LEO does not hardcode endpoints, model identifiers or credentials. Create
