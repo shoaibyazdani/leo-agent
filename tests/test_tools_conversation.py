@@ -167,24 +167,72 @@ async def test_messages_return_compact_redacted_turns_with_tool_details(tmp_path
     assert secret_turn["truncated"] is True
 
 
-async def test_messages_default_to_latest_conversation_and_fail_truthfully(tmp_path: Path) -> None:
+async def test_messages_use_the_bound_conversation_and_fail_without_one(tmp_path: Path) -> None:
     env = _env(tmp_path)
     await _seed("older", text="older note", updated_at="2020-01-01T00:00:00+00:00")
-    await _seed("newest", text="newest note", updated_at="2026-01-01T00:00:00+00:00")
-    latest = await _run(env, "conversation_messages", {"limit": 5})
-    assert latest["conversation_id"] == "newest"
-    assert "newest note" in latest["messages"][0]["text"]
+    await _seed("bound", text="bound note", updated_at="2026-01-01T00:00:00+00:00")
 
-    failed = await env.executor.execute(ToolCall(
+    bound = await _run(
+        env, "conversation_messages", {"limit": 5}, correlation_id="bound"
+    )
+    assert bound["conversation_id"] == "bound"
+    assert bound["cross_conversation"] is False
+    assert "bound note" in bound["messages"][0]["text"]
+
+    unbound = await env.executor.execute(ToolCall(
+        name="conversation_messages", arguments={"limit": 5}
+    ))
+    assert not unbound.success
+    assert "bound current conversation" in (unbound.error or "")
+
+    missing = await env.executor.execute(ToolCall(
         name="conversation_messages", arguments={"conversation_id": "missing"}
     ))
-    assert not failed.success and "unknown conversation" in (failed.error or "")
+    assert not missing.success and "unknown conversation" in (missing.error or "")
+
+
+async def test_messages_cross_conversation_read_is_capped_and_labelled(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    await _seed("bound", text="mine")
+    await _seed("other", text="theirs", count=80)
+
+    cross = await _run(
+        env, "conversation_messages", {"conversation_id": "other", "limit": 50},
+        correlation_id="bound",
+    )
+    assert cross["cross_conversation"] is True
+    assert cross["window"]["max_messages"] == conversation_tools.MESSAGES_CROSS_WINDOW_MESSAGES
+    assert cross["window"]["max_page_chars"] == conversation_tools.MESSAGES_CROSS_PAGE_CHARS
+    assert cross["count"] <= conversation_tools.MESSAGES_CROSS_LIMIT
+    assert cross["conversation_id"] == "other"
+
+
+async def test_messages_page_stops_at_the_bounded_window(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    ids = await _seed("conv-1", count=20)
+
+    # A window smaller than the transcript: the oldest visible id is the window
+    # floor, and an older cursor is clamped to it.
+    monkey = conversation_tools.MESSAGES_WINDOW_MESSAGES
+    conversation_tools.MESSAGES_WINDOW_MESSAGES = 5
+    try:
+        page = await _run(
+            env, "conversation_messages", {"after_id": 0, "limit": 10},
+            correlation_id="conv-1",
+        )
+    finally:
+        conversation_tools.MESSAGES_WINDOW_MESSAGES = monkey
+
+    assert page["clamped"] is True
+    assert page["window"]["window_start_id"] == ids[-5]
+    assert page["messages"][0]["id"] == ids[-5]
+    assert page["hint"]
 
 
 async def test_no_conversations_is_an_explicit_failure(tmp_path: Path) -> None:
     env = _env(tmp_path)
     failed = await env.executor.execute(ToolCall(name="conversation_messages", arguments={}))
-    assert not failed.success and "no conversations exist" in (failed.error or "")
+    assert not failed.success and "bound current conversation" in (failed.error or "")
     assert not list(env.exports.glob("*"))
 
 
