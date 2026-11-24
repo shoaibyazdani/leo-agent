@@ -1081,14 +1081,26 @@ class LeoApp:
         async def _resolve(approval_id: str, approved: bool, actor: str) -> dict[str, Any]:
             return await self.operator_resolve_approval(approval_id, approved, actor=actor)
 
+        async def _admit(
+            text: str, channel: str, subject: str, message_id: str | None = None,
+        ) -> None:
+            # Only a handler that explicitly names its card is edited in place
+            # (the reasoning menu does). The model picker has its own apply
+            # animation and keeps its existing reply path.
+            await self._admit_slash_from_tap(
+                text, channel, subject, source_message_id=message_id,
+            )
+
         await handle_tap(
             channel, descriptor, settings=self.settings, permissions=self.permissions,
             adapters=self.gateway.adapters, resolve=_resolve,
-            allowed=self._approval_senders(channel),
-            admit=self._admit_slash_from_tap,
+            allowed=self._approval_senders(channel), admit=_admit,
         )
 
-    async def _admit_slash_from_tap(self, text: str, channel: str, subject: str) -> None:
+    async def _admit_slash_from_tap(
+        self, text: str, channel: str, subject: str,
+        *, source_message_id: str | None = None,
+    ) -> None:
         """Relay a keyboard tap as the slash command it stands for.
 
         The split deployment queues ``/model <name>`` so the brain — which owns
@@ -1119,10 +1131,16 @@ class LeoApp:
         adapter = self.gateway.adapters.get(channel)
         if reply and adapter is not None:
             markup = getattr(result, "data", {}).get("reply_markup")
-            await adapter.send(
-                subject, reply,
-                reply_markup=dict(markup) if isinstance(markup, Mapping) else None,
-            )
+            keyboard = dict(markup) if isinstance(markup, Mapping) else None
+            edited = False
+            edit = getattr(adapter, "edit_message_text", None)
+            if source_message_id and callable(edit):
+                try:
+                    edited = bool(await edit(subject, source_message_id, reply, keyboard))
+                except Exception:  # a failed edit falls back to a new message
+                    edited = False
+            if not edited:
+                await adapter.send(subject, reply, reply_markup=keyboard)
 
     async def _store_channel_attachment(self, channel: str, descriptor: dict[str, Any]) -> str | None:
         """Download a channel's file and store it, returning the attachment id.

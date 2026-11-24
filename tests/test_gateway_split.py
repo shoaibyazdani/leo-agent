@@ -109,12 +109,17 @@ async def test_turn_lease_excludes_another_holder():
 class _FakeAdapter:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.edits: list[tuple[str, str, str, dict]] = []
         self.markup: dict | None = None
 
     async def send(self, target: str, text: str, **kwargs) -> dict:
         self.sent.append((target, text))
         self.markup = kwargs.get("reply_markup")
         return {"ok": True}
+
+    async def edit_message_text(self, target, message_id, text, reply_markup=None) -> bool:
+        self.edits.append((str(target), str(message_id), str(text), dict(reply_markup or {})))
+        return True
 
 
 def _api(store: GatewayStore, token: str = "t0ken", adapters: dict | None = None):
@@ -328,3 +333,29 @@ async def test_an_answer_without_a_keyboard_keeps_a_text_only_adapter_working():
 
     assert done["delivered"] is True
     assert adapter.markup is None
+
+
+async def test_an_answer_can_replace_the_tapped_menu_card():
+    """A reasoning tap edits its own card; it must not post a second full menu."""
+    store = GatewayStore()
+    adapter = _FakeAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000001",
+        payload=payload(text="/reasoning high", mid="cb-1"),
+    )
+    keyboard = {"inline_keyboard": [[{"text": "medium", "callback_data": "rsn:level:medium"}]]}
+
+    async with _client(api) as client:
+        await client.post("/v1/claim", json={"worker": "w1"})
+        done = (await client.post("/v1/complete", json={
+            "admission_id": admission_id,
+            "answer": "Reasoning effort: high",
+            "conversation_id": "conv_reasoning",
+            "reply_markup": keyboard,
+            "edit_message_id": "77",
+        })).json()
+
+    assert done["delivered"] is True
+    assert adapter.sent == []
+    assert adapter.edits == [("100000001", "77", "Reasoning effort: high", keyboard)]

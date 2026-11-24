@@ -67,11 +67,14 @@ class GatewayClient:
 
     async def complete(self, admission_id: str, answer: str,
                        conversation_id: str = "",
-                       reply_markup: dict[str, Any] | None = None) -> dict[str, Any]:
+                       reply_markup: dict[str, Any] | None = None,
+                       edit_message_id: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"admission_id": admission_id, "answer": answer,
                                 "conversation_id": conversation_id}
         if reply_markup:
             body["reply_markup"] = reply_markup
+        if edit_message_id:
+            body["edit_message_id"] = edit_message_id
         response = await self._http().post("/v1/complete", json=body)
         if response.status_code != 200:
             raise GatewayClientError(f"complete failed: HTTP {response.status_code}")
@@ -292,9 +295,12 @@ async def _claim_loop(
                                       retry=False)
                 except (httpx.HTTPError, GatewayClientError):
                     pass
-            await client.complete(admission_id, answer,
-                                  str(result.get("conversation_id") or ""),
-                                  reply_markup=_answer_markup(result))
+            await client.complete(
+                admission_id, answer,
+                str(result.get("conversation_id") or ""),
+                reply_markup=_answer_markup(result),
+                edit_message_id=payload.get("source_message_id") or None,
+            )
             answered += 1
         except asyncio.CancelledError:
             raise
