@@ -83,9 +83,9 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "tests/test_harden_config.py": {
         "185": "synthetic sk-ant fixture",
         "196": "synthetic sk fixture",
-        "280": "synthetic invalid-token parameter",
+        "280-281": "synthetic invalid-token parameter",
         "313-334": "synthetic multi-provider fixtures",
-        "430-446": "synthetic provider fixtures and hex fixture",
+        "430-458": "synthetic provider fixtures and hex fixture",
     },
     "tests/channels/test_bluebubbles.py": {"23": "test fixture", "25": "test fixture"},
     "tests/channels/test_credential_enrollment.py": {"70": "test fixture", "153": "test fixture"},

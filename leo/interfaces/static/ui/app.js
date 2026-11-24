@@ -155,7 +155,11 @@
     const pill = $('health-pill'), rail = $('rail-status');
     pill.className = `status ${ok ? 'status--live' : 'status--danger'}`;
     pill.querySelector('.status__dot').style.background = ok ? 'var(--accent)' : 'var(--danger)';
-    $('health-text').textContent = h.__error ? 'OFFLINE' : `${h.status === 'ok' ? 'HEALTHY' : String(h.status || 'unknown').toUpperCase()} · ${h.default_provider || '—'}`;
+    // Name the real upstream provider and model. The legacy `default_provider`
+    // is a catalog slot key, which on a single-gateway install is the model id
+    // itself — printing it here read as "provider: deepseek-v4.1-flash".
+    const label = h.provider ? `${h.provider} / ${h.model || h.default_provider}` : (h.model || h.default_provider || '—');
+    $('health-text').textContent = h.__error ? 'OFFLINE' : `${h.status === 'ok' ? 'HEALTHY' : String(h.status || 'unknown').toUpperCase()} · ${label}`;
     rail.className = `status ${ok ? 'status--live' : 'status--danger'}`;
     $('rail-status-text').textContent = ok ? 'Runtime healthy' : 'Runtime unavailable';
     $('rail-meta').textContent = `LOCAL · ${h.version ? 'v' + h.version : 'v0.1.0'}`;
@@ -296,13 +300,27 @@
   }
 
   function renderProviders() {
-    // Rendered independently of usage: a fresh install has providers but no
-    // measured calls, and the Providers tab must still be populated.
-    const providers = state.data.health?.providers || {};
-    const entries = Object.entries(providers);
+    // Rendered independently of usage: a fresh install has models but no
+    // measured calls, and the Models tab must still be populated.
+    // `health.providers` is the legacy slot->model map, so its keys are model
+    // ids, not providers. Group the catalog by its real upstream provider.
+    const catalog = Array.isArray(state.data.health?.catalog) ? state.data.health.catalog : [];
+    const defaultSlot = state.data.health?.default_provider;
+    const entries = catalog.length
+      ? catalog
+      : Object.entries(state.data.health?.providers || {}).map(([name, model]) => ({
+          name, model: typeof model === 'string' ? model : model?.model || '', provider: null, enabled: true,
+        }));
+    const groups = new Map();
+    for (const entry of entries) {
+      const key = entry.provider || 'unknown provider';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(entry);
+    }
+    const showSlot = entries.length < 10;
     $('provider-list').innerHTML = entries.length
-      ? `<div class="list">${entries.map(([name, model]) => `<div class="row"><span class="row__icon">${ico('models')}</span><span><span class="row__title">${esc(name)}</span><br/><span class="row__meta">${esc(typeof model === 'string' ? model : model?.model || 'no model')}</span></span><span>${badge('configured')}</span></div>`).join('')}</div>`
-      : '<div class="empty"><span class="empty__title">No providers configured</span><span class="empty__text">Add a provider in leo.yaml to enable model calls.</span></div>';
+      ? `<div class="list">${[...groups].map(([provider, models]) => `<div class="row"><span class="row__icon">${ico('models')}</span><span><span class="row__title">${esc(provider)}</span><br/><span class="row__meta">${models.length} model${models.length === 1 ? '' : 's'}${showSlot ? ' · ' + models.map((m) => esc(m.model || m.name) + (m.enabled === false ? ' (off)' : '')).join(', ') : ''}</span></span><span>${badge(models.some((m) => m.name === defaultSlot) ? 'default' : 'configured')}</span></div>`).join('')}</div>`
+      : '<div class="empty"><span class="empty__title">No models configured</span><span class="empty__text">Add a provider in leo.yaml to enable model calls.</span></div>';
   }
 
   function renderModels() {

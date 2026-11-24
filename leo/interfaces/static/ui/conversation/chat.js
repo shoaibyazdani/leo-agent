@@ -217,15 +217,20 @@
   function clearBanners() { $('chat-banners').replaceChildren(); }
 
   function updateModelCard(health) {
-    const name = health.default_provider || '—';
-    const provider = health.providers?.[name];
-    const model = typeof provider === 'string' ? provider : (provider?.model || '');
-    $('chat-model-name').textContent = model ? `${name} / ${model}` : name;
+    // `default_provider` is a catalog slot key; on a single-gateway install it
+    // equals the model id, so it must not be shown as the provider name.
+    const slot = health.default_provider || '—';
+    const upstream = health.provider || '';
+    const fromMap = health.providers?.[slot];
+    const model = health.model
+      || (typeof fromMap === 'string' ? fromMap : (fromMap?.model || ''))
+      || slot;
+    $('chat-model-name').textContent = upstream ? `${upstream} / ${model}` : model;
     const ok = health.status === 'ok';
     const badge = $('chat-live-badge');
     badge.className = `status ${ok ? 'status--live' : 'status--danger'}`;
     $('chat-live-text').textContent = ok ? 'live' : 'offline';
-    $('chat-session-provider').textContent = name;
+    $('chat-session-provider').textContent = upstream || '—';
     $('chat-session-tools').textContent = health.tools ?? '—';
     $('chat-session-skills').textContent = health.skills ?? '—';
     $('chat-session-agents').textContent = health.agents ?? '—';
@@ -1724,7 +1729,10 @@
     }, { passive: false });
     const count = Object.keys(providers).length;
     const textEl = dialog.querySelector('.modal__text');
-    if (textEl) textEl.textContent = `${count} providers configured · click a model to switch. The choice is saved to leo.yaml.`;
+    if (textEl) {
+      const upstream = health.provider ? ` on ${health.provider}` : '';
+      textEl.textContent = `${count} model${count === 1 ? '' : 's'}${upstream} configured · click one to switch. The choice is saved to leo.yaml.`;
+    }
 
     let selecting = false;
     const rows = [];

@@ -253,9 +253,91 @@ def test_completion_summary_is_readable_not_raw_json():
     assert "refactor the gateway" in text
     assert "Moved the poll loop" in text
     assert "leo/gateway/server.py" in text
-    assert "Evidence: 1" in text
+    # Evidence bookkeeping is not part of a readable report.
+    assert "Evidence:" not in text
     # Not a dump: no braces from json.dumps.
     assert "{" not in text and "}" not in text
+
+
+def test_scheduled_research_answer_reaches_the_delivery_summary():
+    """A scheduled worker's AgentResult dump answers under "output".
+
+    A cron objective completes with the agent result serialized to a dict; the
+    prose lives in "output". Ignoring that key delivered a header and the
+    objective with no work in it, so the digest is asserted explicitly.
+    """
+    from leo.core.app import LeoApp
+
+    digest = "Yesterday in Pakistan: " + ("x" * 2500)
+    task = SimpleNamespace(
+        id="task_digest",
+        objective="Yesterday's Pakistan news summary",
+        status="completed",
+        result={"agent_id": "research", "success": True, "output": digest, "evidence": []},
+        errors=[],
+        evidence=[{"source": "agent_engine"}],
+    )
+    text = LeoApp._task_summary(task, "completed")
+    assert "Yesterday in Pakistan" in text
+    # A digest is the deliverable, so it is not cut down to a footnote.
+    assert len(text) > 1200
+
+
+def test_structured_output_is_serialized_not_silently_dropped():
+    from leo.core.app import LeoApp
+
+    task = SimpleNamespace(
+        id="task_struct",
+        objective="summarize",
+        status="completed",
+        result={"output": {"headline": "Budget passed", "count": 3}},
+        errors=[],
+        evidence=[],
+    )
+    text = LeoApp._task_summary(task, "completed")
+    assert "Budget passed" in text
+
+
+def test_scheduled_report_is_labelled_and_not_cut_mid_word():
+    """The delivered message names the job and never cuts mid-word.
+
+    This is the exact shape of the 10am news delivery: a long objective, a
+    schedule name in metadata, evidence rows and a 2100-char digest. The old
+    output led with a 36-char task id, printed a truncated objective ending in
+    "The News, " before the report, and ended on a dangling fragment.
+    """
+    from leo.core.app import LeoApp
+
+    digest = "Today is Tue 24 Nov 2026 (PKT); yesterday = Mon 23 Nov 2026.\n\n" + (
+        "Coalition row deepens over new provinces. " * 60
+    )
+    task = SimpleNamespace(
+        id="task_2843050c082d4669940e9bbee8c03bf9",
+        objective=(
+            "Compile a summary of yesterday's news in Pakistan and deliver it. Work out "
+            "yesterday's actual date first and gather the day's major Pakistan news: "
+            "politics, economy, security, courts, and any big national story."
+        ),
+        status="completed",
+        metadata={"schedule": "pakistan-news-10am"},
+        result={"agent_id": "research", "success": True, "output": digest, "evidence": []},
+        errors=[],
+        evidence=[{"source": "agent_engine"}, {"source": "http_get"}],
+    )
+    text = LeoApp._task_summary(task, "completed")
+    first = text.splitlines()[0]
+    # The headline is the job name, not the raw row id.
+    assert "Pakistan news 10am" in first
+    assert "task_2843050c" not in first
+    # The objective is no longer printed as a truncated, comma-dangling prefix.
+    assert "Objective:" not in text
+    assert not text.splitlines()[1].endswith(",")
+    # The report is separated from the header by a blank line.
+    assert text.split("\n")[1] == ""
+    # No stray bookkeeping footer.
+    assert "Evidence:" not in text
+    # Any truncation is marked, and the text does not end mid-word.
+    assert "…" in text or text.endswith(tuple(".!?\"'”)"))
 
 
 def test_failed_summary_names_the_blocker():

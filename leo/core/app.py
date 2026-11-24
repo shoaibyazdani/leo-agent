@@ -14,7 +14,7 @@ from typing import Any, AsyncIterator
 
 from .. import db
 from ..commands import create_registry
-from ..config import Settings
+from ..config import Settings, upstream_provider
 from ..contracts import (
     ChatMessage, MemoryCategory, MemoryKind, MemoryRecord, ModelRequest,
     StreamChunk, ToolCall, new_id, utcnow,
@@ -823,6 +823,35 @@ class LeoApp:
         return LeoApp._task_summary(task, status)
 
     @staticmethod
+    def _clip(text: str, limit: int) -> str:
+        """Truncate on a word boundary, because a cut mid-word reads as a bug.
+
+        The delivered digest used to end "...The News, " and start an objective
+        with a dangling comma, which looks like data corruption rather than
+        truncation. An explicit ellipsis makes the cut intentional.
+        """
+        text = str(text).strip()
+        if len(text) <= limit:
+            return text
+        head = text[:limit]
+        cut = head.rfind(" ")
+        if cut > limit * 0.6:
+            head = head[:cut]
+        return head.rstrip(" ,;:-—") + "…"
+
+    @staticmethod
+    def _delivery_label(task: Any) -> str:
+        """A human name for the job, from the schedule that queued it."""
+        metadata = getattr(task, "metadata", None)
+        if not isinstance(metadata, dict):
+            return ""
+        name = str(metadata.get("schedule") or "").strip()
+        # "pakistan-news-10am" -> "Pakistan news 10am": separators softened and
+        # the first letter raised, so the headline does not open lowercase.
+        label = name.replace("-", " ").replace("_", " ").strip()
+        return label[:1].upper() + label[1:] if label else ""
+
+    @staticmethod
     def _task_summary(task: Any, status: str) -> str:
         """A completion report a human can read, not the raw result JSON.
 
@@ -837,17 +866,39 @@ class LeoApp:
         verb = {"completed": "Completed", "cancelled": "Cancelled", "failed": "Failed"}.get(
             status, status or "Finished"
         )
-        lines = [f"{icon} **{verb}** · `{task_id}`"]
-        if objective:
-            lines.append(f"Objective: {objective[:300]}")
+        # The headline names the job, never a 36-char row id: on a phone the
+        # operator recognises "Pakistan news 10am", not "task_2843050c...".
+        schedule_label = LeoApp._delivery_label(task)
+        label = schedule_label or LeoApp._clip(objective, 90) or task_id
+        lines = [f"{icon} **{verb}** · {label}"]
 
         # A plain string result is already the answer; a dict is summarized.
         if isinstance(result, str) and result.strip():
-            lines.append(result.strip()[:1200])
+            lines.extend(["", LeoApp._clip(result, 1200)])
         elif isinstance(result, dict):
-            answer = result.get("content") or result.get("summary") or result.get("result")
+            answer = (
+                result.get("content")
+                or result.get("summary")
+                or result.get("result")
+                # A scheduled worker stores the AgentResult dump, whose answer
+                # lives under "output". Without this the delivered message was
+                # a header and the objective with no actual work in it.
+                or result.get("output")
+            )
+            if not isinstance(answer, str) and answer is not None:
+                # "output" is whatever the model produced: a JSON object for a
+                # structured answer, not always prose. Serialize it rather than
+                # silently delivering an empty report.
+                try:
+                    answer = json.dumps(answer, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    answer = str(answer)
             if isinstance(answer, str) and answer.strip():
-                lines.append(answer.strip()[:1200])
+                # A digest is the deliverable, not a footnote: 1200 chars cut a
+                # news summary off mid-story. The 4000-char total cap still holds.
+                # A blank line separates the answer from the header so it reads
+                # as the report rather than another header field.
+                lines.extend(["", LeoApp._clip(answer, 3000)])
             files = result.get("files") or result.get("files_modified")
             if isinstance(files, list) and files:
                 shown = ", ".join(str(item) for item in files[:10])
@@ -860,9 +911,12 @@ class LeoApp:
         if errors:
             last = errors[-1]
             detail = last.get("error") if isinstance(last, dict) else last
-            lines.append(f"Blocker: {str(detail)[:400]}")
+            lines.append(f"Blocker: {LeoApp._clip(str(detail), 400)}")
+        # A count of evidence rows is bookkeeping, not information the operator
+        # can use; it was arriving as a stray "Evidence: 2 item(s)" line on every
+        # report, so it is only shown when there is genuinely nothing else.
         evidence = getattr(task, "evidence", None) or []
-        if evidence:
+        if evidence and len(lines) == 1:
             lines.append(f"Evidence: {len(evidence)} item(s)")
         return "\n".join(lines)[:4000]
 
@@ -1036,9 +1090,17 @@ class LeoApp:
         # The outbox id is the stable idempotency key: a retried drain can
         # replay the same external send without delivering it twice.
         idempotency_key = payload.get("idempotency_key") or payload.get("outbox_id")
+        # A slash command answer can carry an inline keyboard (the /model picker
+        # is one). It belongs on the message the chat receives, otherwise the
+        # text arrives and the buttons never do.
+        command_result = answer.get("command_result")
+        markup = command_result.get("data", {}).get("reply_markup") if isinstance(
+            command_result, Mapping) else None
+        reply_markup = dict(markup) if isinstance(markup, Mapping) else None
         sent = await self.gateway.send(
             channel, str(target), str(answer.get("content") or ""),
             subject=str(subject), idempotency_key=idempotency_key,
+            reply_markup=reply_markup,
         )
         delivered = bool(sent.get("success", False)) if isinstance(sent, dict) else False
         if not delivered:
@@ -3212,12 +3274,31 @@ class LeoApp:
         )
 
     async def health(self) -> dict[str, Any]:
+        # ``providers`` is the legacy slot->model map: with one gateway each key
+        # is a MODEL id, so presenting those keys as providers is what made the
+        # dashboard claim 31 providers. ``provider``/``model`` name the real
+        # upstream service and the default model, and ``catalog`` lists every
+        # slot with its true provider.
+        slots = self.settings.models.providers
+        default_slot = self.settings.models.default
+        default_cfg = slots.get(default_slot)
         report: dict[str, Any] = {
             "status": "ok" if self.initialized else "not-initialized",
             "version": "0.1.0",
             "db": str(self.settings.db_path),
-            "providers": {name: p.model for name, p in self.settings.models.providers.items()},
-            "default_provider": self.settings.models.default,
+            "providers": {name: p.model for name, p in slots.items()},
+            "default_provider": default_slot,
+            "provider": upstream_provider(default_cfg),
+            "model": str(getattr(default_cfg, "model", "") or default_slot),
+            "catalog": [
+                {
+                    "name": name,
+                    "model": str(cfg.model or name),
+                    "provider": upstream_provider(cfg),
+                    "enabled": bool(cfg.enabled),
+                }
+                for name, cfg in sorted(slots.items())
+            ],
         }
         if self.initialized:
             # Count only executable registrations: a spec with no callable

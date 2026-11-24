@@ -21,6 +21,7 @@ from leo.config import (
     ModelProviderConfig,
     Settings,
     _parse_env_bool,
+    upstream_provider,
 )
 from leo.contracts import (
     MemoryCategory,
@@ -470,3 +471,70 @@ def test_redaction_leaves_ordinary_text_and_urls_untouched():
     assert "hunter2" not in cleaned["url"]
     assert "[REDACTED]" in cleaned["url"]
     assert cleaned["count"] == 2
+
+
+# --------------------------------------------------------------------------- provider identity
+
+
+def test_upstream_provider_names_the_service_not_the_model_slot():
+    """A slot keyed by a model id must not be reported as a provider.
+
+    The live install keys `models.providers` by model id (one gateway serves
+    them all), so `health.providers` used to advertise 31 "providers" that were
+    really 31 models on opencode.ai. Deriving the host is what makes status
+    truthful without rewriting leo.yaml.
+    """
+    cfg = ModelProviderConfig(
+        kind="openai-compatible", model="deepseek-v4.1-flash",
+        base_url="https://opencode.ai/zen/go",
+    )
+    assert upstream_provider(cfg) == "opencode.ai"
+
+
+def test_upstream_provider_prefers_an_explicit_provider_name():
+    cfg = ModelProviderConfig(
+        kind="openai-compatible", model="deepseek-v4.1-flash",
+        base_url="https://opencode.ai/zen/go", provider="opencode-go",
+    )
+    assert upstream_provider(cfg) == "opencode-go"
+
+
+def test_upstream_provider_strips_api_prefix_and_reports_mock():
+    assert upstream_provider(
+        ModelProviderConfig(base_url="https://api.groq.com/openai/v1")
+    ) == "groq.com"
+    assert upstream_provider(ModelProviderConfig(kind="mock")) == "mock"
+
+
+def test_upstream_provider_returns_none_rather_than_inventing_a_name():
+    assert upstream_provider(None) is None
+    assert upstream_provider(ModelProviderConfig(model="orphan")) is None
+
+
+def test_health_catalog_reports_one_provider_for_a_shared_gateway(tmp_path):
+    """Slots on one gateway resolve to one provider, not N model-named providers."""
+    from leo.config import PathConfig
+
+    settings = Settings()
+    settings.paths = PathConfig(data=tmp_path / "data", logs=tmp_path / "logs")
+    settings.models.providers = {
+        "deepseek-v4.1-flash": ModelProviderConfig(
+            kind="openai-compatible", model="deepseek-v4.1-flash",
+            base_url="https://opencode.ai/zen/go",
+        ),
+        "glm-5.3": ModelProviderConfig(
+            kind="openai-compatible", model="glm-5.3",
+            base_url="https://opencode.ai/zen/go",
+        ),
+    }
+    settings.models.default = "deepseek-v4.1-flash"
+
+    entries = [
+        {"name": name, "model": cfg.model, "provider": upstream_provider(cfg), "enabled": cfg.enabled}
+        for name, cfg in sorted(settings.models.providers.items())
+    ]
+    assert {entry["provider"] for entry in entries} == {"opencode.ai"}
+    # The default slot is a model, so the reported model must be the model id.
+    default_cfg = settings.models.providers[settings.models.default]
+    assert upstream_provider(default_cfg) == "opencode.ai"
+    assert str(default_cfg.model) == "deepseek-v4.1-flash"

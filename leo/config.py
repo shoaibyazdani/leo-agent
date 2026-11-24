@@ -73,6 +73,44 @@ def _is_opencode_inference_gateway(url: str | None) -> bool:
     return host == "opencode.ai" and path == "/inference/go/anthropic"
 
 
+def upstream_provider(config: Any) -> str | None:
+    """Name the service that actually serves a model slot's requests.
+
+    Explicit ``provider:`` wins. Otherwise the base_url host is the evidence we
+    have: a slot keyed ``deepseek-v4.1-flash`` pointed at
+    ``https://opencode.ai/zen/go`` is a model ON opencode.ai, not a provider
+    called "deepseek-v4.1-flash". Returns ``None`` when neither exists rather
+    than inventing a name.
+    """
+    if config is None:
+        return None
+    explicit = getattr(config, "provider", None)
+    if not explicit and isinstance(config, dict):
+        explicit = config.get("provider")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    kind = getattr(config, "kind", None)
+    if not kind and isinstance(config, dict):
+        kind = config.get("kind")
+    if str(kind or "").strip().lower() == "mock":
+        return "mock"
+    base_url = getattr(config, "base_url", None)
+    if not base_url and isinstance(config, dict):
+        base_url = config.get("base_url")
+    if not base_url:
+        return None
+    try:
+        host = (urlparse(str(base_url)).hostname or "").lower()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    for prefix in ("api.", "www."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    return host or None
+
+
 def _validate_env_name(field: str, value: str | None) -> str | None:
     if value is None:
         return None
@@ -197,10 +235,23 @@ class SecurityConfig(BaseModel):
 
 
 class ModelProviderConfig(BaseModel):
+    """One model slot on one upstream service.
+
+    The dict key in ``models.providers`` names the SLOT, which in a
+    single-gateway install is the model id itself (``deepseek-v4.1-flash``).
+    It is not a provider: one gateway (``base_url``) can serve every slot.
+    ``provider`` names that upstream service explicitly; when it is omitted,
+    :func:`upstream_provider` falls back to the base_url host so status output
+    can still name the real provider instead of echoing a model id.
+    """
+
     kind: str = "anthropic-compatible"  # anthropic-compatible | openai-compatible | mock
     base_url: str | None = None
     api_key_env: str | None = None
     model: str = ""
+    # Upstream provider name, e.g. "opencode-go". Optional: derived from
+    # base_url when absent, so no config has to be rewritten to be truthful.
+    provider: str | None = None
     capabilities: list[str] = Field(
         default_factory=lambda: ["text", "streaming", "tools", "structured", "usage"]
     )

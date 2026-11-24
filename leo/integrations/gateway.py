@@ -128,6 +128,23 @@ def _poll_accepts_state(poll: Any) -> bool:
     return len(params) >= 1
 
 
+def _send_accepts_markup(send: Any) -> bool:
+    """True when a bound adapter send() takes a ``reply_markup`` keyword.
+
+    Most adapters predate inline keyboards and only accept ``(target, text)``.
+    Passing the keyword unconditionally turned every keyboard-carrying reply
+    into a ``TypeError`` that the delivery path reported as a failed send, so
+    the picker silently arrived without its buttons.
+    """
+    try:
+        params = inspect.signature(send).parameters
+    except (TypeError, ValueError):
+        return False
+    if "reply_markup" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 class Gateway:
     """Unified conversation store and inbound/outbound channel router."""
 
@@ -898,6 +915,7 @@ class Gateway:
         idempotency_key: str | None = None,
         media: str | Path | None = None,
         caption: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Send one outbound message through the channel's adapter.
 
@@ -968,7 +986,10 @@ class Gateway:
                     root=self.outbound_media_root,
                 )
             else:
-                result = await adapter.send(target, text)
+                extra = {"reply_markup": reply_markup} if (
+                    reply_markup and _send_accepts_markup(adapter.send)
+                ) else {}
+                result = await adapter.send(target, text, **extra)
             if not isinstance(result, Mapping):
                 raise MessagingError(f"{channel} adapter returned an invalid send result")
         except Exception as exc:
