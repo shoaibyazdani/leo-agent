@@ -83,12 +83,12 @@ async def test_the_first_step_sends_one_message_and_later_steps_edit_it(env) -> 
     assert len(env.adapter.edits) == 1
     target, _message_id, edited = env.adapter.edits[0]
     assert target == "100000001"
-    assert edited.startswith("⏳"), edited
+    assert edited.startswith("🛠"), edited
     assert "2 steps" in edited, edited
     # Each row is glyph + monospace label + monospace detail, so the columns
     # read as a set rather than as prose.
-    assert "❯ `shell`" in edited, edited
-    assert "✎ `write_file`" in edited, edited
+    assert "✓ `shell`" in edited, edited
+    assert "✓ `write_file`" in edited, edited
     assert "`leo/app.py`" in edited, edited
 
 
@@ -310,17 +310,17 @@ def test_a_shell_command_shows_the_work_not_its_preamble(env) -> None:
     reporter.begin_sync = None  # not part of this assertion
     from leo.integrations.progress import _step_line
 
-    assert _step_line("shell", {"command": "cd /root/ws && pytest -q"}, None) == "❯ `shell` `pytest -q`"
+    assert _step_line("shell", {"command": "cd /root/ws && pytest -q"}, None) == "✓ `shell` `pytest -q`"
     # `set`/`source`/`cd` chains reduce to the last clause, which is the real work.
-    assert _step_line("shell", {"command": "cd /w && set -a && pytest -q"}, None) == "❯ `shell` `pytest -q`"
+    assert _step_line("shell", {"command": "cd /w && set -a && pytest -q"}, None) == "✓ `shell` `pytest -q`"
     # A single command with no chain keeps its own text.
-    assert _step_line("shell", {"command": "git status"}, None) == "❯ `shell` `git status`"
+    assert _step_line("shell", {"command": "git status"}, None) == "✓ `shell` `git status`"
 
 
 def test_a_step_with_no_detail_does_not_dangle(env) -> None:
     from leo.integrations.progress import _step_line
 
-    assert _step_line("list_files", {}, None) == "◦ `list_files`"
+    assert _step_line("list_files", {}, None) == "✓ `list_files`"
 
 
 async def test_an_unchanged_edit_does_not_open_a_second_message(env) -> None:
@@ -362,6 +362,49 @@ async def test_an_unchanged_edit_does_not_open_a_second_message(env) -> None:
     await reporter._flush(force=True)
 
     assert len(adapter.sent) == 1, f"one turn opened {len(adapter.sent)} messages"
+
+
+async def test_the_models_status_sentence_sits_above_the_work(env) -> None:
+    """The Claude-style half: what it found and is doing, not only tool rows."""
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    reporter.narrate("Found the quoted-operator bug; patching the splitter now.")
+    reporter.note("shell", {"command": "pytest -q"})
+    await reporter._flush(force=True)
+
+    text = env.adapter.sent[0][1]
+    assert "📍 Found the quoted-operator bug; patching the splitter now." in text, text
+    assert text.index("📍") < text.index("✓ `shell`"), "the story comes before the log"
+
+
+async def test_only_the_latest_narration_is_shown(env) -> None:
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    reporter.narrate("Reading the config loader.")
+    reporter.narrate("Found it; patching the parser now.")
+    reporter.note("shell", {"command": "pytest -q"})
+    await reporter._flush(force=True)
+
+    text = env.adapter.sent[0][1]
+    assert "Found it; patching the parser now." in text, text
+    assert "Reading the config loader." not in text, "one line, latest wins"
+
+
+async def test_narration_is_one_clean_redacted_line(env) -> None:
+    reporter = env.reporter
+    await reporter.begin("telegram", "100000001")
+    token = "sk-" + "y" * 24
+    reporter.narrate(f"**Found it** — token: {token}\nthis second line must not appear")
+    reporter.note("shell", {"command": "ls"})
+    await reporter._flush(force=True)
+
+    text = env.adapter.sent[0][1]
+    narration = next(line for line in text.splitlines() if line.startswith("📍"))
+    assert "📍 Found it" in narration, text
+    assert "**" not in narration, "Telegram legacy Markdown markers are stripped"
+    assert "sk-" not in text, "a secret must never reach the chat"
+    assert "[redacted]" in text, text
+    assert "second line" not in text, "the card has one narration line"
 
 
 async def test_repeated_calls_collapse_into_one_row(env) -> None:
