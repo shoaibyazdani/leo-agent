@@ -55,12 +55,26 @@ class ContextOptimizer:
         max_memories: int = 5,
         compact: bool = True,
         min_memory_score: float = 0.0,
+        *,
+        max_message_chars: int = 12_000,
+        protect_head_messages: int = 2,
+        protect_head_tokens: int = 4_000,
+        protect_tail_messages: int = 2,
+        protect_tail_tokens: int = 6_000,
     ) -> None:
         self.memory_selector = memory_selector
         self.tool_output_chars = max(0, tool_output_chars)
         self.max_memories = max(0, max_memories)
         self.compact = compact
         self.min_memory_score = max(0.0, float(min_memory_score))
+        # The first user ask and the newest work are the two regions a long turn
+        # must not lose. They are kept verbatim while the middle is trimmed or
+        # summarized; extreme budgets may still evict them, oldest head first.
+        self.max_message_chars = max(0, int(max_message_chars))
+        self.protect_head_messages = max(0, int(protect_head_messages))
+        self.protect_head_tokens = max(0, int(protect_head_tokens))
+        self.protect_tail_messages = max(0, int(protect_tail_messages))
+        self.protect_tail_tokens = max(0, int(protect_tail_tokens))
 
     def deduplicate(self, messages: list[ChatMessage]) -> list[ChatMessage]:
         """Drop exact duplicate messages, preserving first occurrence and order.
@@ -262,6 +276,112 @@ class ContextOptimizer:
             return {index}
         return {index}
 
+    @staticmethod
+    def _tokens(messages: list[ChatMessage]) -> int:
+        return sum(estimate_tokens(m.content) for m in messages)
+
+    def _align_head_end(self, body: list[ChatMessage], head_end: int) -> int:
+        """Move a head boundary forward so it never splits a tool group."""
+        while 0 < head_end < len(body):
+            group = self._tool_group(body, head_end - 1)
+            if max(group) < head_end:
+                break
+            head_end = max(group) + 1
+        return min(head_end, len(body))
+
+    def _align_tail_start(self, body: list[ChatMessage], tail_start: int) -> int:
+        """Move a tail boundary back over any tool group it would split."""
+        changed = True
+        while changed:
+            changed = False
+            for index in range(max(0, tail_start), len(body)):
+                group = self._tool_group(body, index)
+                if min(group) < tail_start:
+                    tail_start = min(group)
+                    changed = True
+                    break
+                opener = self._nearest_tool_opener(body, index)
+                if opener is not None and opener < tail_start:
+                    tail_start = opener
+                    changed = True
+                    break
+        return max(0, tail_start)
+
+    def _protected_bounds(self, body: list[ChatMessage]) -> tuple[int, int]:
+        """Return ``(head_end, tail_start)`` for a non-system message list.
+
+        Head: a contiguous prefix holding the opening request, extended over an
+        atomic tool group. Tail: a contiguous suffix holding the newest work,
+        bounded by count and by token budget, aligned so no group is split.
+        """
+        length = len(body)
+        if length == 0:
+            return 0, 0
+        head_end = min(self.protect_head_messages, length)
+        # The first real user ask is the objective; include it even when it sits
+        # just past the configured message count.
+        for index in range(min(length, self.protect_head_messages + 4)):
+            if body[index].role == "user":
+                head_end = max(head_end, index + 1)
+                break
+        head_end = self._align_head_end(body, head_end)
+        first_user = next(
+            (index for index, item in enumerate(body[:head_end]) if item.role == "user"),
+            None,
+        )
+        while (
+            self.protect_head_tokens > 0
+            and head_end > 0
+            and self._tokens(body[:head_end]) > self.protect_head_tokens
+        ):
+            if first_user is not None and head_end - 1 <= first_user:
+                break
+            group = self._tool_group(body, head_end - 1)
+            candidate = min(group)
+            if candidate <= 0:
+                break
+            head_end = candidate
+        tail_start = max(head_end, length - self.protect_tail_messages)
+        tail_start = self._align_tail_start(body, tail_start)
+        if tail_start < head_end:
+            tail_start = head_end
+        while (
+            self.protect_tail_tokens > 0
+            and tail_start < length - 1
+            and self._tokens(body[tail_start:]) > self.protect_tail_tokens
+        ):
+            tail_start = self._align_tail_start(body, tail_start + 1)
+            if tail_start >= length:
+                tail_start = length - 1
+                break
+        return head_end, max(head_end, tail_start)
+
+    def _trim_message_sizes(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        """Cap user/assistant content in the unprotected middle only."""
+        if self.max_message_chars <= 0:
+            return messages
+        body = [message for message in messages if message.role != "system"]
+        head_end, tail_start = self._protected_bounds(body)
+        result: list[ChatMessage] = []
+        body_index = 0
+        for message in messages:
+            if message.role == "system":
+                result.append(message)
+                continue
+            in_middle = head_end <= body_index < tail_start
+            body_index += 1
+            if (
+                in_middle
+                and message.role in {"user", "assistant"}
+                and len(message.content) > self.max_message_chars
+            ):
+                copy = message.model_copy(deep=True)
+                copy.content = _truncate(copy.content, self.max_message_chars)
+                result.append(copy)
+            else:
+                result.append(message)
+        return result
+
     def _memory_messages(self, memories: list[MemoryRecord], budget: int) -> list[ChatMessage]:
         selected = self.select_memories(memories, budget)
         if not selected:
@@ -294,50 +414,22 @@ class ContextOptimizer:
         return result
 
     def _compact(self, messages: list[ChatMessage], budget: int, provider: Any) -> list[ChatMessage] | None:
-        """Ask a provider to summarize older messages; never invent a fallback text."""
+        """Summarize only the unprotected middle; never invent a fallback text.
+
+        The opening request (head) and the newest work (tail) stay verbatim: a
+        long turn's objective must survive the summary, and a tool group at
+        either boundary is kept whole.
+        """
         system = [m for m in messages if m.role == "system"]
-        tail = [m for m in messages if m.role != "system"]
-        if len(tail) < 3:
+        body = [m for m in messages if m.role != "system"]
+        head_end, tail_start = self._protected_bounds(body)
+        middle = body[head_end:tail_start]
+        if len(middle) < 2:
             return None
-        # Keep the last two turns verbatim in the recent tail. Only move the
-        # cut when an atomic tool-call group actually straddles it, and move it
-        # *back* to before the whole group so the assistant/tool_result pair
-        # stays together AND the final user/tool message is never swallowed
-        # into the summary. The old "cut_group is always non-empty" logic
-        # pushed the cut forward on every compaction, leaving at most one
-        # recent message (and zero when a group ended the conversation).
-        split = len(tail) - 2
-        for _ in range(len(tail)):
-            crossing = [
-                group
-                for index in (split - 1, split)
-                for group in (self._tool_group(tail, index),)
-                if min(group) < split <= max(group)
-            ]
-            # Contiguous groups are handled above. A result in the recent tail
-            # whose opener would land in the summary is equally unsafe, even
-            # when an intervening non-tool message separated the two.
-            detached_openers = [
-                opener
-                for index in range(split, len(tail))
-                for opener in (self._nearest_tool_opener(tail, index),)
-                if opener is not None and opener < split
-            ]
-            if not crossing and not detached_openers:
-                break
-            candidates = [min(group) for group in crossing] + detached_openers
-            candidate = min(candidates)
-            if candidate >= split or candidate < 1:
-                # No safe boundary exists without splitting a tool group or
-                # emptying the recent tail: mechanical truncation is safer.
-                return None
-            split = candidate
-        else:
-            return None
-        if not (1 <= split < len(tail)):
-            return None
-        older, recent = tail[:split], tail[split:]
-        transcript = "\n".join(f"{m.role}: {m.content[:1000]}" for m in older)
+        per_message = min(self.max_message_chars or 1000, 2000)
+        transcript = "\n".join(
+            f"{m.role}: {m.content[:per_message]}" for m in middle
+        )
         if not transcript.strip():
             return None
         request = ModelRequest(
@@ -359,35 +451,58 @@ class ContextOptimizer:
         if not summary:
             return None
         summary_message = ChatMessage(role="system", content="Conversation summary: " + summary, name="compaction")
-        return system + [summary_message] + recent
+        return system + body[:head_end] + [summary_message] + body[tail_start:]
 
     def _fit(self, messages: list[ChatMessage], budget: int) -> list[ChatMessage]:
-        """Enforce the token budget by dropping, then truncating, oldest content."""
+        """Enforce the token budget while protecting the head and recent tail.
+
+        The middle is evicted first, then the oldest head groups, then the
+        oldest tail message is dropped/truncated. A tiny budget still falls back
+        to the final user turn exactly as before.
+        """
         system = [m.model_copy(deep=True) for m in messages if m.role == "system"]
-        tail = [m.model_copy(deep=True) for m in messages if m.role != "system"]
+        body = [m.model_copy(deep=True) for m in messages if m.role != "system"]
+        if not body:
+            if self._tokens(system) > budget and system:
+                system = system[-1:]
+                system[0].content = _truncate(system[0].content, max(0, budget) * CHARS_PER_TOKEN)
+            return system
+
+        head_end, tail_start = self._protected_bounds(body)
+        head, middle, tail = body[:head_end], body[head_end:tail_start], body[tail_start:]
         total = lambda items: sum(estimate_tokens(m.content) for m in items)  # noqa: E731
 
-        while total(system) + total(tail) > budget and len(tail) > 1:
-            # Evict the oldest group atomically: an assistant tool-use turn
-            # and all of its tool results go together (F-20). A lone
-            # tool result already orphaned by an earlier compaction is its
-            # own group and is removed alone.
-            group = self._tool_group(tail, 0)
-            tail[:] = [m for i, m in enumerate(tail) if i not in group]
-        if total(system) + total(tail) <= budget:
-            return system + tail
+        def over() -> bool:
+            return total(system) + total(head) + total(middle) + total(tail) > budget
 
-        remaining = budget - total(system)
-        if tail:
-            allowance = max(0, remaining) * CHARS_PER_TOKEN
-            tail[0].content = _truncate(tail[0].content, allowance)
+        # 1. Drop the middle atomically, oldest group first.
+        while over() and middle:
+            group = self._tool_group(middle, 0)
+            middle[:] = [m for i, m in enumerate(middle) if i not in group]
+        # 2. The head is the objective: give it up only after the middle, and
+        #    only group-atomically, so a tool pair never separates.
+        while over() and head:
+            group = self._tool_group(head, 0)
+            head[:] = [m for i, m in enumerate(head) if i not in group]
+        # 3. Keep the newest tail message; drop/truncate older tail entries.
+        while over() and len(tail) > 1:
+            tail.pop(0)
+        if over() and tail:
+            remaining = (
+                budget - total(system) - total(head) - total(middle)
+                - total(tail[1:])
+            )
+            tail[0].content = _truncate(tail[0].content, max(0, remaining) * CHARS_PER_TOKEN)
+        if over() and head:
+            remaining = budget - total(system) - total(middle) - total(tail)
+            head[0].content = _truncate(head[0].content, max(0, remaining) * CHARS_PER_TOKEN)
         if total(system) > budget:
             # System content alone exceeds the budget: keep the most recent
             # system message (rules or compaction summary) and truncate it.
             system = system[-1:]
             if system:
                 system[0].content = _truncate(system[0].content, max(0, budget) * CHARS_PER_TOKEN)
-        return system + tail
+        return system + head + middle + tail
 
     def optimize(
         self,
@@ -407,6 +522,7 @@ class ContextOptimizer:
             return []
         cleaned = self.deduplicate(messages)
         cleaned = self._trim_tool_output(cleaned)
+        cleaned = self._trim_message_sizes(cleaned)
         with_memories = self._memory_messages(memories or [], budget) + cleaned
         current = sum(estimate_tokens(m.content) for m in with_memories)
         if provider is not None and self.compact and current > budget:

@@ -1608,3 +1608,73 @@ def test_env_token_without_base_url_injects_nothing(tmp_path, monkeypatch) -> No
     settings = Settings.load(cfg)
     assert "opencode-go" not in settings.models.providers
     assert settings.model_status()["status"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# protected head/tail context shaping
+
+
+def test_context_optimizer_protects_the_objective_and_newest_tail():
+    from leo.models.context import ContextOptimizer
+
+    messages = (
+        [ChatMessage(role="user", content="objective " * 20)]
+        + [ChatMessage(role="assistant", content="filler " * 20) for _ in range(10)]
+        + [ChatMessage(role="user", content="latest")]
+    )
+    optimizer = ContextOptimizer(
+        compact=False, protect_head_messages=1, protect_tail_messages=1
+    )
+
+    result = optimizer.optimize(messages, budget=60, provider=None)
+
+    assert result[0].content.startswith("objective")
+    assert result[-1].content == "latest"
+    assert len(result) == 2, "the unprotected middle was evicted; head and tail stayed"
+
+
+def test_context_optimizer_caps_only_the_unprotected_middle():
+    from leo.models.context import ContextOptimizer
+
+    messages = [
+        ChatMessage(role="user", content="objective"),
+        ChatMessage(role="assistant", content="x" * 500),
+        ChatMessage(role="user", content="latest"),
+    ]
+    optimizer = ContextOptimizer(
+        compact=False,
+        max_message_chars=20,
+        protect_head_messages=1,
+        protect_tail_messages=1,
+    )
+
+    result = optimizer.optimize(messages, budget=10_000, provider=None)
+
+    assert result[0].content == "objective"
+    assert result[-1].content == "latest"
+    middle = next(m for m in result if m.role == "assistant")
+    assert len(middle.content) <= 20
+
+
+def test_protected_bounds_never_split_a_tool_group():
+    from leo.models.context import ContextOptimizer
+
+    group = [
+        ChatMessage(role="user", content="objective"),
+        ChatMessage(
+            role="assistant", content="",
+            tool_calls=[{"id": "c1", "name": "shell", "arguments": {}}],
+        ),
+        ChatMessage(role="tool", content="result", tool_call_id="c1"),
+    ]
+    optimizer = ContextOptimizer(
+        compact=False, protect_head_messages=2, protect_tail_messages=0
+    )
+    head_end, _tail_start = optimizer._protected_bounds(group)
+    assert head_end == 3, "the head boundary moved past the whole tool group"
+
+    optimizer = ContextOptimizer(
+        compact=False, protect_head_messages=1, protect_tail_messages=1
+    )
+    _head_end, tail_start = optimizer._protected_bounds(group)
+    assert tail_start == 1, "the tail boundary moved back to the tool opener"
