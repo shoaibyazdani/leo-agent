@@ -13,14 +13,15 @@ from leo import db
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path: Path, monkeypatch):
     db.set_db_path(tmp_path / "test.db")
-    # A test process inherits the operator's environment, and the approval
-    # notifier reads the operator's own target from it. Pin the target's database
-    # to this test's file so a run can never announce an approval that only exists
-    # in a scratch database — the operator then taps a button for a row the real
-    # gateway cannot find. Explicitly clears the kill switch so a suppression test
-    # has to set it itself.
+    # A test process inherits the operator's environment, including the real
+    # Telegram token and notify target when the suite is run beside a live
+    # service. Pin the database and turn the notifier off for the whole suite:
+    # otherwise a test that builds the real app announces approvals that only
+    # exist in its scratch database, the operator taps an empty card, and the
+    # gateway answers "cannot resolve" because the row was never in its database.
+    # The notifier's own tests opt back in explicitly.
     monkeypatch.setenv("LEO_DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.delenv("LEO_NO_NOTIFY", raising=False)
+    monkeypatch.setenv("LEO_NO_NOTIFY", "1")
     asyncio.run(db.initialize())
     yield
     db._db_path = None
