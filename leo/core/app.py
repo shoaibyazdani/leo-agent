@@ -239,6 +239,10 @@ class LeoApp:
         from ..models.reasoning_state import ReasoningState
         self.reasoning_state = ReasoningState()
         self._cancelled_runs: set[str] = set()
+        # In-process turn interrupts, keyed by conversation: a /stop wakes the
+        # live model call, stream and tool wait immediately instead of waiting
+        # for the next durable poll. The SQLite row stays the cross-process path.
+        self._stop_events: dict[str, asyncio.Event] = {}
         # Origin chat of the turn in flight: {channel, target, conversation_id}.
         # Used by task_create(background=true) so progress reaches the chat
         # that asked, and cleared when the turn ends.
@@ -1136,11 +1140,21 @@ class LeoApp:
             edit = getattr(adapter, "edit_message_text", None)
             if source_message_id and callable(edit):
                 try:
-                    edited = bool(await edit(subject, source_message_id, reply, keyboard))
+                    # The tap consumed the choice: keep the result text and
+                    # remove the buttons. Sending the refreshed menu here would
+                    # leave a live-looking card that invites a second tap.
+                    edited = bool(await edit(
+                        subject, source_message_id, reply, {"inline_keyboard": []},
+                    ))
                 except Exception:  # a failed edit falls back to a new message
                     edited = False
             if not edited:
-                await adapter.send(subject, reply, reply_markup=keyboard)
+                # A tap that cannot edit must not post a second menu: the
+                # status text alone is the honest result.
+                await adapter.send(
+                    subject, reply,
+                    reply_markup=None if source_message_id else keyboard,
+                )
 
     async def _store_channel_attachment(self, channel: str, descriptor: dict[str, Any]) -> str | None:
         """Download a channel's file and store it, returning the attachment id.

@@ -358,4 +358,7 @@ async def test_an_answer_can_replace_the_tapped_menu_card():
 
     assert done["delivered"] is True
     assert adapter.sent == []
-    assert adapter.edits == [("100000001", "77", "Reasoning effort: high", keyboard)]
+    # The supplied picker is not reattached: a consumed tap becomes text-only.
+    assert adapter.edits == [
+        ("100000001", "77", "Reasoning effort: high", {"inline_keyboard": []})
+    ]
