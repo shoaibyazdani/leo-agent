@@ -844,6 +844,18 @@ class Gateway:
                     conversation_id=payload.get("conversation_id"),
                 )
                 summary["processed"] += 1
+            except asyncio.CancelledError as cancel:
+                # A turn that hit its lifetime cap cancels itself; that is a
+                # failed row, not a reason to abandon every row behind it.
+                current = asyncio.current_task()
+                if current is not None and getattr(current, "cancelling", lambda: 0)() > 0:
+                    raise
+                await self._write_delivery_marker(outbox_id, "claimed")
+                status = "pending" if (int(row["attempts"]) + 1) < max(1, int(max_attempts)) else "failed"
+                await self._finish_outbox(
+                    outbox_id, status, error=f"CancelledError: {cancel or 'turn cancelled'}"
+                )
+                summary["failed"] += 1
             except Exception as exc:  # noqa: BLE001 - one bad turn must not stall the queue
                 marker = await self._delivery_state(outbox_id)
                 error = f"{type(exc).__name__}: {exc}"
