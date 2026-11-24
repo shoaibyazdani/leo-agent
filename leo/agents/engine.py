@@ -51,8 +51,12 @@ RESERVED_DELEGATION_KEYS: frozenset[str] = frozenset({
 
 # Bounded tool loop for model workers. A model may call tools repeatedly, but
 # every round must re-send the assistant(tool_calls) message and the matching
-# tool messages, and it can never loop forever.
-MAX_MODEL_TOOL_ROUNDS = 4
+# tool messages, and it can never loop forever. The bound must still fit real
+# work: at 4 rounds a worker that listed a directory, read one file and searched
+# twice ran out mid-investigation and the whole task failed on the ceiling
+# rather than on anything being wrong. 12 keeps the loop finite while leaving
+# room for read -> act -> verify.
+MAX_MODEL_TOOL_ROUNDS = 12
 
 
 class AgentError(RuntimeError):

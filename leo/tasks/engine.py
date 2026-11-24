@@ -217,9 +217,25 @@ def _delivery_targets(task: TaskRecord) -> dict[str, Any]:
         _add_targets(value, out)
     payload = metadata.get("schedule_payload")
     if isinstance(payload, Mapping):
-        for key in (*_TARGET_KEYS, "channel", "channels"):
-            if key in payload:
-                _add_targets(payload[key], out)
+        # A schedule payload declares a channel *and* an address for it
+        # ({"channel": "telegram", "target": "525083981"}). Reading the channel
+        # on its own yields a target-less entry and the address is dropped, so
+        # delivery addressed the literal string "None" and never arrived.
+        channels = payload.get("channel") or payload.get("channels")
+        address = next(
+            (payload[key] for key in ("target", "to", "recipient", "chat_id")
+             if payload.get(key) not in (None, "")),
+            None,
+        )
+        if channels and address is not None:
+            declared = channels if isinstance(channels, (list, tuple, set)) else [channels]
+            for channel in declared:
+                if channel:
+                    out.setdefault(str(channel), address)
+        else:
+            for key in (*_TARGET_KEYS, "channel", "channels"):
+                if key in payload:
+                    _add_targets(payload[key], out)
     return out
 
 
