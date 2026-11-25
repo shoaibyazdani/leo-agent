@@ -104,11 +104,20 @@ def _apply_limits(cpu_seconds, memory_bytes):
     # Enforce memory even when the platform refuses RLIMIT_AS/RSS lowering:
     # a daemon watchdog kills this child if peak RSS exceeds the budget.
     if resource is not None:
+        def _current_rss_bytes():
+            # ru_maxrss is a high-water mark that can survive fork+exec, so a
+            # heavyweight parent makes every child look like it already blew
+            # the budget. Measure live RSS instead.
+            try:
+                with open("/proc/self/statm", "rb") as fh:
+                    return int(fh.read().split()[1]) * resource.getpagesize()
+            except (OSError, IndexError, ValueError):
+                peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                return peak if sys.platform == "darwin" else peak * 1024
+
         def _watch_memory():
             while True:
-                peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                rss = peak if sys.platform == "darwin" else peak * 1024
-                if rss > memory_bytes:
+                if _current_rss_bytes() > memory_bytes:
                     os._exit(97)
                 time.sleep(0.01)
 
@@ -210,6 +219,14 @@ def _main():
     except BaseException as exc:
         result["passed"] = False
         result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        if isinstance(exc, MemoryError):
+            # The budget was the thing that stopped the test, so this is an
+            # isolation failure, not an adapter test failure: die by the same
+            # path the watchdog uses so the parent reports one code.
+            sys.stderr.write("memory budget of %d bytes exceeded\n" % memory_bytes)
+            sys.stderr.flush()
+            sys.stdout.flush()
+            os._exit(97)
         result["failure"] = {
             "code": "isolated_test_error",
             "message": result["error"],
