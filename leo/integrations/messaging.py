@@ -194,6 +194,12 @@ class NormalizedMessage(BaseRecord):
     text: str
     timestamp: str = Field(default_factory=utcnow)
     reply_ref: str | None = None
+    # Provider-supplied context for the message being replied to. Telegram
+    # includes the original text in the update, so no stored-message lookup is
+    # needed. Other adapters may leave these unset.
+    reply_text: str | None = None
+    reply_sender: str | None = None
+    reply_is_bot: bool | None = None
     message_id: str | None = None
     sender_id: str | None = None
     conversation_ref: str | None = None
@@ -716,6 +722,7 @@ class TelegramAdapter(MessagingAdapter):
 
     async def send(
         self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None,
+        reply_to: str | None = None,
         silent: bool = False,
     ) -> dict[str, Any]:
         token = credential("TELEGRAM_BOT_TOKEN")
@@ -729,7 +736,10 @@ class TelegramAdapter(MessagingAdapter):
             # The keyboard belongs to the message the human reads last, not to a
             # continuation that may arrive before it.
             keyboard = reply_markup if index + 1 == len(chunks) else None
-            last = await self._send_one(token, target, chunk, reply_markup=keyboard, silent=silent)
+            last = await self._send_one(
+                token, target, chunk, reply_markup=keyboard, silent=silent,
+                reply_to=reply_to if index == 0 else None,
+            )
             if index + 1 < len(chunks):
                 _LOG.info("telegram long message split", extra={
                     "chunks": len(chunks), "part": index + 1})
@@ -816,6 +826,7 @@ class TelegramAdapter(MessagingAdapter):
         self, token: str, target: str, text: str,
         reply_markup: dict[str, Any] | None = None,
         silent: bool = False,
+        reply_to: str | None = None,
     ) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
@@ -823,6 +834,8 @@ class TelegramAdapter(MessagingAdapter):
                                    "parse_mode": TELEGRAM_PARSE_MODE}
         if reply_markup:
             payload["reply_markup"] = reply_markup
+        if reply_to:
+            payload["reply_parameters"] = {"message_id": int(reply_to)}
         if silent:
             # A live progress line is an update, not an interruption.
             payload["disable_notification"] = True
@@ -897,6 +910,12 @@ class TelegramAdapter(MessagingAdapter):
                 _LOG.info("LEO notice echoed back ignored", extra={"channel": self.channel})
                 continue
             reply = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
+            reply_sender_data = reply.get("from") if isinstance(reply.get("from"), dict) else {}
+            reply_text = str(reply.get("text") or reply.get("caption") or "").strip()[:600]
+            reply_sender = (
+                str(reply_sender_data.get("username") or reply_sender_data.get("first_name") or "").strip()
+                or None
+            )
             chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
             # The numeric id is the admission identity and the chat id is the
             # session key; the username is only a display label.
@@ -908,6 +927,9 @@ class TelegramAdapter(MessagingAdapter):
                     text=str(message.get("text") or message.get("caption") or ""),
                     timestamp=_from_epoch(message.get("date")),
                     reply_ref=_ref(reply.get("message_id")),
+                    reply_text=reply_text or None,
+                    reply_sender=reply_sender,
+                    reply_is_bot=bool(reply_sender_data.get("is_bot")) if reply else None,
                     message_id=_ref(message.get("message_id")),
                     sender_id=sender_id,
                     conversation_ref=_ref(chat.get("id")),

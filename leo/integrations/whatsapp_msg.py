@@ -76,6 +76,53 @@ def _prefer_pn(primary: Any, alt: Any) -> str:
     return str(primary or alt or "")
 
 
+class _TypingKeepalive:
+    """Re-publish WhatsApp "typing…" for one chat while a turn is running.
+
+    The composing state expires after a few seconds on the recipient side, so a
+    single call is not enough for a slow model turn. Presence is cosmetic: every
+    failure here is swallowed so a broken presence call can never break a reply.
+    """
+
+    INTERVAL_SECONDS = 4.0
+
+    def __init__(self, manager: Any, owner: str, auth: str, jid: str) -> None:
+        self._manager = manager
+        self._owner = owner
+        self._auth = auth
+        self._jid = jid
+        self._task: asyncio.Task[None] | None = None
+
+    async def _send(self, state: str) -> None:
+        try:
+            await self._manager.typing(
+                owner_id=self._owner, to=self._jid, state=state, auth=self._auth,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def _loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.INTERVAL_SECONDS)
+            await self._send("composing")
+
+    async def start(self) -> None:
+        await self._send("composing")
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await self._send("paused")
+
+
 def missing_model_env(app: LeoApp) -> list[str]:
     """Environment names the default provider declares but the process lacks.
 
@@ -229,6 +276,10 @@ async def run_message_agent(
                     result.ignored += 1
                     continue
                 emit("message", {"sender": sender, "chars": len(str(message.get("text") or ""))})
+                # WhatsApp expires a composing state after a few seconds, so a
+                # background task repeats it for as long as the turn is running.
+                presence = _TypingKeepalive(manager, owner, auth, reply_to)
+                await presence.start()
                 try:
                     answer = await app.ask(
                         str(message.get("text") or ""),
@@ -242,6 +293,8 @@ async def run_message_agent(
                     result.failed += 1
                     emit("failed", {"sender": sender, "error": type(exc).__name__})
                     continue
+                finally:
+                    await presence.stop()
                 reply = str(answer.get("content") or "").strip()
                 if not reply:
                     result.ignored += 1

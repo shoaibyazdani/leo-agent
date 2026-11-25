@@ -914,6 +914,31 @@ app.post('/send', jsonBody, async (req, res, next) => {
   }
 });
 
+// Chat-state presence ("typing…" / paused) for one target chat. WhatsApp drops
+// a composing state after a few seconds, so the caller re-sends while working.
+const PRESENCE_STATES = new Set(['composing', 'paused']);
+
+app.post('/typing', jsonBody, async (req, res, next) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const to = body.to;
+    const presence = body.state;
+    if (!isJid(to) || typeof presence !== 'string' || !PRESENCE_STATES.has(presence)) {
+      res.status(400).json({ error: 'invalid_request' });
+      return;
+    }
+    if (state.phase !== 'connected' || !state.linked || !socket) {
+      res.status(409).json({ error: 'not_connected' });
+      return;
+    }
+    await withTimeout(socket.sendPresenceUpdate(presence, to), 5_000);
+    res.json({ ok: true });
+  } catch (err) {
+    // The generic error handler returns a code only; never echo text or JIDs.
+    next(err);
+  }
+});
+
 app.post('/start', jsonBody, (_req, res) => {
   if (state.stopping) {
     res.status(409).json({ error: 'stopping' });

@@ -475,9 +475,9 @@ class ReviewConfig(BaseModel):
     model: str = ""
     # Whether the review may propose memory notes in addition to skills.
     capture_memory: bool = True
-    # Background skill writes are staged for /skills approve by default.
-    # Interactive foreground writes are unaffected.
-    write_approval: bool = True
+    # Background skill writes apply directly by default. Set true to stage
+    # them for /skills approve instead. Interactive writes are unaffected.
+    write_approval: bool = False
     # Explicit /learn may gather a source with read-only local and web tools.
     # Writes are direct because the user asked for this skill.
     learn_enabled: bool = True

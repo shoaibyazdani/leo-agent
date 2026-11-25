@@ -33,6 +33,7 @@ from datetime import datetime
 from .approval_buttons import build_keyboard
 from .notices import (
     APPROVAL_PREFIX,
+    REVIEW_CREATED_PREFIX,
     REVIEW_FAILED_PREFIX,
     REVIEW_STAGED_PREFIX,
 )
@@ -41,20 +42,20 @@ from .permissions import reason_is_trustable
 _LOG = get_logger("security.notifier")
 
 REQUESTED_TOPIC = "approval.requested"
-# A background review/learn pass writes nothing an operator sees: its skill
-# writes are staged in SQLite and its memory proposals only exist behind
-# ``/skills pending``. The completion event carried no subscriber at all, so a
-# staged write sat unnoticed until someone happened to ask. These topics are the
-# announcement seam; the notifier still decides nothing on the operator's behalf.
+# A background review/learn pass may apply a skill directly or stage it for
+# approval. Its completion event carried no subscriber, so either outcome could
+# go unnoticed. These topics are the announcement seam; the notifier still
+# decides nothing on the operator's behalf.
 REVIEW_TOPICS = (
     "review.completed",
     "review.failed",
     "learn.completed",
     "learn.failed",
 )
-# Cap how many staged writes one notice names: the rest are still listed by
+# Cap how many skill writes one notice names: the rest are still listed by
 # ``/skills pending`` and a chat message must stay readable on a phone.
 MAX_NAMED_STAGED = 3
+MAX_NAMED_CREATED = 3
 
 
 class ApprovalNotifier:
@@ -287,11 +288,11 @@ class ApprovalNotifier:
     # -- review announcements ----------------------------------------------
     @staticmethod
     def _review_message(payload: dict[str, Any]) -> str | None:
-        """One short line for a finished background pass, or None to stay quiet.
+        """One short notice for a finished background pass, or None to stay quiet.
 
-        Silence is the default: a review that wrote nothing is not news, and an
-        announcement for every turn would train the operator to ignore the ones
-        that matter. Only a staged skill write or a real failure is announced.
+        Silence is the default: a review that changed no skill is not news, and
+        an announcement for every turn would train the operator to ignore the
+        ones that matter. Applied creations, staged writes and failures are news.
         """
         status = str(payload.get("status") or "").strip().lower()
         mode = str(payload.get("mode") or "review").strip().lower()
@@ -303,23 +304,49 @@ class ApprovalNotifier:
                 lines.append(f"error: {error}")
             lines.append("nothing was written; the artifact names the cause")
             return "\n".join(lines)
-        staged = [item for item in (payload.get("staged") or []) if isinstance(item, Mapping)]
-        if not staged:
-            return None
-        shown = staged[:MAX_NAMED_STAGED]
-        lines = [REVIEW_STAGED_PREFIX]
-        for item in shown:
-            skill = " ".join(str(item.get("skill") or "?").split())[:64]
-            action = str(item.get("action") or "write").strip().lower()
-            lines.append(f"{action}: {skill} ({item.get('proposal_id')})")
-        remaining = len(staged) - len(shown)
-        if remaining > 0:
-            lines.append(f"+{remaining} more")
-        lines += [
-            "not applied yet. review and apply with:",
-            f"/skills pending",
-            f"/skills approve {shown[0].get('proposal_id')}",
+        created = [
+            item for item in (payload.get("created") or [])
+            if isinstance(item, Mapping) and item.get("skill")
         ]
+        staged = [
+            item for item in (payload.get("staged") or [])
+            if isinstance(item, Mapping) and item.get("skill")
+        ]
+        if not created and not staged:
+            return None
+        lines = [REVIEW_CREATED_PREFIX if created and not staged else REVIEW_STAGED_PREFIX]
+        for item in created[:MAX_NAMED_CREATED]:
+            skill = " ".join(str(item.get("skill") or "?").split())[:64]
+            category = " ".join(str(item.get("category") or "uncategorized").split())[:64]
+            description = " ".join(str(item.get("description") or "").split())[:160]
+            lines.append(f"{skill} [{category}]")
+            if description:
+                lines.append(description)
+        remaining_created = len(created) - min(len(created), MAX_NAMED_CREATED)
+        if remaining_created > 0:
+            lines.append(f"+{remaining_created} more created")
+        if staged:
+            if created:
+                lines.append(REVIEW_STAGED_PREFIX)
+            for item in staged[:MAX_NAMED_STAGED]:
+                skill = " ".join(str(item.get("skill") or "?").split())[:64]
+                action = str(item.get("action") or "write").strip().lower()
+                category = " ".join(str(item.get("category") or "").split())[:64]
+                description = " ".join(str(item.get("description") or "").split())[:160]
+                detail = f"{action}: {skill}"
+                if category:
+                    detail += f" [{category}]"
+                lines.append(f"{detail} ({item.get('proposal_id')})")
+                if description:
+                    lines.append(description)
+            remaining = len(staged) - len(staged[:MAX_NAMED_STAGED])
+            if remaining > 0:
+                lines.append(f"+{remaining} more")
+            lines += [
+                "not applied yet. review and apply with:",
+                "/skills pending",
+                f"/skills approve {staged[0].get('proposal_id')}",
+            ]
         return "\n".join(lines)
 
     async def _on_review(self, event: Event) -> None:

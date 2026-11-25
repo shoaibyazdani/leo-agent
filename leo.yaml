@@ -328,9 +328,9 @@ learning:
     min_transcript_chars: 200
     model: ""                 # empty = the configured default chat model
     capture_memory: true
-    # Background skill writes wait for /skills approve. Interactive writes are
-    # unaffected. Set false for fully unattended authoring.
-    write_approval: true
+    # Background skill writes apply directly and are announced. Set true to
+    # stage them for /skills approve instead. Interactive writes are unaffected.
+    write_approval: false
     # /learn gathers sources with read-only file tools and http_get, then
     # authors directly because the user asked for the skill.
     learn_enabled: true

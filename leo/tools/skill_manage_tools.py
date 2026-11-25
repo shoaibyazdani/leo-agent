@@ -387,6 +387,8 @@ async def skill_manage(args: dict[str, Any], ctx: dict[str, Any]) -> Any:
             "staged": True,
             "proposal_id": record["id"],
             "digest": str(record["arguments_digest"])[:16],
+            "category": str(args.get("category") or "").strip()[:64],
+            "description": " ".join(str(args.get("description") or "").split())[:160],
             "message": (
                 f"Skill write staged for review as {record['id']}. "
                 "An operator can inspect it with /skills pending and apply it "
