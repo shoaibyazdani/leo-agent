@@ -7,7 +7,8 @@ import pytest
 from leo.config import Settings
 from leo.contracts import RiskLevel
 from leo.events import Event, EventBus
-from leo.security.notifier import ApprovalNotifier
+from leo.security.notices import REVIEW_FAILED_PREFIX, REVIEW_STAGED_PREFIX
+from leo.security.notifier import MAX_NAMED_STAGED, REVIEW_TOPICS, ApprovalNotifier
 
 
 @pytest.fixture(autouse=True)
@@ -261,3 +262,100 @@ def test_stop_unsubscribes() -> None:
     notifier.start()
     notifier.stop()
     assert bus._handlers["approval.requested"] == []
+    for topic in REVIEW_TOPICS:
+        assert bus._handlers.get(topic, []) == []
+
+
+# ---------------------------------------------------------------------------
+# background review notices
+#
+# A staged skill write used to be announced nowhere: ``review.completed`` was
+# emitted with no subscriber, so a write could sit pending for days. These tests
+# pin the announcement, not the review itself.
+
+
+@pytest.mark.asyncio
+async def test_staged_skill_write_is_announced() -> None:
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    assert notifier.start() is True
+
+    await bus.emit(
+        "review.completed",
+        review_id="rev_1",
+        conversation_id="conv_1",
+        status="completed",
+        mode="review",
+        actions=3,
+        staged=[{"proposal_id": "sprop_abc", "skill": "repo_change_review", "action": "create"}],
+    )
+
+    assert len(adapter.sent) == 1
+    target, text = adapter.sent[0]
+    assert target == "525083981"
+    assert text.startswith(REVIEW_STAGED_PREFIX)
+    assert "repo_change_review" in text
+    assert "/skills approve sprop_abc" in text
+
+
+@pytest.mark.asyncio
+async def test_a_review_that_staged_nothing_stays_quiet() -> None:
+    """Silence is the default: no news is not a notification."""
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    notifier.start()
+
+    await bus.emit(
+        "review.completed", review_id="rev_2", status="completed",
+        mode="review", actions=2, staged=[],
+    )
+
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_learn_pass_is_announced() -> None:
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    notifier.start()
+
+    await bus.emit(
+        "learn.failed", review_id="learn_1", status="failed", mode="learn",
+        actions=0, error="TimeoutError: learn exceeded 120s",
+    )
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0][1]
+    assert text.startswith(REVIEW_FAILED_PREFIX)
+    assert "learn" in text and "120s" in text
+
+
+def test_many_staged_writes_are_summarized_not_dumped() -> None:
+    staged = [
+        {"proposal_id": f"sprop_{index}", "skill": f"skill-{index}", "action": "create"}
+        for index in range(7)
+    ]
+    text = ApprovalNotifier._review_message({
+        "status": "completed", "mode": "review", "staged": staged,
+    })
+    assert text is not None
+    assert text.count("sprop_") == MAX_NAMED_STAGED + 1  # +1 from the approve hint
+    assert "+4 more" in text
+
+
+@pytest.mark.asyncio
+async def test_review_notices_are_off_without_operator_config() -> None:
+    """The same opt-in gates review notices: no channel named, no message."""
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(
+        FakeGateway(adapter, bus), _settings(enabled=False), events=bus
+    )
+
+    assert notifier.start() is False
+    await bus.emit("review.completed", review_id="rev_3", status="completed",
+                   mode="review", staged=[{"proposal_id": "sprop_x", "skill": "x"}])
+    assert adapter.sent == []
