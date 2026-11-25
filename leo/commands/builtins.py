@@ -887,12 +887,14 @@ async def new_command(ctx: CommandContext) -> CommandResult:
     if subject is None:
         return _summary(
             ctx, "new",
-            f"New conversation {conversation_id} created. The client adapter must switch to this id to use it.",
+            "Fresh start ✨ New conversation is ready. "
+            "Your previous chats are still saved.",
             {"conversation_id": conversation_id, "subject": subject},
         )
     return _summary(
         ctx, "new",
-        f"New conversation {conversation_id} created; this channel switches to it on your next message.",
+        "Fresh start ✨ New conversation is ready. "
+        "Your previous chats are still saved — send your next message here.",
         {"conversation_id": conversation_id, "subject": subject},
     )
 
