@@ -196,8 +196,11 @@ async def test_every_toolset_executes_through_real_executor(
     # A tiny real PNG: the tool sniffs bytes, so a text file renamed .png would
     # be refused before any reader runs.
     # Inside the allowed root: the executor confines any path-shaped argument.
+    # Settings.root is the process CWD, so this lands in the repo checkout and
+    # must be removed even when the test fails partway through.
     vision_probe = Path(app.settings.root) / "vision-probe.png"
     vision_probe.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    request.addfinalizer(lambda: vision_probe.unlink(missing_ok=True))
 
     async def _stub_describe(blocks, *, question=None):
         assert blocks and blocks[0]["source"]["media_type"] == "image/png"
