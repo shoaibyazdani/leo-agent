@@ -82,10 +82,13 @@ async def test_review_write_is_staged_not_applied(env):
     result = await _run(
         env, "create", name="staged-skill",
         description="Use when staging a skill.",
+        category="development",
         content=_content(),
     )
     assert result.success is True, result.error
     assert result.output["staged"] is True
+    assert result.output["category"] == "development"
+    assert result.output["description"] == "Use when staging a skill."
     assert result.output["proposal_id"].startswith("sprop_")
     assert await env.skills.get("staged-skill") is None
 
@@ -94,6 +97,19 @@ async def test_review_write_is_staged_not_applied(env):
     assert pending[0]["action"] == "create"
     assert pending[0]["skill"] == "staged-skill"
     assert pending[0]["payload"]["content"] == _content()
+
+
+async def test_background_writes_apply_directly_by_default(env):
+    env.settings.learning.review.write_approval = False
+    result = await _run(
+        env, "create", name="direct-skill",
+        description="Use when testing the direct-write default.",
+        content=_content(),
+    )
+    assert result.success is True, result.error
+    assert "staged" not in result.output
+    assert await env.skills.get("direct-skill") is not None
+    assert await staging.pending() == []
 
 
 async def test_foreground_writes_are_not_staged(env):

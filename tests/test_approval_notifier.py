@@ -7,8 +7,17 @@ import pytest
 from leo.config import Settings
 from leo.contracts import RiskLevel
 from leo.events import Event, EventBus
-from leo.security.notices import REVIEW_FAILED_PREFIX, REVIEW_STAGED_PREFIX
-from leo.security.notifier import MAX_NAMED_STAGED, REVIEW_TOPICS, ApprovalNotifier
+from leo.security.notices import (
+    REVIEW_CREATED_PREFIX,
+    REVIEW_FAILED_PREFIX,
+    REVIEW_STAGED_PREFIX,
+)
+from leo.security.notifier import (
+    MAX_NAMED_CREATED,
+    MAX_NAMED_STAGED,
+    REVIEW_TOPICS,
+    ApprovalNotifier,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -288,7 +297,10 @@ async def test_staged_skill_write_is_announced() -> None:
         status="completed",
         mode="review",
         actions=3,
-        staged=[{"proposal_id": "sprop_abc", "skill": "repo_change_review", "action": "create"}],
+        staged=[{
+            "proposal_id": "sprop_abc", "skill": "repo_change_review", "action": "create",
+            "category": "development", "description": "Use when reviewing repository changes.",
+        }],
     )
 
     assert len(adapter.sent) == 1
@@ -296,7 +308,57 @@ async def test_staged_skill_write_is_announced() -> None:
     assert target == "525083981"
     assert text.startswith(REVIEW_STAGED_PREFIX)
     assert "repo_change_review" in text
+    assert "development" in text
+    assert "Use when reviewing repository changes." in text
     assert "/skills approve sprop_abc" in text
+
+
+@pytest.mark.asyncio
+async def test_applied_skill_creation_is_announced_with_purpose() -> None:
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    assert notifier.start() is True
+
+    await bus.emit(
+        "review.completed",
+        review_id="rev_created",
+        conversation_id="conv_created",
+        status="completed",
+        mode="review",
+        actions=1,
+        created=[{
+            "skill": "release_checklist",
+            "category": "development",
+            "description": "Use when preparing a release checklist.",
+        }],
+        staged=[],
+    )
+
+    assert len(adapter.sent) == 1
+    target, text = adapter.sent[0]
+    assert target == "525083981"
+    assert text.startswith(REVIEW_CREATED_PREFIX)
+    assert "release_checklist [development]" in text
+    assert "Use when preparing a release checklist." in text
+    assert "/skills approve" not in text
+
+
+def test_many_applied_creations_are_summarized_not_dumped() -> None:
+    created = [
+        {
+            "skill": f"skill-{index}",
+            "category": "development",
+            "description": f"Purpose {index}.",
+        }
+        for index in range(7)
+    ]
+    text = ApprovalNotifier._review_message({
+        "status": "completed", "mode": "review", "created": created, "staged": [],
+    })
+    assert text is not None
+    assert text.count("skill-") == MAX_NAMED_CREATED
+    assert "+4 more created" in text
 
 
 @pytest.mark.asyncio
