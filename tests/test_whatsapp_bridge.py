@@ -138,6 +138,7 @@ class FakeBridgeServer:
         self.cancel_calls = 0
         self.repair_calls = 0
         self.repair_payloads: list[dict | None] = []
+        self.typing_calls: list[dict] = []
         self.repair_error: str | None = None
         self.force_unauthorized = False
         self.status_overrides: dict = {}
@@ -246,6 +247,12 @@ class FakeBridgeServer:
             result = self.snapshot()
             result["timed_out"] = True
             return FakeResponse(200, result)
+        if method == "POST" and path == "/typing":
+            payload = body or {}
+            if payload.get("state") not in {"composing", "paused"}:
+                return FakeResponse(400, {"error": "invalid_request"})
+            self.typing_calls.append(payload)
+            return FakeResponse(200, {"ok": True})
         return FakeResponse(404, {"error": "not_found"})
 
 
@@ -902,6 +909,29 @@ async def test_cancel_rejects_cross_generation_qr(h):
     status = await h.manager.status(owner_id="alice", auth=h.auth)
     assert status["qr"] is None
     assert status["qr_available"] is False
+
+
+async def test_typing_publishes_presence_for_one_chat(h):
+    await _started(h)
+    await h.manager.typing(owner_id="alice", to="15551234567@s.whatsapp.net", auth=h.auth)
+    assert h.server.typing_calls == [
+        {"to": "15551234567@s.whatsapp.net", "state": "composing"},
+    ]
+    await h.manager.typing(
+        owner_id="alice", to="15551234567@s.whatsapp.net", state="paused", auth=h.auth,
+    )
+    assert h.server.typing_calls[-1]["state"] == "paused"
+
+
+async def test_typing_rejects_an_unknown_state_and_a_bad_target(h):
+    await _started(h)
+    with pytest.raises(BridgeError) as exc:
+        await h.manager.typing(owner_id="alice", to="15551234567@s.whatsapp.net", state="idle", auth=h.auth)
+    assert exc.value.code == "invalid_request"
+    with pytest.raises(BridgeError) as exc:
+        await h.manager.typing(owner_id="alice", to="not-a-jid", auth=h.auth)
+    assert exc.value.code == "invalid_target"
+    assert h.server.typing_calls == []
 
 
 async def test_repair_surfaces_explicit_credential_drain_failure(h):

@@ -81,7 +81,7 @@ PROTOCOL = "whatsapp-bridge/1"
 _APP_REPO_ROOT = Path(__file__).resolve().parents[3]
 _PACKAGE_DIR = Path(__file__).resolve().parent
 # SHA-256 of the shipped bridge.js. Recompute when bridge.js is changed.
-_BRIDGE_JS_SHA256 = "d0782b9158a05008c1a2bc9d8fd5994848b5f50f486c9161555a49a6ba83d220"
+_BRIDGE_JS_SHA256 = "b4322176717f4429be16fc8dc316e543f38e5582ab014a579bc98f8bfdb078e1"
 _BRIDGE_SCRIPT_MAX_BYTES = 1_000_000
 _NODE_COMMAND_ALLOWLIST = frozenset({"node"})
 # Only the first bytes of `node --version` are read; a hostile binary cannot
@@ -1300,6 +1300,27 @@ class WhatsAppBridgeManager:
             "to": to,
             "id": message_id if isinstance(message_id, str) and len(message_id) <= MAX_MESSAGE_ID_CHARS else None,
         }
+
+    async def typing(
+        self,
+        owner_id: str | None = None,
+        *,
+        to: str,
+        state: str = "composing",
+        auth: str | None = None,
+    ) -> None:
+        """Publish a chat-state presence ("composing" / "paused") for one chat.
+
+        WhatsApp expires a composing state after a few seconds, so callers that
+        do long work must repeat this. Failures are non-fatal for the caller.
+        """
+        self._require_auth(owner_id, auth)
+        self._require_running()
+        if not _is_jid(to):
+            raise BridgeError("Invalid WhatsApp target.", code="invalid_target")
+        if state not in {"composing", "paused"}:
+            raise BridgeError("Invalid presence state.", code="invalid_request")
+        await self._request("POST", "/typing", {"to": to, "state": state}, timeout=10.0)
 
     async def wait_for_connection(
         self,

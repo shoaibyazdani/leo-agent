@@ -153,7 +153,7 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "36": "synthetic token", "855": "synthetic stripe-shaped fixture", "956": "test fixture",
     },
     "tests/test_tools_preview.py": {"815": "test fixture"},
-    "tests/test_whatsapp_bridge.py": {"1389": "test fixture"},
+    "tests/test_whatsapp_bridge.py": {"1419": "test fixture"},
 }
 
 
