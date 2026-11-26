@@ -145,6 +145,17 @@ def _send_accepts_markup(send: Any) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _send_accepts_reply_to(send: Any) -> bool:
+    """True when a bound adapter supports native reply threading."""
+    try:
+        params = inspect.signature(send).parameters
+    except (TypeError, ValueError):
+        return False
+    return "reply_to" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 class Gateway:
     """Unified conversation store and inbound/outbound channel router."""
 
@@ -454,6 +465,9 @@ class Gateway:
                     "conversation_ref": message.conversation_ref,
                     "thread": message.thread,
                     "reply_ref": message.reply_ref,
+                    "reply_text": message.reply_text,
+                    "reply_sender": message.reply_sender,
+                    "reply_is_bot": message.reply_is_bot,
                     "reply_target": reply_target,
                     "source_timestamp": message.timestamp,
                     "source_message_id": message.message_id,
@@ -482,6 +496,9 @@ class Gateway:
                     "conversation_ref": message.conversation_ref,
                     "thread": message.thread,
                     "reply_ref": message.reply_ref,
+                    "reply_text": message.reply_text,
+                    "reply_sender": message.reply_sender,
+                    "reply_is_bot": message.reply_is_bot,
                     "reply_target": reply_target,
                     "outbox_id": outbox_id,
                     "idempotency_key": outbox_id,
@@ -962,6 +979,7 @@ class Gateway:
         media: str | Path | None = None,
         caption: str | None = None,
         reply_markup: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> dict[str, Any]:
         """Send one outbound message through the channel's adapter.
 
@@ -991,6 +1009,8 @@ class Gateway:
         send_arguments = {
             "channel": channel, "target": target_str, "text": str(text), "subject": subject,
         }
+        if reply_to:
+            send_arguments["reply_to"] = str(reply_to)
         if media_path is not None:
             # Keys are added only when media is actually attached so existing
             # text-only digests stay byte-identical (no spurious approval churn).
@@ -1035,6 +1055,8 @@ class Gateway:
                 extra = {"reply_markup": reply_markup} if (
                     reply_markup and _send_accepts_markup(adapter.send)
                 ) else {}
+                if reply_to and _send_accepts_reply_to(adapter.send):
+                    extra["reply_to"] = str(reply_to)
                 result = await adapter.send(target, text, **extra)
             if not isinstance(result, Mapping):
                 raise MessagingError(f"{channel} adapter returned an invalid send result")
@@ -1052,6 +1074,7 @@ class Gateway:
             "target": target_str,
             "provider_message_id": result.get("message_id"),
             "idempotency_key": idempotency_key,
+            "reply_to": str(reply_to) if reply_to else None,
         }
         if media_path is not None:
             # Name and size only: the absolute local path is not stored in the

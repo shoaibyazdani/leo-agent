@@ -133,6 +133,7 @@ async def env(tmp_path, monkeypatch):
 
 
 async def test_review_creates_a_documentation_only_skill(env):
+    assert env.settings.learning.review.write_approval is False
     conversation_id = await env.seed()
     router = ScriptedRouter([
         {"tool_calls": [_call(
@@ -472,3 +473,92 @@ async def test_learn_scope_is_read_only_and_excludes_memory(env):
     assert "terminal" not in LEARN_SCOPE
     assert "memory_propose" not in LEARN_SCOPE
     assert "skill_manage" in LEARN_SCOPE
+
+
+async def test_a_staged_skill_write_is_reported_as_staged(env):
+    """The handler's flags must reach the artifact, the outcome and the event.
+
+    Real symptom: the review artifact said ``staged: false`` and the counters
+    said ``skills_written`` for exactly the write that was waiting for an
+    operator, because the envelope carries the handler's result under
+    ``output`` and the loop read ``staged`` from the top level.
+    """
+    env.settings.learning.review.write_approval = True
+    conversation_id = await env.seed()
+    router = ScriptedRouter([
+        {"tool_calls": [_call(
+            "c1", "skill_manage", action="create", name="staged-lesson",
+            description="Use when the review stages a write.",
+            category="development",
+            content=(
+                "# Staged lesson\n\n## When to Use\n\n- A background review stages a write.\n\n"
+                "## Procedure\n\n1. Stage it.\n2. Wait for the operator.\n"
+            ),
+        )]},
+        {"content": "Staged one skill write."},
+    ])
+    seen: list[dict] = []
+
+    async def _capture(event):
+        seen.append(event.payload)
+
+    env.events.subscribe("review.completed", _capture)
+    review = env.engine(router)
+    outcome = await review.run(conversation_id, explicit=True)
+
+    assert outcome.status == "completed", outcome.error
+    assert outcome.actions[0]["staged"] is True
+    assert await env.skills.get("staged-lesson") is None
+    assert [item["skill"] for item in outcome.staged] == ["staged-lesson"]
+    assert outcome.staged[0]["proposal_id"].startswith("sprop_")
+    assert outcome.staged[0]["category"] == "development"
+    assert outcome.staged[0]["description"] == "Use when the review stages a write."
+    assert outcome.created == []
+    assert review.status()["skills_staged"] == 1
+    assert review.status()["skills_written"] == 0
+
+    from pathlib import Path
+
+    artifact = json.loads(Path(outcome.artifact_path).read_text(encoding="utf-8"))
+    assert artifact["staged"][0]["proposal_id"] == outcome.staged[0]["proposal_id"]
+    # The completion event is what a channel notifier announces, so the ids
+    # have to be on the event itself rather than only in the artifact.
+    assert seen and seen[0]["staged"] == outcome.staged
+    assert seen[0]["created"] == []
+
+
+async def test_applied_skill_creation_reaches_outcome_artifact_and_event(env):
+    conversation_id = await env.seed()
+    router = ScriptedRouter([
+        {"tool_calls": [_call(
+            "c1", "skill_manage", action="create", name="applied-lesson",
+            description="Use when a review applies a skill directly.",
+            category="development",
+            content=(
+                "# Applied lesson\n\n## When to Use\n\n- A review applies a skill.\n\n"
+                "## Procedure\n\n1. Apply it.\n"
+            ),
+        )]},
+        {"content": "Created applied-lesson."},
+    ])
+    seen: list[dict] = []
+
+    async def _capture(event):
+        seen.append(event.payload)
+
+    env.events.subscribe("review.completed", _capture)
+    outcome = await env.engine(router).run(conversation_id, explicit=True)
+
+    assert outcome.status == "completed", outcome.error
+    assert outcome.staged == []
+    assert outcome.created == [{
+        "skill": "applied-lesson",
+        "category": "development",
+        "description": "Use when a review applies a skill directly.",
+    }]
+    assert await env.skills.get("applied-lesson") is not None
+    from pathlib import Path
+
+    artifact = json.loads(Path(outcome.artifact_path).read_text(encoding="utf-8"))
+    assert artifact["created"] == outcome.created
+    assert seen and seen[0]["created"] == outcome.created

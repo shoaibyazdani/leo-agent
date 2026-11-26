@@ -13,6 +13,7 @@ node_modules/
 .leo/whatsapp/
 leo/integrations/whatsapp_bridge/node_modules/
 leo/integrations/whatsapp_bridge/.env
+leo/integrations/whatsapp_bridge/pair_code.out
 auth_info_baileys/
 whatsapp-session*
 

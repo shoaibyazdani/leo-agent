@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,21 @@ MIN_LIVE_COMMANDS = 35  # currently available slash commands, not all 127 specs
 MIN_LIVE_AGENTS = 24
 
 TEST_PATH_RE = re.compile(r"(?:tests/)[A-Za-z0-9_./-]+\.py")
+
+
+def _platform_tool_counts(live_tools: int) -> set[int]:
+    """Tool totals a truthful doc may quote: this platform and the other one.
+
+    The four ``computer_*`` operator tools register only on macOS, so a doc
+    that states both figures is correct on either host and this test must not
+    depend on the platform it runs on.
+    """
+    from leo.tools.operator_tools import _COMPUTER_SPECS
+
+    other = live_tools - len(_COMPUTER_SPECS) if sys.platform == "darwin" else \
+        live_tools + len(_COMPUTER_SPECS)
+    return {live_tools, other}
+
 
 
 def _live_roster_counts() -> tuple[int, int, int, int]:
@@ -139,19 +155,27 @@ def test_tool_command_and_agent_counts_match_test_backed_roster() -> None:
     assert live_commands >= MIN_LIVE_COMMANDS, f"live slash roster shrank to {live_commands}"
     assert all_commands >= live_commands
     assert live_agents >= MIN_LIVE_AGENTS, f"live agent roster shrank to {live_agents}"
+    # The platform-agnostic tool allowance must stay a tight pair, not a range:
+    # any other total is still a stale claim.
+    from leo.tools.operator_tools import _COMPUTER_SPECS
+
+    allowed_tools = _platform_tool_counts(live_tools)
+    delta = -len(_COMPUTER_SPECS) if sys.platform == "darwin" else len(_COMPUTER_SPECS)
+    assert allowed_tools == {live_tools, live_tools + delta}, allowed_tools
 
     progress = PROGRESS.read_text(encoding="utf-8")
     current = progress.split("## Milestone scope", 1)[0]
     claim_patterns = (
-        (r"(\d+)\s+registered\s+tools\b", live_tools),
-        (r"(\d+)\s+available\s+slash\s+commands\b", live_commands),
-        (r"(\d+)\s+registered\s+slash\s+commands\b", all_commands),
-        (r"(\d+)\s+specialist\s+agents\b", live_agents),
+        (r"(\d+)\s+registered\s+tools\b", _platform_tool_counts(live_tools)),
+        (r"(\d+)\s+available\s+slash\s+commands\b", {live_commands}),
+        (r"(\d+)\s+registered\s+slash\s+commands\b", {all_commands}),
+        (r"(\d+)\s+specialist\s+agents\b", {live_agents}),
     )
-    for pattern, live in claim_patterns:
+    for pattern, allowed in claim_patterns:
         claims = {int(n) for n in re.findall(pattern, current)}
-        assert claims == {live}, (
-            f"current-state claims {claims} for {pattern!r}, live composition root has {live}"
+        assert claims, f"current-state claim missing for {pattern!r}"
+        assert claims <= allowed, (
+            f"current-state claims {claims} for {pattern!r}, live composition root has {sorted(allowed)}"
         )
     for stale in ("90 registered tools", "93 registered tools", "34 available slash commands",
                   "20 specialist agents"):
@@ -159,9 +183,9 @@ def test_tool_command_and_agent_counts_match_test_backed_roster() -> None:
 
     markers = ("stale", "historical", "earlier")
     for line in progress.splitlines():
-        for pattern, live in claim_patterns:
+        for pattern, allowed in claim_patterns:
             for match in re.finditer(pattern, line):
-                if int(match.group(1)) != live:
+                if int(match.group(1)) not in allowed:
                     assert any(marker in line.lower() for marker in markers), line
         if "18 tools, 12 skills" in line:
             assert any(marker in line.lower() for marker in ("stale", "historical")), line

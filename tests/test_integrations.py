@@ -194,6 +194,42 @@ async def test_telegram_webhook_hmac_and_normalized_message(monkeypatch):
         await adapter.handle_webhook(payload, {})
 
 
+async def test_telegram_reply_context_and_native_reply(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 99}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = TelegramAdapter(client=client, require_verification=False)
+        messages = await adapter.handle_webhook({
+            "update_id": 1,
+            "message": {
+                "message_id": 12,
+                "date": 1700000000,
+                "text": "explain that",
+                "from": {"id": 42, "username": "alice"},
+                "chat": {"id": 42},
+                "reply_to_message": {
+                    "message_id": 11,
+                    "text": "A quoted earlier answer",
+                    "from": {"id": 99, "username": "leoboijibot", "is_bot": True},
+                },
+            },
+        })
+        assert len(messages) == 1
+        message = messages[0]
+        assert message.reply_ref == "11"
+        assert message.reply_text == "A quoted earlier answer"
+        assert message.reply_sender == "leoboijibot"
+        assert message.reply_is_bot is True
+        await adapter.send("42", "Here is the explanation", reply_to=message.reply_ref)
+    assert json.loads(requests[0].content)["reply_parameters"] == {"message_id": 11}
+
+
 async def test_telegram_send_uses_injected_client_and_hides_token(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token-should-never-leak")
     requests: list[httpx.Request] = []
@@ -562,6 +598,35 @@ async def test_gateway_inbound_routing_and_session_isolation(integration_db):
     assert len(seen) == 3 and seen[0].topic == GATEWAY_MESSAGE_TOPIC
     assert seen[0].payload["sender"] == "alice" and seen[0].payload["reply_ref"] == "7"
     assert any(call[0] == "gateway.receive" for call in permissions.calls)
+
+
+async def test_gateway_forwards_reply_context_and_threads_reply(integration_db, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 99}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = Gateway(
+            {"telegram": TelegramAdapter(client=client)},
+            events=EventBus(persist=False),
+            permissions=AllowAll(),
+            admission=ChannelAdmission(ChannelsConfig(default_mode="open")),
+        )
+        payload = await gateway.receive(NormalizedMessage(
+            channel="telegram", sender="alice", sender_id="42", conversation_ref="42",
+            text="explain that", reply_ref="11", reply_text="A quoted earlier answer",
+            reply_sender="leoboijibot", reply_is_bot=True,
+        ))
+        assert payload["reply_text"] == "A quoted earlier answer"
+        assert payload["reply_is_bot"] is True
+        sent = await gateway.send(
+            "telegram", "42", "Here is the explanation", reply_to=payload["reply_ref"]
+        )
+    assert sent["success"] is True
+    assert json.loads(requests[0].content)["reply_parameters"] == {"message_id": 11}
 
 
 async def test_gateway_history_respects_permissions(integration_db):

@@ -8,8 +8,9 @@ narrative changelog.
 - Provider-independent agent platform: streaming chat in the dashboard and in
   the terminal (`leo chat`), durable tasks, layered memory, specialist agents,
   native tools and skills, approvals with audit, integrations adapters.
-- Measured from the live `LeoApp.initialize()` composition root: 108
-  registered tools, 42 available slash commands (126 registered slash
+- Measured from the live `LeoApp.initialize()` composition root: 104
+  registered tools on Linux (108 on macOS, which adds the four `computer_*`
+  operator tools), 42 available slash commands (126 registered slash
   commands in total) and 24 specialist agents.
 - Agent-managed skills: `skill_manage` creates documentation-only skills
   (no executable handler) with a fresh-read requirement, a 60-character
