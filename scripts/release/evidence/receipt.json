@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "owner": "leo",
+  "evidence_source": "leo_local_test_run",
+  "upstream_test_evidence": false,
+  "generated_at": "2026-11-26T07:28:58.994762+00:00",
+  "command": ".venv/bin/python -m pytest --junitxml=scripts/release/evidence/junit.xml",
+  "junit_xml": "scripts/release/evidence/junit.xml",
+  "junit_sha256": "c5ea2be4f99487441b52eb21b3cf692eb13e4691deda4e9a66d38891a1fe63fd",
+  "summary": {
+    "total": 2949,
+    "passed": 2924,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 25
+  },
+  "checks": {
+    "migration_drill": {
+      "status": "unverified",
+      "reason": "Migration unit tests ran, but no production-copy WAL drill was performed locally.",
+      "evidence": [
+        "tests/test_schedule_migration.py"
+      ]
+    },
+    "backup_restore": {
+      "status": "unverified",
+      "reason": "No backup/restore drill was performed; rollback remains a documented procedure.",
+      "evidence": []
+    },
+    "tui_pty": {
+      "status": "partial",
+      "reason": "TUI card projection tests ran; no interactive PTY session was driven.",
+      "evidence": [
+        "tests/test_schedule_tui.py"
+      ]
+    },
+    "playwright_dom": {
+      "status": "partial",
+      "reason": "Static UI contract checks passed; Chromium is absent, so real DOM checks skipped.",
+      "evidence": [
+        "tests/test_playwright_approval_cards.py"
+      ]
+    },
+    "telegram_mock_transport": {
+      "status": "verified",
+      "reason": "Offline MockTransport tests cover literal plain-text cards, chunks and callbacks.",
+      "evidence": [
+        "tests/test_messaging_telegram.py"
+      ]
+    },
+    "telegram_live_smoke": {
+      "status": "unverified",
+      "reason": "No live Telegram credential or send was used; live delivery is unverified.",
+      "evidence": []
+    },
+    "split_gateway_two_process": {
+      "status": "partial",
+      "reason": "Offline split-gateway tests ran; no separately deployed two-process smoke was performed.",
+      "evidence": [
+        "tests/test_gateway_split.py"
+      ]
+    }
+  },
+  "notes": [
+    "Only LEO's own pytest run produced the counts in this receipt.",
+    "Source-project tests were not executed and are not evidence of LEO behavior."
+  ]
+}

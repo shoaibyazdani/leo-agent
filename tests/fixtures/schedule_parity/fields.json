@@ -1,0 +1,548 @@
+{
+  "schema_version": 1,
+  "oracle_commit": "7cf9e92cd6277b327b36a51fb897cdc8403902d6",
+  "declared_model_fields": [
+    "action",
+    "attach_to_session",
+    "catch_up",
+    "context_from",
+    "continuity",
+    "deliver",
+    "enabled_toolsets",
+    "failure_deliver",
+    "job_id",
+    "monitor",
+    "name",
+    "no_agent",
+    "paused",
+    "paused_reason",
+    "pinned",
+    "prompt",
+    "repeat",
+    "schedule",
+    "script",
+    "skills",
+    "timezone",
+    "workdir",
+    "wrap_response"
+  ],
+  "handler_forwarded_fields": [
+    "job_id",
+    "prompt",
+    "schedule",
+    "name",
+    "repeat",
+    "deliver",
+    "failure_deliver",
+    "skill",
+    "skills",
+    "reason",
+    "script",
+    "context_from",
+    "continuity",
+    "enabled_toolsets",
+    "workdir",
+    "no_agent",
+    "attach_to_session",
+    "paused_reason",
+    "pinned",
+    "timezone",
+    "grace_minutes",
+    "catch_up",
+    "wrap_response"
+  ],
+  "legacy_compat_fields": [
+    "job_id",
+    "prompt",
+    "schedule",
+    "name",
+    "repeat",
+    "deliver",
+    "failure_deliver",
+    "skill",
+    "skills",
+    "reason",
+    "script",
+    "context_from",
+    "continuity",
+    "enabled_toolsets",
+    "workdir",
+    "no_agent",
+    "attach_to_session",
+    "paused_reason",
+    "pinned",
+    "timezone",
+    "grace_minutes",
+    "catch_up",
+    "wrap_response",
+    "include_disabled",
+    "monitor_script",
+    "monitor_url"
+  ],
+  "operator_only_fields": [
+    "provider",
+    "model",
+    "base_url",
+    "reasoning_effort",
+    "interpreter"
+  ],
+  "internal_fields": [
+    "approve",
+    "session_id"
+  ],
+  "fields": {
+    "action": {
+      "exposure": [
+        "declared_model_schema"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "One of: create, list, update, pause, resume, remove, run, cancel. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+      },
+      "semantics": "Dispatches create/list/update/pause/resume/remove/run/cancel; run_now and trigger are run aliases.",
+      "storage": "handler/local value"
+    },
+    "approve": {
+      "exposure": [
+        "internal_or_handler_direct"
+      ],
+      "declared_schema": null,
+      "semantics": "Internal model-boundary flag; direct Python callers omit it.",
+      "storage": "handler/local value"
+    },
+    "attach_to_session": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "boolean",
+        "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), a user-written bare platform target (deliver='slack' — that platform's home channel), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
+      },
+      "semantics": "Makes an eligible single delivery conversation continuable; broadcast and local are not attached.",
+      "storage": "attach_to_session"
+    },
+    "base_url": {
+      "exposure": [
+        "operator_programmatic_only"
+      ],
+      "declared_schema": null,
+      "semantics": "Operator/programmatic endpoint with credential-origin validation; never forwarded by the model handler.",
+      "storage": "handler/local value"
+    },
+    "catch_up": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "boolean",
+        "description": "Runs missed while the machine was off: true = run once on return, false = skip. Omit for the default (recurring run once, one-shots skip)."
+      },
+      "semantics": "Tri-state missed-run policy; only real booleans or null are accepted by storage.",
+      "storage": "handler/local value"
+    },
+    "context_from": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional job ID(s) whose most recent completed output is injected as context each run — chains jobs (A collects, B processes). For a job's OWN previous output prefer `continuity`. On update, [] clears."
+      },
+      "semantics": "Existing job IDs whose latest completed output is injected; self denotes this job.",
+      "storage": "context_from"
+    },
+    "continuity": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "boolean",
+        "description": "True = each run sees the job's own previous output, so it can dedupe and continue where it left off (scouts, monitors, incremental digests). Default false. On update, false turns it off."
+      },
+      "semantics": "True adds self to context_from; false removes it.",
+      "storage": "context_from contains self"
+    },
+    "deliver": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Where the job's output is POSTED as a one-way message (the job itself always runs in a fresh session with no chat context). Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (inject into a Bot Chat as a real message), 'room:<room_id>' (post into a Bot Mode Group Chat; it starts a round only for members the output @mentions), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'. From a local chat (CLI, TUI or Desktop) the default writes the result into that chat's history as a note, seen when the chat is reopened and by its next turn, not as a live message."
+      },
+      "semantics": "Comma-separated routing tokens resolved by the same scheduler resolver used at run time.",
+      "storage": "handler/local value"
+    },
+    "enabled_toolsets": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\"]) — cuts token overhead. Infer from the prompt. Omit for all default tools. [] = an explicit zero-tool allowlist (the job's agent gets no toolsets, MCP servers included unless named); it is preserved as [], never widened back to the default."
+      },
+      "semantics": "Absent inherits defaults; [] is an explicit zero-tool allowlist.",
+      "storage": "enabled_toolsets"
+    },
+    "failure_deliver": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Optional override target for FAILURE notices only (same grammar as deliver). When set, engine failure/interruption notices go here instead of the deliver target; 'local' suppresses them entirely (state still recorded in cron list/run history). Use for jobs delivering into shared channels where failure noise is unwanted. Omit = failures follow deliver (default). On update, '' clears."
+      },
+      "semantics": "Optional separate failure lane; empty string clears on update.",
+      "storage": "handler/local value"
+    },
+    "grace_minutes": {
+      "exposure": [
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": null,
+      "semantics": "Cron-only catch-up override in whole minutes from 0 through 1440; 0 is preserved.",
+      "storage": "grace_minutes"
+    },
+    "include_disabled": {
+      "exposure": [
+        "legacy_compat",
+        "internal_or_handler_direct"
+      ],
+      "declared_schema": null,
+      "semantics": "Handler-only list switch; model dispatch defaults it to true.",
+      "storage": "handler/local value"
+    },
+    "interpreter": {
+      "exposure": [
+        "operator_programmatic_only"
+      ],
+      "declared_schema": null,
+      "semantics": "Operator/programmatic Python interpreter for scripts; absent from the model surface.",
+      "storage": "handler/local value"
+    },
+    "job_id": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Required for update/pause/resume/remove/run/cancel."
+      },
+      "semantics": "See the frozen shared schema and handler source.",
+      "storage": "handler/local value"
+    },
+    "model": {
+      "exposure": [
+        "operator_programmatic_only"
+      ],
+      "declared_schema": null,
+      "semantics": "Operator/programmatic inference model; never forwarded by the model handler.",
+      "storage": "handler/local value"
+    },
+    "monitor": {
+      "exposure": [
+        "declared_model_schema",
+        "internal_or_handler_direct"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Optional change-detector that gates the agent: an http(s) URL (fetched each tick) or a script path (same rules as `script`, run each tick) — cheap, no LLM. Output identical to the previous tick skips the agent run entirely; changed output wakes the agent with a diff injected into the prompt. First tick always runs (baseline). Output must be deterministic (no timestamps) or every tick looks changed. Incompatible with no_agent. On update, '' clears."
+      },
+      "semantics": "http(s) URL or script path; first successful sample baselines, unchanged suppresses, change wakes the agent.",
+      "storage": "monitor_script or monitor_url"
+    },
+    "monitor_script": {
+      "exposure": [
+        "legacy_compat"
+      ],
+      "declared_schema": null,
+      "semantics": "Legacy stored script monitor alias; model-facing monitor is canonical.",
+      "storage": "handler/local value"
+    },
+    "monitor_url": {
+      "exposure": [
+        "legacy_compat"
+      ],
+      "declared_schema": null,
+      "semantics": "Legacy stored URL monitor alias; model-facing monitor is canonical.",
+      "storage": "handler/local value"
+    },
+    "name": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Optional human-friendly name"
+      },
+      "semantics": "Optional saved label; blank falls back to prompt/skill/script-derived text.",
+      "storage": "handler/local value"
+    },
+    "no_agent": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "boolean",
+        "default": false,
+        "description": "True = no LLM: the scheduler runs `script` (required) on schedule and delivers its stdout verbatim; empty stdout sends nothing (watchdog pattern). Use for script-only pings with fixed output; keep False for anything needing reasoning."
+      },
+      "semantics": "Requires script; stdout is the result, empty stdout sends nothing, nonzero/timeout is an error.",
+      "storage": "no_agent"
+    },
+    "paused": {
+      "exposure": [
+        "declared_model_schema",
+        "internal_or_handler_direct"
+      ],
+      "declared_schema": {
+        "type": "boolean",
+        "description": "Create only: persist disabled atomically. Resume to schedule; explicit run remains available. Default false."
+      },
+      "semantics": "Create-only disabled state; explicit run remains available.",
+      "storage": "handler/local value"
+    },
+    "paused_reason": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Create only: auditable reason; requires paused=true."
+      },
+      "semantics": "Create-only auditable reason requiring paused=true.",
+      "storage": "handler/local value"
+    },
+    "pinned": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "boolean",
+        "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later `/model` changes never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
+      },
+      "semantics": "True snapshots the current operator provider/model; false clears the pin; no separate pinned field is stored.",
+      "storage": "provider/model"
+    },
+    "prompt": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "For create/update: the full self-contained prompt (when it runs goes in 'schedule'; data windows like 'since yesterday' stay here; paired with any skills as the task instruction). For run: optional transient context for that single fire (never persisted)."
+      },
+      "semantics": "Full self-contained job instruction; run uses it as transient one-fire context.",
+      "storage": "handler/local value"
+    },
+    "provider": {
+      "exposure": [
+        "operator_programmatic_only"
+      ],
+      "declared_schema": null,
+      "semantics": "Operator/programmatic inference provider; never forwarded by the model handler.",
+      "storage": "handler/local value"
+    },
+    "reason": {
+      "exposure": [
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": null,
+      "semantics": "Handler-only pause/cancel reason; absent from the declared model schema.",
+      "storage": "handler/local value"
+    },
+    "reasoning_effort": {
+      "exposure": [
+        "operator_programmatic_only"
+      ],
+      "declared_schema": null,
+      "semantics": "Operator/programmatic inference effort override; absent from the model surface.",
+      "storage": "handler/local value"
+    },
+    "repeat": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "integer",
+        "description": "Optional number of runs, after which the job completes (e.g. 'every day at 8am' + repeat=3 = the next three mornings). Omit for defaults (once for one-shot, forever for recurring)."
+      },
+      "semantics": "Omitted is forever for recurring and one for one-shot; numeric strings normalize; non-positive becomes forever in the oracle.",
+      "storage": "repeat.times"
+    },
+    "schedule": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "REQUIRED for create. Schedule forms: (1) recurring interval — '30m', 'every 2h', 'every hour' (EVERY 30 minutes / 2 hours / hour, forever by default); (2) explicit one-shot by duration — 'in 30m', 'in 2h' (fires ONCE that far from now; use this for 'remind me in N minutes' — do NOT hand-compute an absolute timestamp); (3) natural day/time — 'every monday 9am', 'weekdays at 9am', 'every day at 9am' (recurring weekly/daily); (4) cron syntax — '0 9 * * *' (daily 9am); (5) absolute one-shot — ISO timestamp '2026-06-01T09:00:00'."
+      },
+      "semantics": "Parsed to once, interval or cron before persistence; bare durations recur and 'in <duration>' is one-shot.",
+      "storage": "handler/local value"
+    },
+    "script": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Optional script run each tick; stdout is injected into the agent's prompt as context (with no_agent=True the script IS the job). Relative paths resolve under the profile SOURCE_PROJECT_HOME/scripts/; .sh/.bash via bash, else Python. On update, '' clears."
+      },
+      "semantics": "Relative file under the source project's scripts directory; stdout feeds the agent unless no_agent is true.",
+      "storage": "script"
+    },
+    "session_id": {
+      "exposure": [
+        "internal_or_handler_direct"
+      ],
+      "declared_schema": null,
+      "semantics": "Internal background-run completion routing key, not a model field.",
+      "storage": "handler/local value"
+    },
+    "skill": {
+      "exposure": [
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": null,
+      "semantics": "Legacy singular skill alias; canonicalized into ordered unique skills.",
+      "storage": "handler/local value"
+    },
+    "skills": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional ordered skill names loaded before the cron prompt. On update, [] clears."
+      },
+      "semantics": "Ordered unique skill names loaded before the job prompt; [] clears on update.",
+      "storage": "skills and legacy skill"
+    },
+    "timezone": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Optional IANA zone (e.g. 'America/New_York') the cron expression is read in, instead of the profile's. On update, '' clears."
+      },
+      "semantics": "IANA zone for recurring wall-clock schedules; empty clears on update.",
+      "storage": "handler/local value"
+    },
+    "workdir": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "description": "Optional absolute existing path to run the job from: injects that directory's AGENTS.md/context files and anchors terminal/file tools there. On update, '' clears."
+      },
+      "semantics": "Absolute existing directory anchoring tools/scripts; relative and missing paths reject.",
+      "storage": "handler/local value"
+    },
+    "wrap_response": {
+      "exposure": [
+        "declared_model_schema",
+        "model_handler",
+        "legacy_compat"
+      ],
+      "declared_schema": {
+        "type": "string",
+        "enum": [
+          "on",
+          "off",
+          "inherit"
+        ],
+        "description": "Per-job override for the 'Cronjob Response: <name>' header and 'To stop or manage this job...' footer around delivered output. 'on' wraps; 'off' delivers the raw output verbatim (useful for briefings meant to read clean); 'inherit' removes an override so the job follows the global cron.wrap_response again. Omit to leave it unchanged (a new job inherits)."
+      },
+      "semantics": "on/off/inherit maps to true/false/null for delivered framing.",
+      "storage": "wrap_response"
+    }
+  },
+  "required_runtime_semantics": [
+    "attach_to_session",
+    "context_from",
+    "continuity",
+    "enabled_toolsets",
+    "grace_minutes",
+    "monitor",
+    "no_agent",
+    "pinned",
+    "script",
+    "skills",
+    "workdir",
+    "wrap_response"
+  ],
+  "leo_field_adaptations": {
+    "script": "operator-allowlisted executable path, opt-in, args supplied by operator provisioning rather than a new model field",
+    "no_agent": "distinct native script-only execution with durable evidence",
+    "monitor": "existing egress-checked HTTP client or restricted script runner; no headers/cookies/private targets",
+    "context_from": "latest completed native task outputs, cycle rejection and bounded injection",
+    "continuity": "bounded own previous completed output with a first-run note",
+    "enabled_toolsets": "intersect the agent allowlist; [] means no tools",
+    "skills": "freeze a creation-time documentation snapshot and inject it at run time",
+    "wrap_response": "control delivered text and include it in the edit fingerprint",
+    "workdir": "anchor tools/scripts inside LEO allowed roots; not an OS chroot",
+    "attach_to_session": "create/use a durable native job conversation and expose a compact next-reply brief",
+    "pinned": "store operator-owned provider/model; missing target fails closed with needs-you",
+    "grace_minutes": "operator/programmatic-only late-run policy; model requests are rejected"
+  },
+  "removed_scope_absent": [
+    "inline script authoring",
+    "per-job script state directories",
+    "gate-context/watchdog machinery",
+    "connector-call facade",
+    "watcher skills/templates"
+  ]
+}

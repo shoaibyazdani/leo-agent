@@ -388,3 +388,32 @@ security:
     # `~` is expanded per operator (see Settings.resolve), so this file stays
     # portable; add absolute roots only in a local, uncommitted override.
     - ~/Downloads
+
+automation:
+  # Scheduler cadence and the durable background-task concurrency gate.
+  tick_seconds: 1.0
+  max_concurrent_tasks: 4
+  default_task_timeout_seconds: 3600
+  # Conditional proactive scheduling guidance. off removes the hint only;
+  # offer is the shipped default; create is opt-in and never bypasses cards.
+  proactive_mode: offer
+  # Scheduled script execution is operator-provisioned and opt-in. Scripts run
+  # without a shell, with a minimal environment, from `scripts_root`, under a
+  # timeout and output cap. A relative `script` resolves here; an absolute path
+  # must stay inside it.
+  allow_scripts: false
+  scripts_root: ~/LEO/scripts/scheduled
+  script_timeout_seconds: 60
+  script_max_output_bytes: 200000
+  # URL monitors use the same egress-checked HTTP client; script monitors use
+  # the restricted runner above.
+  monitor_timeout_seconds: 20
+  monitor_max_bytes: 200000
+  # Unified delivery context. `home` and `all` resolve only to configured
+  # platform:chat[:thread] homes. Named bot-chat profiles and local:<id>
+  # conversations must be listed here to resolve. room:<id> requires a
+  # room-capable adapter plus this default room channel, or it is rejected.
+  home_channels: []
+  bot_profiles: []
+  local_conversations: []
+  default_room_channel: null

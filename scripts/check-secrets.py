@@ -99,7 +99,7 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "tests/channels/test_signal.py": {"30": "test fixture", "32": "test fixture"},
     "tests/channels/test_slack.py": {"21": "test fixture", "83": "test fixture"},
     "tests/channels/test_teams.py": {"32": "test fixture"},
-    "tests/test_agents_automation_operator.py": {"33": "test fixture"},
+    "tests/test_agents_automation_operator.py": {"40": "test fixture"},
     "tests/test_agents_reviewer.py": {"143": "test fixture"},
     "tests/test_commands.py": {"514": "test fixture"},
     "tests/test_tools_http.py": {
@@ -127,7 +127,53 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "scripts/leo_conversation_observer.py": {
         "1607": "synthetic leak-token fixture used to verify redaction on disk",
     },
-    "tests/test_api.py": {"241": "test fixture", "452": "test fixture", "489": "test fixture"},
+    "tests/test_api.py": {
+        "241": "test fixture", "345": "synthetic failure-message fixture",
+        "452": "test fixture", "489": "test fixture",
+        "556": "synthetic secret fixture", "593": "synthetic secret fixture",
+    },
+    # Pinned commits and SHA-256 evidence in the scheduling parity corpus are
+    # integrity metadata, never credentials.
+    "docs/SCHEDULES.md": {"1-": "only=long hex: pinned commit identifiers"},
+    "scripts/release/evidence/junit.xml": {
+        "1": "synthetic parametrized test-case names from existing redaction fixtures, not live credentials",
+    },
+    "scripts/release/evidence/receipt.json": {
+        "1-": "only=long hex: JUnit SHA-256 evidence hash",
+    },
+    "scripts/schedule_parity/extract_fixtures.py": {
+        "19": "only=long hex: pinned oracle commit",
+    },
+    "scripts/schedule_parity/run_baseline.py": {
+        "18-19": "only=long hex: pinned baseline commit and lock hash",
+    },
+    "tests/fixtures/schedule_parity/acceptance_matrix.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/cancel.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/create.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/list.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/pause.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/remove.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/resume.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/run.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/update.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/baseline/receipt.json": {"1-": "only=long hex: pinned baseline and evidence hashes"},
+    "tests/fixtures/schedule_parity/baseline_failures.json": {"1-": "only=long hex: pinned baseline commit"},
+    "tests/fixtures/schedule_parity/consent_cards.json": {"1-": "only=long hex: pinned commit and source hashes"},
+    "tests/fixtures/schedule_parity/delivery_tokens.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/fields.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/grammar.json": {"1-": "only=long hex: pinned commit and source hashes"},
+    "tests/fixtures/schedule_parity/oracle_manifest.json": {"1-": "only=long hex: pinned oracle and fixture hashes"},
+    "tests/fixtures/schedule_parity/repeat.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/tool_schema.json": {"1-": "only=long hex: pinned commit and schema hashes"},
+    "tests/test_schedule_safety.py": {
+        "71-139": "synthetic secret and control-character fixtures exercising the scanner and redactor",
+    },
+    "tests/test_schedule_security.py": {
+        "28": "synthetic unsafe-prompt fixture", "110": "assertion that the synthetic token is absent",
+    },
+    "tests/test_secret_sinks.py": {
+        "290": "synthetic PEM fixture used to verify redaction",
+    },
     "tests/test_chat_tools.py": {"1298": "test fixture"},
     "tests/test_conversation_observer.py": {
         "92-103": "synthetic tokens exercising the redactor",

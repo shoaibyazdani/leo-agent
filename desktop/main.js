@@ -3,7 +3,7 @@
 // process owns the API token (if any) and never sends it to the renderer.
 'use strict';
 
-const { app, BrowserWindow, dialog, Menu, ipcMain, shell, session } = require('electron');
+const { app, BrowserWindow, dialog, Menu, ipcMain, Notification, shell, session } = require('electron');
 const { spawn } = require('node:child_process');
 const http = require('node:http');
 const https = require('node:https');
@@ -21,6 +21,9 @@ const CHANNELS = Object.freeze({
   OPEN_SETTINGS: 'leo:open-settings',
   RELOAD: 'leo:reload',
   API_STATUS: 'leo:api-status',
+  // Notification-only: shows schedule copy, never approves or denies. This is
+  // not a second event transport; it is a one-way display request.
+  NOTIFY: 'leo:notify',
 });
 
 const VIEWS = new Set([
@@ -438,6 +441,18 @@ ipcMain.handle(CHANNELS.HEALTH, async () => refreshHealth());
 ipcMain.handle(CHANNELS.OPEN_SETTINGS, async () => openSettings());
 ipcMain.handle(CHANNELS.RELOAD, async () => reloadShell());
 ipcMain.handle(CHANNELS.API_STATUS, async () => apiStatus());
+// Notification-only bridge: bounded text, no buttons, no approval channel.
+ipcMain.handle(CHANNELS.NOTIFY, async (_event, payload = {}) => {
+  const title = safeText(payload && payload.title ? payload.title : 'LEO', 120);
+  const body = safeText(payload && payload.body ? payload.body : '', 1200);
+  if (!Notification.isSupported()) return { shown: false, reason: 'unsupported' };
+  const notification = new Notification({ title: title || 'LEO', body });
+  // Clicking only focuses the in-app approvals view. There is no button, no
+  // decision payload and no approval authority in this IPC channel.
+  notification.on('click', () => { void showView('approvals'); if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show(); });
+  notification.show();
+  return { shown: true };
+});
 
 app.whenReady().then(async () => {
   installContentSecurityPolicy();

@@ -12,6 +12,7 @@ reclaims it after the expiry, so the turn runs again rather than vanishing.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import socket
@@ -20,7 +21,9 @@ from typing import Any
 
 import httpx
 
-from .server import token_path
+from ..contracts import INCAPABLE_SURFACE, TurnContext, surface_capabilities
+from ..security.approval_cards import presenting_cards_via, schedule_terminal_text
+from .server import APPROVAL_RPC_PROTOCOL, gateway_approval_channels, token_path
 
 _LOG = logging.getLogger(__name__)
 
@@ -68,16 +71,69 @@ class GatewayClient:
     async def complete(self, admission_id: str, answer: str,
                        conversation_id: str = "",
                        reply_markup: dict[str, Any] | None = None,
-                       edit_message_id: str | None = None) -> dict[str, Any]:
+                       edit_message_id: str | None = None, *,
+                       principal: str | None = None,
+                       thread_id: str | None = None,
+                       reply_target: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"admission_id": admission_id, "answer": answer,
                                 "conversation_id": conversation_id}
         if reply_markup:
             body["reply_markup"] = reply_markup
         if edit_message_id:
             body["edit_message_id"] = edit_message_id
+        # Echo the identity the worker was admitted with. The gateway verifies
+        # it and still delivers to the admission's own target, never this body.
+        if principal:
+            body["principal"] = principal
+        if thread_id:
+            body["thread_id"] = thread_id
+        if reply_target:
+            body["reply_target"] = reply_target
         response = await self._http().post("/v1/complete", json=body)
         if response.status_code != 200:
             raise GatewayClientError(f"complete failed: HTTP {response.status_code}")
+        return response.json()
+
+    async def approval_present(
+        self, admission_id: str, approval_id: str, digest: str, *,
+        principal: str | None = None, thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "admission_id": admission_id, "approval_id": approval_id,
+            "confirm_proposal_digest": digest,
+        }
+        if principal:
+            body["principal"] = principal
+        if thread_id:
+            body["thread_id"] = thread_id
+        response = await self._http().post("/v1/approval/present", json=body)
+        if response.status_code != 200:
+            raise GatewayClientError(
+                f"approval present failed: HTTP {response.status_code} {response.text[:200]}"
+            )
+        return response.json()
+
+    async def approval_ack(self, admission_id: str, approval_id: str) -> dict[str, Any]:
+        response = await self._http().post("/v1/approval/ack", json={
+            "admission_id": admission_id, "approval_id": approval_id,
+        })
+        if response.status_code != 200:
+            raise GatewayClientError(
+                f"approval ack failed: HTTP {response.status_code} {response.text[:200]}"
+            )
+        return response.json()
+
+    async def approval_update(
+        self, admission_id: str, approval_id: str, digest: str, text: str,
+    ) -> dict[str, Any]:
+        response = await self._http().post("/v1/approval/update", json={
+            "admission_id": admission_id, "approval_id": approval_id,
+            "confirm_proposal_digest": digest, "text": text,
+        })
+        if response.status_code != 200:
+            raise GatewayClientError(
+                f"approval update failed: HTTP {response.status_code} {response.text[:200]}"
+            )
         return response.json()
 
     async def redeem_ticket(self, ticket: str) -> str:
@@ -231,6 +287,136 @@ async def _abandon_turn(
         pass
 
 
+def _accepts_turn(callable_obj: Any) -> bool:
+    """True when a brain's ask() accepts the trusted ``turn`` keyword.
+
+    A real ``LeoApp.ask`` always does. Test/double brains that predate the
+    keyword keep working; for them the admission identity is still preserved on
+    the reply path by the gateway.
+    """
+    try:
+        params = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        param.name == "turn" or param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in params
+    )
+
+
+def admission_turn(
+    admission: Mapping[str, Any],
+    *,
+    approval_channels: frozenset[str] = frozenset(),
+) -> TurnContext:
+    """Build the trusted turn context from durable admission facts.
+
+    A gateway channel is card-capable only when the gateway advertised the
+    approval protocol and native inbound identity/terminal rewrite for it.
+    Everything else is incapable by default, so no card can be created there.
+    """
+    channel = str(admission.get("channel") or "gateway")
+    payload = admission.get("payload") or {}
+    if not isinstance(payload, Mapping):
+        payload = {}
+    return TurnContext(
+        principal=str(
+            admission.get("principal")
+            or payload.get("principal")
+            or payload.get("sender_id")
+            or "gateway"
+        ),
+        channel=channel,
+        conversation_id=(
+            str(admission.get("conversation_id"))
+            if admission.get("conversation_id") else None
+        ),
+        thread_id=(
+            str(admission.get("thread_id") or payload.get("thread") or payload.get("thread_id"))
+            if admission.get("thread_id") or payload.get("thread") or payload.get("thread_id")
+            else None
+        ),
+        target=str(
+            admission.get("reply_target")
+            or admission.get("subject")
+            or payload.get("reply_target")
+            or ""
+        ) or None,
+        surface=channel,
+        capabilities=(
+            surface_capabilities(channel) if channel in approval_channels
+            else INCAPABLE_SURFACE
+        ),
+        origin=f"gateway:{channel}",
+        source="gateway",
+    )
+
+
+async def _present_gateway_card(
+    client: GatewayClient,
+    admission: Mapping[str, Any],
+    presented: dict[str, dict[str, Any]],
+    approval_id: str,
+) -> bool:
+    """Transport delegate used by PermissionManager when the worker asks it
+    to present a card. The shared approval row is read, never rewritten here.
+    """
+    from .. import db
+    from ..security.approval_cards import is_schedule_kind
+
+    row = await db.fetchone("SELECT kind, digest FROM approvals WHERE id=?", (approval_id,))
+    if row is None or not is_schedule_kind(str(row["kind"] or "")):
+        return False
+    admission_id = str(admission.get("admission_id") or "")
+    response = await client.approval_present(
+        admission_id, approval_id, str(row["digest"] or ""),
+        principal=str(admission.get("principal") or "") or None,
+        thread_id=str(admission.get("thread_id") or "") or None,
+    )
+    if not response.get("presented"):
+        return False
+    await client.approval_ack(admission_id, approval_id)
+    presented[approval_id] = {
+        "message_id": str(response.get("message_id") or ""),
+        "digest": str(row["digest"] or ""),
+    }
+    return True
+
+
+async def _settle_gateway_cards(
+    client: GatewayClient,
+    app: Any,
+    admission_id: str,
+    presented: dict[str, dict[str, Any]],
+) -> None:
+    """Wait on the shared approval row and rewrite cards the gateway showed.
+
+    The lease keeps renewing while this runs: a human can still decide while
+    the worker's turn is open. A card that expires is rewritten as expired,
+    never as approved.
+    """
+    permissions = getattr(app, "permissions", None)
+    if permissions is None:
+        return
+    for approval_id, record in list(presented.items()):
+        card = await permissions.get_schedule_card(approval_id)
+        if card is None:
+            continue
+        if str(card.status or "") == "pending":
+            try:
+                card = await permissions.wait_for_schedule_card(approval_id)
+            except (TimeoutError, asyncio.TimeoutError):
+                continue
+        text = schedule_terminal_text(card, status=str(card.status or ""))
+        try:
+            await client.approval_update(
+                admission_id, approval_id, str(card.proposal_digest or record["digest"]), text
+            )
+        except (httpx.HTTPError, GatewayClientError) as exc:
+            _LOG.warning("gateway card rewrite failed: %s: %s",
+                         approval_id, exc, extra={"approval_id": approval_id})
+
+
 async def _claim_loop(
     client: GatewayClient,
     app: Any,
@@ -240,6 +426,7 @@ async def _claim_loop(
     lease_seconds: int,
     once: bool,
     turn_max_seconds: float,
+    approval_channels: frozenset[str] = frozenset(),
 ) -> int:
     """One claim/answer loop. Several of these share a client and a brain."""
     answered = 0
@@ -259,19 +446,32 @@ async def _claim_loop(
         payload = admission.get("payload") or {}
         text = str(payload.get("text") or "")
         admission_id = str(admission.get("admission_id") or "")
+        turn_ctx = admission_turn(admission, approval_channels=approval_channels)
         keepalive = asyncio.create_task(
             _keep_lease(client, admission_id, me, lease_seconds, turn_max_seconds),
             name="leo-lease",
         )
-        turn = asyncio.create_task(
-            app.ask(
-                text,
-                channel=str(admission.get("channel") or "gateway"),
-                subject=str(admission.get("subject") or ""),
-                conversation_id=admission.get("conversation_id") or None,
-            ),
-            name="leo-turn",
-        )
+        ask_kwargs: dict[str, Any] = {}
+        if _accepts_turn(app.ask):
+            ask_kwargs["turn"] = turn_ctx
+        presented: dict[str, dict[str, Any]] = {}
+
+        async def present(approval_id: str, surface: str) -> bool:
+            # The gateway holds the adapter. Only after it confirms delivery
+            # does PermissionManager record shown_at on the shared row.
+            return await _present_gateway_card(client, admission, presented, approval_id)
+
+        with presenting_cards_via(present if turn_ctx.capabilities.can_present_card else None):
+            turn = asyncio.create_task(
+                app.ask(
+                    text,
+                    channel=str(admission.get("channel") or "gateway"),
+                    subject=str(admission.get("subject") or ""),
+                    conversation_id=admission.get("conversation_id") or None,
+                    **ask_kwargs,
+                ),
+                name="leo-turn",
+            )
         try:
             # Whichever finishes first decides the fate of the turn. Without this
             # race the ceiling only stopped RENEWING: the worker kept working,
@@ -295,11 +495,21 @@ async def _claim_loop(
                                       retry=False)
                 except (httpx.HTTPError, GatewayClientError):
                     pass
+            await _settle_gateway_cards(client, app, admission_id, presented)
             await client.complete(
                 admission_id, answer,
                 str(result.get("conversation_id") or ""),
                 reply_markup=_answer_markup(result),
                 edit_message_id=payload.get("source_message_id") or None,
+                # Preserve the admitted sender identity and thread the gateway
+                # verifies before it delivers to the admission's own target.
+                principal=str(admission.get("principal") or "") or None,
+                thread_id=(
+                    str(admission.get("thread_id") or "") or None
+                ),
+                reply_target=(
+                    str(admission.get("reply_target") or "") or None
+                ),
             )
             answered += 1
         except asyncio.CancelledError:
@@ -355,6 +565,13 @@ async def run_worker(
         client.token = await client.redeem_ticket(ticket)
     elif not token:
         client.token = resolve_token(None)
+    # A gateway older than the card protocol advertises no approval fields.
+    # Fail closed: no schedule card is created or shown on such a gateway.
+    try:
+        health = await client.health()
+    except (httpx.HTTPError, GatewayClientError):
+        health = {}
+    approval_channels = gateway_approval_channels(health)
     app = brain or LeoApp()
     await app.initialize()
     me = worker_id()
@@ -363,7 +580,8 @@ async def run_worker(
         asyncio.create_task(
             _claim_loop(client, app, f"{me}:{index + 1}",
                         wait_seconds=wait_seconds, lease_seconds=lease_seconds,
-                        once=once, turn_max_seconds=turn_max_seconds),
+                        once=once, turn_max_seconds=turn_max_seconds,
+                        approval_channels=approval_channels),
             name=f"leo-claim-{index + 1}",
         )
         for index in range(max(1, int(concurrency)))

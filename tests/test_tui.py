@@ -82,6 +82,47 @@ async def test_approve_command_resolves_as_operator_principal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tui_presents_and_resolves_a_schedule_card_with_a_choice() -> None:
+    from leo import db
+
+    app = await _mock_app()
+    try:
+        card = await app.permissions.create_schedule_card(
+            kind="schedule_create",
+            body='Schedule "Water" (every day at 8am): Drink water.',
+            proposal_digest="tui-digest",
+            requested_by="chat:web",
+            conversation_id="conv-tui",
+        )
+        console, stream = _console()
+        tui = tui_mod.ChatTUI(app, console=console)
+
+        assert await tui.run_command("approvals", []) is True
+        row = await db.fetchone(
+            "SELECT shown_at FROM approvals WHERE id=?", (card.approval_id,)
+        )
+        assert row["shown_at"], "listing the full card on the TUI is presentation"
+        assert "Allow for this chat [session]" in stream.getvalue()
+
+        assert await tui.run_command(
+            "approve", [card.approval_id, "session"]
+        ) is True
+        row = await db.fetchone(
+            "SELECT status FROM approvals WHERE id=?", (card.approval_id,)
+        )
+        assert row["status"] == "approved"
+        grants = await db.fetchall(
+            "SELECT subject_type, subject_id FROM approval_grants"
+        )
+        assert [dict(item) for item in grants] == [{
+            "subject_type": "conversation", "subject_id": "conv-tui"
+        }]
+        assert "approved" in stream.getvalue().lower()
+    finally:
+        await app.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_unknown_command_returns_false_and_approve_needs_an_id() -> None:
     app = await _mock_app()
     try:

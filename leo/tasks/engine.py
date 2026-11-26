@@ -19,6 +19,7 @@ from ..config import Settings
 from ..contracts import TaskRecord, TaskStatus, new_id, utcnow
 from ..events import EventBus
 from ..logging import get_logger
+from ..schedules.delivery import DeliveryPlan, task_delivery_plan
 
 _LOG = get_logger("tasks")
 
@@ -180,6 +181,16 @@ def _add_targets(value: Any, out: dict[str, Any]) -> None:
         return
     if isinstance(value, Mapping):
         data = dict(value)
+        # A validated schedule target is a DTO, not a channel:projection map.
+        # Project it onto its platform so older callers of notify_targets keep
+        # seeing the familiar {channel: address} shape.
+        if "platform" in data and any(k in data for k in ("chat_id", "chat", "kind")):
+            address = next(
+                (data[k] for k in ("chat_id", "chat") if data.get(k) not in (None, "")),
+                None,
+            )
+            out.setdefault(str(data["platform"]), address or str(data["platform"]))
+            return
         if "channel" in data and any(k in data for k in ("target", "to", "recipient")):
             channel = data.get("channel")
             target = next(data[k] for k in ("target", "to", "recipient") if k in data)
@@ -402,10 +413,22 @@ class DurableTaskEngine:
         """Write one task row on ``conn`` with compare-and-swap on its revision.
 
         Callers own the transaction; a zero-row update aborts their whole unit
-        of work (important for atomic checkpoints and claims).
+        of work (important for atomic checkpoints and claims). A transition
+        into a terminal state also records the schedule completion counter in
+        this same transaction, exactly once per task.
         """
         task.updated_at = utcnow()
         previous_version = task.version
+        previous_status: str | None = None
+        if task.status.terminal:
+            row = await (
+                await conn.execute(
+                    "SELECT status FROM tasks WHERE id=? AND version=?",
+                    (task.id, previous_version),
+                )
+            ).fetchone()
+            if row is not None:
+                previous_status = str(row["status"])
         task.version += 1
         sql = """UPDATE tasks SET objective=?, status=?, plan=?, current_step=?, history=?,
                  dependencies=?, checkpoints=?, result=?, errors=?, retry_count=?,
@@ -441,7 +464,54 @@ class DurableTaskEngine:
             raise TaskConflictError(
                 f"task {task.id} was modified concurrently; reload and re-apply"
             )
+        if (
+            task.status.terminal
+            and previous_status is not None
+            and not TaskStatus(previous_status).terminal
+        ):
+            await self._account_schedule_terminal(conn, task)
         return task
+
+    @staticmethod
+    async def _account_schedule_terminal(conn: Any, task: TaskRecord) -> None:
+        """Count one scheduled terminal task exactly once, in its write transaction.
+
+        A durable ``schedule:completed:<task_id>`` marker makes the increment
+        idempotent across retries, restarts and terminal replay. Manual runs
+        (``metadata.manual_run``) never consume a repeat slot or cadence. When
+        the finite limit is reached the schedule is marked ``completed`` and
+        disabled; the tick authority turns that into a tombstone and removes
+        the row, so this function never deletes a schedule itself.
+        """
+        metadata = task.metadata or {}
+        if metadata.get("manual_run"):
+            return
+        schedule_id = str(metadata.get("schedule_id") or "").strip()
+        if not schedule_id:
+            return
+        marker = f"schedule:completed:{task.id}"
+        now = utcnow()
+        cursor = await conn.execute(
+            "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+            (marker, schedule_id, now),
+        )
+        if int(getattr(cursor, "rowcount", 0) or 0) < 1:
+            return
+        await conn.execute(
+            """UPDATE schedules SET
+                 completed_count = completed_count + 1,
+                 status = CASE
+                   WHEN repeat_limit IS NOT NULL
+                        AND completed_count + 1 >= repeat_limit
+                   THEN 'completed' ELSE status END,
+                 enabled = CASE
+                   WHEN repeat_limit IS NOT NULL
+                        AND completed_count + 1 >= repeat_limit
+                   THEN 0 ELSE enabled END,
+                 updated_at = ?
+               WHERE id=?""",
+            (now, schedule_id),
+        )
 
     async def _save(self, task: TaskRecord) -> TaskRecord:
         """Persist ``task`` with compare-and-swap on the row revision.
@@ -1311,6 +1381,54 @@ class DurableTaskEngine:
         return await outcome if inspect.isawaitable(outcome) else outcome
 
     async def _deliver_result(self, task: TaskRecord) -> list[dict[str, Any]]:
+        """Deliver one terminal task through its durable DeliveryPlan.
+
+        Validated schedule payloads carry resolved targets. They are projected
+        into a :class:`DeliveryPlan` by the same resolver the preview used, and
+        receipts are keyed by ``platform:chat:thread``. Legacy tasks keep the
+        old ``{channel: target}`` path and receipt keys.
+        """
+        payload = (task.metadata or {}).get("schedule_payload")
+        planned = isinstance(payload, Mapping) and any(
+            isinstance(payload.get(key), list)
+            for key in ("delivery", "failure_delivery")
+        )
+        if not planned:
+            return await self._deliver_legacy(task)
+
+        status = str((task.metadata or {}).get("status") or getattr(task.status, "value", task.status))
+        failure_explicit = bool(payload.get("failure_delivery"))
+        lane = (
+            "failure"
+            if status in ("failed", "cancelled") and failure_explicit
+            else "result"
+        )
+        plan, _explicit = task_delivery_plan(payload, lane=lane)
+        delivered: list[dict[str, Any]] = []
+        if plan.nowhere:
+            reason = plan.describe()
+            if plan.unresolved:
+                reason += "; " + ", ".join(item.code for item in plan.unresolved)
+            receipt = await self._record_delivery(
+                task.id, "nowhere", "nowhere", reason, None
+            )
+            await self._emit("task.delivery_nowhere", task, lane=lane, reason=reason)
+            delivered.append(receipt)
+        for target in plan.targets:
+            key = DeliveryPlan.identity_key(target)
+            receipt = await self._deliver_one(
+                task, plan, target, key, lane=lane, status=status
+            )
+            if receipt is not None:
+                delivered.append(receipt)
+                if receipt["status"] == "failed" and lane == "result" and failure_explicit:
+                    await self._notify_failure_lane(task, key, receipt["detail"])
+                # Without an explicit failure lane the durable failure receipt is
+                # already honest; never re-send the same content to the same chat.
+        return delivered
+
+    async def _deliver_legacy(self, task: TaskRecord) -> list[dict[str, Any]]:
+        """The pre-Plan delivery path, retained for legacy callers."""
         targets = _delivery_targets(task)
         if not targets:
             return []
@@ -1343,6 +1461,89 @@ class DurableTaskEngine:
                     )
             delivered.append(receipt)
         return delivered
+
+    async def _deliver_one(
+        self,
+        task: TaskRecord,
+        plan: DeliveryPlan,
+        target: Any,
+        key: str,
+        *,
+        lane: str,
+        status: str,
+        notice: bool = False,
+        notice_text: str | None = None,
+    ) -> dict[str, Any] | None:
+        receipts = dict(task.metadata.get("task.delivery") or {})
+        prior = receipts.get(key)
+        if isinstance(prior, Mapping) and prior.get("status") == "sent":
+            return None  # durable receipt: an at-least-once transport is not re-sent
+        channel = str(getattr(target, "platform", "") or "nowhere")
+        address = getattr(target, "chat_id", None) or ""
+        context = self._worker_context(task)
+        context.update(
+            delivery_lane=lane,
+            delivery_target=target.model_dump(mode="json"),
+            delivery_target_key=key,
+            delivery_notice=notice,
+            delivery_text_override=notice_text,
+        )
+        handler = (
+            self._delivery_handlers.get(channel)
+            or self._delivery_handlers.get(str(getattr(target, "kind", "") or ""))
+            or self._default_delivery
+        )
+        if handler is None:
+            return await self._record_delivery(
+                task.id, key, "skipped", "no delivery handler registered", address
+            )
+        try:
+            outcome = await self._call_delivery(handler, task, channel, address, context)
+            detail = outcome if isinstance(outcome, (str, int, float, bool)) else None
+            receipt = await self._record_delivery(task.id, key, "sent", detail, address)
+            await self._emit(
+                "task.delivered", task, channel=channel, target=address,
+                delivery_key=key, lane=lane,
+            )
+        except Exception as exc:  # noqa: BLE001 - delivery failures are durable
+            receipt = await self._record_delivery(
+                task.id, key, "failed", f"{type(exc).__name__}: {exc}", address
+            )
+            await self._emit(
+                "task.delivery_failed", task, channel=channel, target=address,
+                error=receipt["detail"], delivery_key=key, lane=lane,
+            )
+        return receipt
+
+    async def _notify_failure_lane(self, task: TaskRecord, failed_key: str, detail: Any) -> None:
+        """Route a failed result delivery to an explicitly configured failure lane."""
+        metadata = task.metadata or {}
+        payload = metadata.get("schedule_payload")
+        plan, explicit = task_delivery_plan(payload, lane="failure")
+        if not explicit or plan.nowhere:
+            return
+        notices = dict(metadata.get("task.delivery_failure_notices") or {})
+        if notices.get(failed_key):
+            return
+        text = f"Scheduled delivery failed for {failed_key}: {str(detail)[:300]}"
+        for target in plan.targets:
+            key = DeliveryPlan.identity_key(target)
+            if key == failed_key:
+                continue
+            notice_key = f"failure:{key}"
+            receipt = await self._deliver_one(
+                task, plan, target, notice_key, lane="failure", status="failed",
+                notice=True, notice_text=text,
+            )
+            if receipt is not None:
+                notices[failed_key] = notice_key
+        if notices:
+            current = await self._load(task.id)
+            current.metadata["task.delivery_failure_notices"] = notices
+            try:
+                await self._save(current)
+            except TaskConflictError:
+                self._log.debug("failure-lane notice marker lost a concurrent save")
 
     async def _record_delivery(
         self, task_id: str, channel: str, status: str, detail: Any, target: Any = None

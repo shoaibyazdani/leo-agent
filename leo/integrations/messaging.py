@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
@@ -51,6 +52,31 @@ TELEGRAM_MAX_MEDIA_BYTES = 50 * 1024 * 1024
 _MEDIA_PHOTO_SUFFIXES = frozenset({
     ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
 })
+
+
+@dataclass(frozen=True)
+class AdapterCapabilities:
+    """What a channel adapter can honestly do for scheduled delivery.
+
+    All capabilities default to False. A platform name alone never entitles an
+    adapter to room routing, approval cards or terminal rewrites.
+    """
+
+    delivery_capable: bool = False
+    room_capable: bool = False
+    approval_card: bool = False
+    full_text: bool = False
+    terminal_edit: bool = False
+
+    @classmethod
+    def for_adapter(cls, adapter: Any) -> "AdapterCapabilities":
+        return cls(
+            delivery_capable=bool(getattr(adapter, "supports_delivery", True)),
+            room_capable=bool(getattr(adapter, "supports_rooms", False)),
+            approval_card=bool(getattr(adapter, "supports_approval_cards", False)),
+            full_text=bool(getattr(adapter, "supports_full_text", False)),
+            terminal_edit=callable(getattr(adapter, "edit_message_text", None)),
+        )
 
 
 def _is_entity_error(response: Any) -> bool:
@@ -106,6 +132,37 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS,
     if parts and parts[-1].count("```") % 2 == 1:
         parts[-1] = parts[-1].rstrip() + "\n```"
     return parts
+
+
+def split_plain_text(
+    text: str, limit: int = TELEGRAM_MAX_CHARS,
+    max_chunks: int = MAX_MESSAGE_CHUNKS,
+) -> list[str]:
+    """Split literal text with *no* loss, truncation or markup repair.
+
+    Approval cards are consent evidence: every character shown in the dashboard
+    must reach the chat unchanged. Chunks therefore partition the original text
+    exactly (``"".join(chunks) == text``), and an oversized body raises rather
+    than being clipped or fenced back together.
+    """
+    body = text or ""
+    if len(body) <= limit:
+        return [body]
+    chunks: list[str] = []
+    remaining = body
+    while remaining:
+        if len(chunks) >= max_chunks or len(remaining) > limit * max_chunks:
+            raise MessagingError("text does not fit the transport chunk cap")
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        window = remaining[:limit]
+        cut = max(window.rfind("\n\n") + 2, window.rfind("\n") + 1, window.rfind(" ") + 1)
+        if cut <= 0 or cut >= len(remaining):
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    return chunks
 
 
 class MessagingError(RuntimeError):
@@ -700,6 +757,9 @@ class TelegramAdapter(MessagingAdapter):
     # for a box with no public HTTPS endpoint (allow-listed, fails closed).
     supports_webhook = True
     supports_polling = True
+    supports_delivery = True
+    supports_approval_cards = True
+    supports_full_text = True
 
     def verify_webhook(self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None) -> bool:
         secret = credential("TELEGRAM_WEBHOOK_SECRET")
@@ -715,20 +775,28 @@ class TelegramAdapter(MessagingAdapter):
 
     async def send(
         self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None,
-        silent: bool = False,
+        silent: bool = False, plain_text: bool = False,
     ) -> dict[str, Any]:
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
             raise MessagingError("telegram send blocked: TELEGRAM_BOT_TOKEN is not set")
         # Telegram caps one message at 4096 characters and rejects the whole send
         # with 400 otherwise. A long answer must arrive in parts, not vanish.
-        chunks = split_message(str(text), TELEGRAM_MAX_CHARS)
+        # Approval cards use the lossless splitter: no truncation, no fenced
+        # rewrite, and no Markdown interpretation of the literal card body.
+        chunks = (
+            split_plain_text(str(text), TELEGRAM_MAX_CHARS)
+            if plain_text else split_message(str(text), TELEGRAM_MAX_CHARS)
+        )
         last: dict[str, Any] = {}
         for index, chunk in enumerate(chunks):
             # The keyboard belongs to the message the human reads last, not to a
             # continuation that may arrive before it.
             keyboard = reply_markup if index + 1 == len(chunks) else None
-            last = await self._send_one(token, target, chunk, reply_markup=keyboard, silent=silent)
+            last = await self._send_one(
+                token, target, chunk, reply_markup=keyboard, silent=silent,
+                plain=plain_text,
+            )
             if index + 1 < len(chunks):
                 _LOG.info("telegram long message split", extra={
                     "chunks": len(chunks), "part": index + 1})
@@ -752,12 +820,15 @@ class TelegramAdapter(MessagingAdapter):
     async def edit_message_text(
         self, target: str, message_id: str, text: str,
         reply_markup: dict[str, Any] | None = None,
+        *, thread_id: str | None = None, plain_text: bool = False,
     ) -> bool:
         """Replace the text of a sent message (best effort).
 
         ``parse_mode`` is required here too, not only on the first send. Without
         it the initial message renders markdown and every later edit shows the
         raw markup, so a progress line ends up displaying its own ``**``.
+        Schedule cards opt into literal text and carry the forum topic so the
+        terminal rewrite lands where the card was presented.
         """
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token or not message_id:
@@ -765,8 +836,13 @@ class TelegramAdapter(MessagingAdapter):
         url = f"{self.API_BASE}/bot{token}/editMessageText"
         payload: dict[str, Any] = {
             "chat_id": str(target), "message_id": str(message_id), "text": str(text),
-            "parse_mode": TELEGRAM_PARSE_MODE,
         }
+        if plain_text:
+            payload["text"] = str(text)[:4096]
+        else:
+            payload["parse_mode"] = TELEGRAM_PARSE_MODE
+        if thread_id not in (None, ""):
+            payload["message_thread_id"] = str(thread_id)
         if reply_markup:
             payload["reply_markup"] = reply_markup
         try:
@@ -785,7 +861,7 @@ class TelegramAdapter(MessagingAdapter):
             description = ""
         if "not modified" in description.lower():
             return True
-        if response.status_code == 400 and _is_entity_error(response):
+        if not plain_text and response.status_code == 400 and _is_entity_error(response):
             # An unbalanced `**` or stray `<` must not freeze the update at its
             # last good text. Drop the formatting and show the text as written.
             payload.pop("parse_mode", None)
@@ -815,11 +891,13 @@ class TelegramAdapter(MessagingAdapter):
         self, token: str, target: str, text: str,
         reply_markup: dict[str, Any] | None = None,
         silent: bool = False,
+        *, plain: bool = False,
     ) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
-        payload: dict[str, Any] = {"chat_id": str(target), "text": text,
-                                   "parse_mode": TELEGRAM_PARSE_MODE}
+        payload: dict[str, Any] = {"chat_id": str(target), "text": text}
+        if not plain:
+            payload["parse_mode"] = TELEGRAM_PARSE_MODE
         if reply_markup:
             payload["reply_markup"] = reply_markup
         if silent:
@@ -829,7 +907,7 @@ class TelegramAdapter(MessagingAdapter):
             response = await self._http().post(url, json=payload, timeout=self.timeout)
         except httpx.HTTPError as exc:
             raise MessagingError(f"telegram send failed: {type(exc).__name__}") from None
-        if response.status_code == 400 and _is_entity_error(response):
+        if not plain and response.status_code == 400 and _is_entity_error(response):
             # The text is markdown-ish but not valid Telegram entities (an unclosed
             # `**` or a stray underscore). Plain text keeps the content; a 400 loses
             # the whole message, and a user would rather read raw markers than nothing.
@@ -866,6 +944,7 @@ class TelegramAdapter(MessagingAdapter):
         )
         if updates is None:
             updates = data if isinstance(data, list) else [data]
+        await self._dispatch_callbacks(updates)
         return self._messages_from_updates(updates)
 
     def _messages_from_updates(self, updates: list[Any]) -> list[NormalizedMessage]:
@@ -874,9 +953,12 @@ class TelegramAdapter(MessagingAdapter):
         for update in updates:
             if not isinstance(update, dict):
                 continue
+            if isinstance(update.get("callback_query"), dict):
+                # A tap is an approval decision, never a chat turn. Dispatching
+                # happens in handle_webhook/poll; turning it into a message would
+                # replay the approval body as if the operator had typed it.
+                continue
             message = update.get("message") or update.get("edited_message")
-            if not message and isinstance(update.get("callback_query"), dict):
-                message = update["callback_query"].get("message")
             if not isinstance(message, dict):
                 continue
             sender_data = message.get("from") if isinstance(message.get("from"), dict) else {}
@@ -1075,6 +1157,9 @@ class TelegramAdapter(MessagingAdapter):
                 "sender_id": _ref(sender.get("id")),
                 "chat_id": _ref(chat.get("id")),
                 "message_id": _ref(message.get("message_id")),
+                # Forum topics are a durable place; a schedule card's tap must
+                # keep the thread it was sent to so the rewrite lands there.
+                "thread_id": _ref(message.get("message_thread_id")),
             }
             sink = self.callback_sink
             if sink is None:

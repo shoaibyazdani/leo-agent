@@ -199,7 +199,9 @@ async def test_api_requires_configured_token(monkeypatch):
         assert (await client.get("/approvals")).status_code == 401
         ok = await client.get("/approvals", headers={"authorization": "Bearer test-token"})
         assert ok.status_code == 200
-        assert ok.json() == {"approvals": []}
+        # ``cards`` is the additive Phase 4 projection; ``approvals`` keeps its
+        # legacy raw-row shape for existing callers.
+        assert ok.json() == {"approvals": [], "cards": []}
 
 
 async def test_terminal_denies_interpreters_and_dangerous_flags(sec_env):

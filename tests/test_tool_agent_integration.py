@@ -61,14 +61,12 @@ async def app(monkeypatch: pytest.MonkeyPatch) -> LeoApp:
 async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     names = [spec.name for spec in app.registry.list_specs()]
     assert names and len(names) == len(set(names)), "duplicate tool names"
-    # 28 non-operator registrar modules advertise 85 specs (this roster count
-    # still includes json_query); the operator registrar adds 9 and builtins add
-    # another 10, for 103 advertised names. json_query is deliberately withdrawn
-    # from the model-callable catalogue because its caller-supplied data/default
-    # arguments let a model feed invented numbers back as evidence, leaving 103
-    # unique live names. preview_tools, http_tools, conversation_tools,
-    # edit_tools, vision_tools, memory_propose_tools and skill_manage_tools are
-    # all part of the shipped roster.
+    # 28 non-operator registrar modules advertise 90 specs: the two additions
+    # are the explicit schedule_pause/schedule_resume tools, an intentional
+    # final-parity roster update rather than accidental duplicates. json_query
+    # stays withdrawn from the model-callable catalogue because its
+    # caller-supplied data/default arguments let a model feed invented numbers
+    # back as evidence. The remaining rosters are asserted explicitly below.
     assert len(app.tool_roster) == 29, (
         "expected the live 29-module tool roster including preview_tools, "
         f"http_tools, conversation_tools, edit_tools, vision_tools and "
@@ -80,7 +78,9 @@ async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
         "preview_tools", "http_tools", "conversation_tools", "edit_tools",
         "vision_tools", "memory_propose_tools", "skill_manage_tools",
     } <= set(registrars)
-    assert sum(len(value) for value in registrars.values()) == 85
+    # Intentional roster update: 88 advertised non-operator specs -> 90 with
+    # explicit schedule_pause/schedule_resume.
+    assert sum(len(value) for value in registrars.values()) == 90
     # The operator registrar declares 9 specs, but four of them drive the macOS
     # desktop through osascript/screencapture/pbcopy and are only registered on
     # darwin - on any other platform they would be advertised and then fail at
@@ -89,7 +89,7 @@ async def test_full_tool_roster_is_registered_once(app: LeoApp) -> None:
     # computer tools can actually run.
     operator_specs = 9 if sys.platform == "darwin" else 5
     assert len(app.tool_roster["operator_tools"]) == operator_specs
-    assert len(names) == 94 + operator_specs
+    assert len(names) == 99 + operator_specs
     assert "json_query" not in names  # operator/offline only, never model-callable
     assert all(app.tool_roster.values())
     for roster_names in app.tool_roster.values():
@@ -734,7 +734,10 @@ async def test_streamed_tool_turn_persists_atomic_assistant_and_tool_pair(app: L
 
 async def test_action_routes_are_live_and_capabilities_advertised(app: LeoApp, monkeypatch) -> None:
     transport = httpx.ASGITransport(app=api_module.api)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    # Intentional contract update: unasked schedule mutations require a trusted
+    # Host (loopback or configured origin), not an arbitrary test host. Other
+    # routes keep their previous behavior; this route now names that boundary.
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8000") as client:
         health = (await client.get("/health")).json()
         assert health["capabilities"] == {
             "task_run": True, "agent_delegate": True,

@@ -64,7 +64,11 @@ def _safe_path(value: Any, ctx: dict[str, Any]) -> Path:
     if "\x00" in text:
         raise PermissionError("path contains NUL byte")
     try:
-        resolved = Path(text).expanduser().resolve()
+        candidate = Path(text).expanduser()
+        workdir = ctx.get("workdir")
+        if workdir and not candidate.is_absolute():
+            candidate = Path(str(workdir)).expanduser() / candidate
+        resolved = candidate.resolve()
     except (OSError, RuntimeError) as exc:
         raise PermissionError(f"cannot resolve path safely: {text}") from exc
     for root in _allowed_roots(ctx):

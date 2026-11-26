@@ -62,6 +62,8 @@ class MatrixAdapter(MessagingAdapter):
     verification_env = ()
     supports_webhook = False
     supports_polling = True
+    supports_delivery = True
+    supports_rooms = True
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)

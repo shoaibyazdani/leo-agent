@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "oracle_commit": "7cf9e92cd6277b327b36a51fb897cdc8403902d6",
+  "tokens": [
+    {
+      "token": "omitted",
+      "oracle": true,
+      "meaning": "origin when a capturable origin exists, otherwise local"
+    },
+    {
+      "token": "origin",
+      "oracle": true,
+      "meaning": "captured platform/chat/thread, else first configured home channel, else nowhere"
+    },
+    {
+      "token": "all",
+      "oracle": true,
+      "meaning": "every connected platform with a configured home channel at fire time; excludes bot-chat"
+    },
+    {
+      "token": "local",
+      "oracle": true,
+      "meaning": "history only; no external target"
+    },
+    {
+      "token": "bot-chat",
+      "oracle": true,
+      "meaning": "own source-project profile conversation"
+    },
+    {
+      "token": "bot-chat:<profile>",
+      "oracle": true,
+      "meaning": "named machine-local profile conversation; missing profile rejects create"
+    },
+    {
+      "token": "room:<id>",
+      "oracle": true,
+      "meaning": "machine-local hosted room; malformed or unresolved room produces no target"
+    },
+    {
+      "token": "room:<id>@<profile>",
+      "oracle": true,
+      "meaning": "room hosted by a named local profile"
+    },
+    {
+      "token": "<platform>:<chat>",
+      "oracle": true,
+      "meaning": "explicit chat; Telegram/Slack may adopt a durable origin thread"
+    },
+    {
+      "token": "<platform>:<chat>:<thread>",
+      "oracle": true,
+      "meaning": "explicit chat and thread/topic"
+    },
+    {
+      "token": "<platform>",
+      "oracle": true,
+      "meaning": "that platform's configured home channel, or same-platform origin fallback"
+    },
+    {
+      "token": "comma list",
+      "oracle": true,
+      "meaning": "tokens resolve independently, order preserved, targets deduplicated by platform/chat/thread"
+    },
+    {
+      "token": "list/tuple input",
+      "oracle": true,
+      "meaning": "normalized to a comma-separated string"
+    },
+    {
+      "token": "failure_deliver",
+      "oracle": true,
+      "meaning": "separate failure lane using the same grammar; local suppresses external failure notices"
+    },
+    {
+      "token": "home",
+      "oracle": false,
+      "meaning": "not a final-head token; treated as a bare platform name and normally resolves nowhere"
+    },
+    {
+      "token": "local:<id>",
+      "oracle": false,
+      "meaning": "not a final-head token; planned LEO-native durable conversation mapping"
+    },
+    {
+      "token": "object target",
+      "oracle": false,
+      "meaning": "not parsed by final head; planned LEO-native validated object form"
+    }
+  ],
+  "normalization": {
+    "none_or_empty_create": "origin if origin exists, else local",
+    "empty_runtime": "local",
+    "case_sensitive": [
+      "origin",
+      "local"
+    ],
+    "case_insensitive": [
+      "all",
+      "bot-chat",
+      "room"
+    ],
+    "unknown_token": "resolves nowhere; final head does not reject every typo at create"
+  },
+  "target_identity": [
+    "platform.lower()",
+    "chat_id",
+    "thread_id"
+  ],
+  "result_and_failure_lanes_separate": true,
+  "leo_adaptation": {
+    "home": "optional native alias for configured home; never claim source-project parity",
+    "local:<id>": "durable local conversation by ID",
+    "object target": "validated native target objects; reject unknown keys",
+    "unknown_tokens": "reject before persistence instead of displaying a guessed recipient",
+    "bot-chat": "durable local conversation, not byte-identical source-project profile behavior",
+    "room": "requires a room-capable adapter and configured default room channel, otherwise reject"
+  }
+}

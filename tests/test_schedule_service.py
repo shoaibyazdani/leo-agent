@@ -1,0 +1,409 @@
+"""ScheduleService: the one proposal/consent/commit authority.
+
+Covers direct operator writes, answerable-surface cards, fail-closed no-card
+proposals, request replay, concurrent name reservation, semantic no-op edits,
+CAS stale edits, repeat merge and the grant path.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from leo import db
+from leo.config import Settings
+from leo.contracts import TurnContext
+from leo.events import EventBus
+from leo.security.approval_cards import KIND_SCHEDULE_CREATE, KIND_SCHEDULE_EDIT
+from leo.security.permissions import PermissionManagerImpl
+from leo.schedules.clock import FrozenClock
+from leo.schedules.service import ScheduleService, ScheduleServiceError
+from leo.schedules.store import ScheduleStore
+from leo.tasks import DurableTaskEngine, Scheduler
+
+NOW = datetime(2026, 11, 25, 7, 0, tzinfo=timezone.utc)
+
+
+def _operator() -> TurnContext:
+    return TurnContext(
+        principal="operator:cli", channel="cli", surface="cli", source="operator"
+    )
+
+
+def _chat(surface: str = "tui", *, conversation_id: str = "conv-a", principal: str = "chat:web") -> TurnContext:
+    return TurnContext(
+        principal=principal,
+        channel=surface,
+        conversation_id=conversation_id,
+        surface=surface,
+        origin=surface,
+        source="chat",
+    )
+
+
+@pytest.fixture
+async def env(tmp_path):
+    db.set_db_path(tmp_path / "test.db")
+    await db.initialize()
+    settings = Settings()
+    settings.security.allowed_roots = [tmp_path]
+    events = EventBus()
+    clock = FrozenClock(NOW)
+    permissions = PermissionManagerImpl(settings, events, clock=clock)
+    engine = DurableTaskEngine(settings, events)
+    scheduler = Scheduler(engine, settings, events, clock=clock)
+    store = ScheduleStore(clock=clock)
+    service = ScheduleService(
+        store=store,
+        scheduler=scheduler,
+        engine=engine,
+        permissions=permissions,
+        events=events,
+        settings=settings,
+        clock=clock,
+        allowed_workdir_roots=[tmp_path],
+    )
+    return SimpleNamespace(
+        settings=settings, events=events, permissions=permissions,
+        engine=engine, scheduler=scheduler, store=store, service=service,
+        clock=clock,
+    )
+
+
+async def _create_operator(env, **arguments):
+    return await env.service.create(
+        arguments, actor="operator:cli", turn=_operator()
+    )
+
+
+async def _resolve(env, approval_id: str, *, choice: str = "once", digest: str, resolver: str = "operator:local"):
+    return await env.permissions.resolve_schedule_card(
+        approval_id,
+        choice=choice,
+        resolver=resolver,
+        confirm_proposal_digest=digest,
+        commit=env.service.commit,
+    )
+
+
+# --------------------------------------------------------------------------- direct operator
+
+
+async def test_operator_create_is_unasked_audited_and_has_no_card(env):
+    out = await _create_operator(env, name="ops", schedule="1h", prompt="check")
+    assert out["status"] == "created"
+    row = await db.fetchone("SELECT * FROM schedules WHERE name='ops'")
+    assert row is not None and row["origin"] == "cli"
+    assert row["created_by"] == "operator:cli"
+    assert await db.fetchall("SELECT id FROM approvals") == []
+    audit = await db.fetchone(
+        "SELECT actor, decision FROM audit_log WHERE action='schedule.created'"
+    )
+    assert dict(audit) == {"actor": "operator:cli", "decision": "allowed"}
+
+
+async def test_answerable_surface_presents_one_create_card(env):
+    out = await env.service.create(
+        {"name": "water", "schedule": "every day at 8am", "prompt": "Drink water."},
+        actor="chat:web",
+        turn=_chat("tui"),
+    )
+    assert out["status"] == "approval_required"
+    card = out["card"]
+    assert card["kind"] == KIND_SCHEDULE_CREATE
+    assert card["choices"] == ["once", "session", "always", "deny"]
+    assert "Drink water." in card["body"]
+    assert card["shown_at"] and card["presented_surface"] == "tui"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='water'") is None
+    assert await db.fetchone("SELECT id FROM approvals WHERE id=?", (card["approval_id"],)) is not None
+
+
+async def test_incapable_surface_fails_closed_with_zero_schedule_and_approval_rows(env):
+    out = await env.service.create(
+        {"name": "cli-job", "schedule": "1h", "prompt": "Check."},
+        actor="chat:cli",
+        turn=_chat("cli"),
+    )
+    assert out["status"] == "approval_required"
+    assert out["approval_id"] is None and out["card"] is None
+    assert await db.fetchall("SELECT id FROM schedules") == []
+    assert await db.fetchall("SELECT id FROM approvals") == []
+    assert len(await db.fetchall("SELECT id FROM schedule_proposals")) == 1
+
+
+async def test_concurrent_same_name_reservation_allows_exactly_one(env):
+    results = await asyncio.gather(
+        env.service.create(
+            {"name": "race", "schedule": "1h", "prompt": "a"},
+            actor="chat:one", turn=_chat("cli", conversation_id="c1", principal="chat:one"),
+        ),
+        env.service.create(
+            {"name": "race", "schedule": "1h", "prompt": "b"},
+            actor="chat:two", turn=_chat("cli", conversation_id="c2", principal="chat:two"),
+        ),
+        return_exceptions=True,
+    )
+    successes = [item for item in results if isinstance(item, dict)]
+    failures = [item for item in results if isinstance(item, BaseException)]
+    assert len(successes) == 1 and len(failures) == 1
+    assert isinstance(failures[0], ScheduleServiceError)
+    assert failures[0].code == "duplicate_name"
+    proposals = await db.fetchall("SELECT id FROM schedule_proposals WHERE active_name='race'")
+    assert len(proposals) == 1
+
+
+async def test_request_key_replays_the_same_proposal(env):
+    first = await env.service.create(
+        {"name": "replay", "schedule": "1h", "prompt": "a"},
+        actor="chat:web", turn=_chat("cli"), request_key="req-1",
+    )
+    second = await env.service.create(
+        {"name": "replay", "schedule": "1h", "prompt": "different"},
+        actor="chat:web", turn=_chat("cli"), request_key="req-1",
+    )
+    assert second["replayed"] is True
+    assert second["proposal_id"] == first["proposal_id"]
+    assert len(await db.fetchall("SELECT id FROM schedule_proposals")) == 1
+    assert await db.fetchall("SELECT id FROM schedules") == []
+
+
+async def test_committed_request_key_replays_without_a_second_write(env):
+    first = await env.service.create(
+        {"name": "committed", "schedule": "1h", "prompt": "a"},
+        actor="operator:cli", turn=_operator(), request_key="req-op",
+    )
+    second = await env.service.create(
+        {"name": "committed", "schedule": "1h", "prompt": "a"},
+        actor="operator:cli", turn=_operator(), request_key="req-op",
+    )
+    assert first["status"] == second["status"] == "created"
+    assert second["replayed"] is True
+    assert len(await db.fetchall("SELECT id FROM schedules")) == 1
+
+
+# --------------------------------------------------------------------------- card commit
+
+
+async def test_once_card_commit_creates_the_schedule_atomically(env):
+    out = await env.service.create(
+        {"name": "water", "schedule": "1h", "prompt": "Drink water."},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    resolved = await _resolve(
+        env, out["approval_id"], choice="once", digest=out["card"]["proposal_digest"]
+    )
+    assert resolved.status == "approved" and resolved.schedule_id
+    row = await db.fetchone("SELECT * FROM schedules WHERE id=?", (resolved.schedule_id,))
+    assert row is not None and row["name"] == "water"
+    assert row["consent_digest"] == out["card"]["proposal_digest"]
+    approval = await db.fetchone(
+        "SELECT status FROM approvals WHERE id=?", (out["approval_id"],)
+    )
+    proposal = await db.fetchone(
+        "SELECT status FROM schedule_proposals WHERE id=?", (out["proposal_id"],)
+    )
+    assert approval["status"] == "approved"
+    assert proposal["status"] == "committed"
+    assert await db.fetchall("SELECT id FROM approval_grants") == []
+
+
+async def test_session_choice_grants_cardless_create_in_the_same_conversation(env):
+    turn = _chat("tui", conversation_id="conv-a")
+    first = await env.service.create(
+        {"name": "one", "schedule": "1h", "prompt": "a"},
+        actor="chat:web", turn=turn,
+    )
+    resolved = await _resolve(
+        env, first["approval_id"], choice="session",
+        digest=first["card"]["proposal_digest"],
+    )
+    assert resolved.grant_id
+
+    second = await env.service.create(
+        {"name": "two", "schedule": "1h", "prompt": "b"},
+        actor="chat:web", turn=_chat("cli", conversation_id="conv-a"),
+    )
+    assert second["status"] == "created"
+    assert second["card"] is None
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='two'") is not None
+    # Only the first card exists: the grant path did not leave an invisible
+    # approval row behind.
+    assert len(await db.fetchall("SELECT id FROM approvals")) == 1
+
+
+async def test_always_grant_is_profile_scoped_and_expires(env):
+    first = await env.service.create(
+        {"name": "one", "schedule": "1h", "prompt": "a"},
+        actor="chat:web", turn=_chat("tui", conversation_id="conv-a"),
+    )
+    resolved = await _resolve(
+        env, first["approval_id"], choice="always",
+        digest=first["card"]["proposal_digest"],
+    )
+    assert resolved.grant_id
+    grant = await db.fetchone(
+        "SELECT subject_type, subject_id FROM approval_grants WHERE id=?",
+        (resolved.grant_id,),
+    )
+    assert dict(grant) == {"subject_type": "profile", "subject_id": "chat:web"}
+
+    other = await env.service.create(
+        {"name": "two", "schedule": "1h", "prompt": "b"},
+        actor="chat:other", turn=_chat("cli", principal="chat:other", conversation_id="conv-b"),
+    )
+    assert other["status"] == "approval_required"
+    assert other["approval_id"] is None
+
+
+async def test_edit_card_commit_cas_and_revision_bump(env):
+    created = await _create_operator(env, name="job", schedule="1h", prompt="a")
+    assert created["status"] == "created"
+    out = await env.service.update(
+        name="job", arguments={"prompt": "b"},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    assert out["status"] == "approval_required"
+    card = out["card"]
+    assert card["kind"] == KIND_SCHEDULE_EDIT
+    assert card["choices"] == ["once", "deny"]
+    assert "prompt changed" in card["body"]
+
+    resolved = await _resolve(
+        env, card["approval_id"], choice="once", digest=card["proposal_digest"]
+    )
+    assert resolved.status == "approved"
+    row = await db.fetchone("SELECT * FROM schedules WHERE name='job'")
+    assert row["config_revision"] == 2
+    assert json.loads(row["payload"])["objective"] == "b"
+    assert await db.fetchall("SELECT id FROM approval_grants") == []
+
+
+async def test_stale_edit_card_commit_rolls_back_and_stays_pending(env):
+    created = await _create_operator(env, name="job", schedule="1h", prompt="a")
+    assert created["status"] == "created"
+    pending = await env.service.update(
+        name="job", arguments={"prompt": "b"},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    card = pending["card"]
+
+    # Another writer advances the row before the operator answers.
+    await env.service.update(
+        name="job", arguments={"prompt": "c"},
+        actor="operator:cli", turn=_operator(),
+    )
+    with pytest.raises(ScheduleServiceError) as excinfo:
+        await _resolve(
+            env, card["approval_id"], choice="once",
+            digest=card["proposal_digest"],
+        )
+    assert excinfo.value.code == "stale_update"
+    approval = await db.fetchone(
+        "SELECT status, answered_at FROM approvals WHERE id=?", (card["approval_id"],)
+    )
+    assert approval["status"] == "pending" and approval["answered_at"] is None
+    row = await db.fetchone("SELECT config_revision FROM schedules WHERE name='job'")
+    assert row["config_revision"] == 2  # only the direct operator edit committed
+
+
+async def test_noop_update_does_not_reanchor_or_reserve(env):
+    created = await _create_operator(
+        env, name="job", schedule="1h", prompt="a", repeat=5,
+    )
+    assert created["status"] == "created"
+    before = await db.fetchone(
+        "SELECT next_run_at, config_revision FROM schedules WHERE name='job'"
+    )
+    out = await env.service.update(
+        name="job", arguments={"prompt": "a"},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    assert out["status"] == "no_change"
+    after = await db.fetchone(
+        "SELECT next_run_at, config_revision FROM schedules WHERE name='job'"
+    )
+    assert dict(after) == dict(before)
+    assert len(await db.fetchall("SELECT id FROM schedule_proposals")) == 1
+
+
+async def test_repeat_merge_preserves_claimed_and_completed_counts(env):
+    created = await _create_operator(
+        env, name="job", schedule="1h", prompt="a", repeat=5,
+    )
+    assert created["status"] == "created"
+    row = await db.fetchone("SELECT id FROM schedules WHERE name='job'")
+    await db.execute(
+        "UPDATE schedules SET claimed_count=3, completed_count=2 WHERE id=?",
+        (row["id"],),
+    )
+    out = await env.service.update(
+        name="job", arguments={"repeat": 2},
+        actor="operator:cli", turn=_operator(),
+    )
+    assert out["status"] == "updated"
+    merged = await db.fetchone("SELECT * FROM schedules WHERE id=?", (row["id"],))
+    assert merged["repeat_limit"] == 2
+    assert merged["claimed_count"] == 3 and merged["completed_count"] == 2
+
+
+async def test_denied_card_releases_the_active_name(env):
+    first = await env.service.create(
+        {"name": "name", "schedule": "1h", "prompt": "a"},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    resolved = await _resolve(
+        env, first["approval_id"], choice="deny",
+        digest=first["card"]["proposal_digest"],
+    )
+    assert resolved.status == "denied"
+    proposal = await db.fetchone(
+        "SELECT status FROM schedule_proposals WHERE id=?", (first["proposal_id"],)
+    )
+    assert proposal["status"] == "denied"
+    # The reservation no longer blocks a fresh proposal with the same name.
+    second = await env.service.create(
+        {"name": "name", "schedule": "1h", "prompt": "b"},
+        actor="chat:web", turn=_chat("cli"),
+    )
+    assert second["status"] == "approval_required"
+
+
+# --------------------------------------------------------------------------- remove / run / cancel
+
+
+async def test_model_remove_is_a_card_and_operator_remove_is_direct(env):
+    created = await _create_operator(env, name="job", schedule="1h", prompt="a")
+    assert created["status"] == "created"
+    pending = await env.service.remove(name="job", actor="chat:web", turn=_chat("tui"))
+    assert pending["status"] == "approval_required"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='job'") is not None
+    resolved = await _resolve(
+        env, pending["card"]["approval_id"], choice="once",
+        digest=pending["card"]["proposal_digest"],
+    )
+    assert resolved.status == "approved"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='job'") is None
+    assert await db.fetchone(
+        "SELECT id FROM schedule_tombstones WHERE name='job'"
+    ) is not None
+
+
+async def test_run_now_creates_a_manual_task_and_cancel_stops_it(env):
+    created = await _create_operator(env, name="job", schedule="1h", prompt="run")
+    assert created["status"] == "created"
+    before = await db.fetchone("SELECT next_run_at, claimed_count FROM schedules WHERE name='job'")
+    run = await env.service.run_now(name="job", actor="chat:web", turn=_chat("tui"))
+    assert run["status"] == "running" and run["manual_run"] is True
+    task = await env.engine.get(run["task_id"])
+    assert task is not None and task.metadata.get("manual_run") is True
+    after = await db.fetchone("SELECT next_run_at, claimed_count FROM schedules WHERE name='job'")
+    assert dict(after) == dict(before)
+
+    cancelled = await env.service.cancel(name="job", actor="chat:web", turn=_chat("tui"))
+    assert cancelled["status"] == "cancelled"
+    assert (await env.engine.get(run["task_id"])).status.value == "cancelled"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='job'") is not None

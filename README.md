@@ -140,6 +140,7 @@ durable memory writes stay in the SQLite memory module.
 - [LEO_DECISIONS.md](LEO_DECISIONS.md) — engineering decisions
 - [LEO_INTEGRATIONS.md](LEO_INTEGRATIONS.md) — real vs blocked integrations; [channel matrix](LEO_INTEGRATIONS.md#channel-matrix-2026-11-18) (22 auto-registered adapters appear in Connected Surfaces; live delivery blocked until credentials are supplied)
 - [LEO_SECURITY.md](LEO_SECURITY.md) — permissions, approvals, audit
+- [docs/SCHEDULES.md](docs/SCHEDULES.md) — schedule grammar, consent, delivery and capability matrix
 - [docs/REASONING.md](docs/REASONING.md) — `/reasoning` levels, scopes, provider mapping and display privacy
 - [docs/TESTING.md](docs/TESTING.md) — how to run the suite
 - [LEO_KNOWN_ISSUES.md](LEO_KNOWN_ISSUES.md) — honest limitations
@@ -148,7 +149,7 @@ durable memory writes stay in the SQLite memory module.
 ## Tests
 
 ```bash
-uv run pytest -q
+.venv/bin/python -m pytest -q
 ```
 
 ## Safety

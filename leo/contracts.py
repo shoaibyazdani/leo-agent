@@ -7,12 +7,14 @@ circular dependencies.
 
 from __future__ import annotations
 
+import contextvars
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, AsyncIterator, Literal, Protocol
+from typing import Any, AsyncIterator, Iterator, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def new_id(prefix: str = "") -> str:
@@ -91,6 +93,10 @@ class ToolSpec(BaseRecord):
     supports_dry_run: bool = False
     # Opt-in one-shot approval consumption on successful dispatch (shell).
     consume_approval: bool = False
+    # Opt-in pre-persistence secret/unsafe-text preflight. The executor scans
+    # the call arguments before authorization, quota charging, handler dispatch
+    # and durable recording; a refusal persists only a digest and category.
+    secret_scan: bool = False
     input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
     output_schema: dict[str, Any] = Field(default_factory=dict)
 
@@ -102,6 +108,25 @@ class ToolCall(BaseRecord):
     correlation_id: str | None = None
     actor: str = "assistant"
     dry_run: bool = False
+    # Trusted provenance, populated at trusted construction sites (chat, API,
+    # gateway and agent delegation). ``source`` is the provenance class
+    # (chat/api/gateway/agent/operator/scheduled/unattended); ``origin`` names
+    # the concrete origin (channel, agent id, api principal). A handler cannot
+    # set these to widen authority.
+    source: str = ""
+    origin: str | None = None
+    principal: str | None = None
+    conversation_id: str | None = None
+    thread_id: str | None = None
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    # Optional trusted working directory for relative tool paths and shell cwd.
+    # It is set only by an internal execution adapter, never from tool
+    # arguments, and every consumer still confines the result to allowed roots.
+    workdir: str | None = None
+    # A pre-verified durable approval id set only by a trusted internal caller
+    # (the automation specialist after its own gate). It is never read from
+    # model arguments, so it cannot be forged through a tool payload.
+    authorization: str | None = None
 
 
 class ToolResult(BaseRecord):
@@ -114,6 +139,167 @@ class ToolResult(BaseRecord):
     risk: RiskLevel = RiskLevel.LOW
     decision: str = "allowed"
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SurfaceCapabilities(BaseModel):
+    """What one surface can actually do with an approval card.
+
+    Everything defaults to incapable. A surface may carry a card only when it
+    can present the full literal body, wait for a decision and rewrite the
+    result. Send-only, notifier-blind and unverified adapters stay incapable;
+    Phase 4/9 opt capable surfaces in explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    can_present_card: bool = False
+    can_wait_for_decision: bool = False
+    full_text: bool = False
+    can_rewrite: bool = False
+    notify_only: bool = False
+    max_card_chars: int | None = None
+
+
+INCAPABLE_SURFACE = SurfaceCapabilities()
+
+# The one surface capability manifest, keyed by surface name. Unknown surfaces
+# resolve to ``INCAPABLE_SURFACE`` so a new adapter cannot accidentally receive
+# a card just by existing.
+SURFACE_CAPABILITIES: dict[str, SurfaceCapabilities] = {
+    # Interactive card surfaces. Rollout is phased; the manifest records the
+    # contract, not an entitlement.
+    "tui": SurfaceCapabilities(
+        can_present_card=True,
+        can_wait_for_decision=True,
+        full_text=True,
+        # The TUI rewrites a decided card by printing its terminal text in the
+        # same transcript; it cannot edit an already-scrolled line.
+        can_rewrite=True,
+        max_card_chars=8000,
+    ),
+    "web": SurfaceCapabilities(
+        can_present_card=True,
+        can_wait_for_decision=True,
+        full_text=True,
+        can_rewrite=True,
+        max_card_chars=20000,
+    ),
+    "electron": SurfaceCapabilities(
+        can_present_card=True,
+        can_wait_for_decision=True,
+        full_text=True,
+        can_rewrite=True,
+        max_card_chars=20000,
+    ),
+    "telegram": SurfaceCapabilities(
+        can_present_card=True,
+        can_wait_for_decision=True,
+        full_text=True,
+        can_rewrite=True,
+        max_card_chars=4096,
+    ),
+    # Blocking surfaces: a human may see a notice, but the turn cannot wait
+    # mid-flight for a card decision.
+    "cli": SurfaceCapabilities(
+        can_present_card=False,
+        can_wait_for_decision=False,
+        full_text=True,
+        can_rewrite=False,
+        notify_only=True,
+    ),
+    "api": SurfaceCapabilities(notify_only=True),
+    # Explicitly incapable: send-only / notifier-blind adapters and delegated
+    # or scheduled work with no human surface at all.
+    "a2a": INCAPABLE_SURFACE,
+    "whatsapp": INCAPABLE_SURFACE,
+    "whatsapp_web": INCAPABLE_SURFACE,
+    "agent": INCAPABLE_SURFACE,
+    "scheduled": INCAPABLE_SURFACE,
+    "chat": INCAPABLE_SURFACE,
+}
+
+
+def surface_capabilities(surface: str | None) -> SurfaceCapabilities:
+    """Capabilities for a surface name; unknown surfaces are incapable."""
+    key = str(surface or "").strip().lower()
+    return SURFACE_CAPABILITIES.get(key, INCAPABLE_SURFACE)
+
+
+class TurnContext(BaseModel):
+    """Trusted, task-local facts about one turn.
+
+    Built at a trusted entry point (chat, API, gateway, agent delegation,
+    scheduled execution) and installed in a ``ContextVar`` for the duration of
+    the turn. Authority fields (``principal``, ``surface``, ``source``) never
+    come from a request body or model output. ``origin``/``target`` describe
+    where the turn came from and where a reply belongs; they are routing facts,
+    not grants.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    principal: str = "chat"
+    channel: str = "cli"
+    conversation_id: str | None = None
+    thread_id: str | None = None
+    target: str | None = None
+    surface: str = "chat"
+    capabilities: SurfaceCapabilities
+    origin: str | None = None
+    # Provenance class: chat/api/gateway/agent/operator/scheduled/unattended.
+    source: str = "chat"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_capabilities(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if data.get("capabilities") is not None:
+            return data
+        surface = str(data.get("surface") or "chat")
+        capabilities = surface_capabilities(surface)
+        return {**data, "capabilities": capabilities.model_dump(mode="json")}
+
+    def tool_fields(self) -> dict[str, Any]:
+        """The provenance fields copied onto a :class:`ToolCall`."""
+        return {
+            "source": self.source,
+            "origin": self.origin or self.channel or None,
+            "principal": self.principal,
+            "conversation_id": self.conversation_id,
+            "thread_id": self.thread_id,
+            "capabilities": self.capabilities.model_dump(mode="json"),
+        }
+
+
+_CURRENT_TURN_CONTEXT: contextvars.ContextVar[TurnContext | None] = (
+    contextvars.ContextVar("leo_turn_context", default=None)
+)
+
+
+def current_turn_context() -> TurnContext | None:
+    """The trusted context of the turn running on this task, if any."""
+    return _CURRENT_TURN_CONTEXT.get()
+
+
+def set_turn_context(turn: TurnContext | None) -> contextvars.Token:
+    """Install a trusted turn context; the returned token restores the prior one."""
+    return _CURRENT_TURN_CONTEXT.set(turn)
+
+
+def reset_turn_context(token: contextvars.Token) -> None:
+    """Restore the context that was active before :func:`set_turn_context`."""
+    _CURRENT_TURN_CONTEXT.reset(token)
+
+
+@contextmanager
+def turn_context(turn: TurnContext | None) -> Iterator[TurnContext | None]:
+    """Scope a trusted turn context to a block (sync or async callers)."""
+    token = set_turn_context(turn)
+    try:
+        yield turn
+    finally:
+        reset_turn_context(token)
 
 
 class Decision(BaseRecord):

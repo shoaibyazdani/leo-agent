@@ -246,6 +246,11 @@ def _safe_path(value: Any, ctx: dict[str, Any]) -> Path:
     if "\x00" in str(value):
         raise PermissionError("path contains NUL byte")
     candidate = Path(value).expanduser()
+    workdir = ctx.get("workdir")
+    if workdir and not candidate.is_absolute():
+        # A scheduled job's workdir is the base for relative tool paths. The
+        # result is still checked against the allowed roots below.
+        candidate = Path(str(workdir)).expanduser() / candidate
     resolved = candidate.resolve()
     settings = ctx["settings"]
     if getattr(settings.security, "workspace_only", True):
@@ -672,7 +677,7 @@ async def shell(args: dict[str, Any], ctx: dict[str, Any]) -> Any:
     command = args.get("command")
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command must be a non-empty string")
-    cwd = _safe_path(args.get("cwd") or str(settings.root), ctx)
+    cwd = _safe_path(args.get("cwd") or ctx.get("workdir") or str(settings.root), ctx)
     configured_timeout = float(settings.security.shell_timeout_seconds)
     timeout = min(float(args.get("timeout", configured_timeout)), configured_timeout)
     configured_cap = int(settings.security.shell_max_output_bytes)

@@ -520,6 +520,34 @@ class AutomationConfig(BaseModel):
     recovery_on_startup: bool = True
     max_concurrent_tasks: int = 4
     default_task_timeout_seconds: int = 3600
+    # Conditional scheduling guidance only. ``off`` removes the hint without
+    # changing any tool, card or grant; ``create`` is an opt-in for a later
+    # evaluation campaign and never bypasses consent.
+    proactive_mode: Literal["off", "offer", "create"] = "offer"
+    # Scheduled script execution is operator-provisioned and opt-in. When
+    # disabled, a script-backed schedule fails closed at execution instead of
+    # running arbitrary local code behind the operator's back.
+    allow_scripts: bool = False
+    # Allowlisted directory. A relative ``script`` resolves here; an absolute
+    # path must resolve inside it. ``None`` means no script execution at all.
+    scripts_root: Path | None = None
+    script_timeout_seconds: int = Field(default=60, ge=1, le=600)
+    script_max_output_bytes: int = Field(
+        default=200_000, ge=1_000, le=2_000_000
+    )
+    # URL/script monitors use the same egress-checked HTTP client and share the
+    # restricted script runner, both bounded by these caps.
+    monitor_timeout_seconds: float = Field(default=20.0, ge=1.0, le=120.0)
+    monitor_max_bytes: int = Field(default=200_000, ge=1_000, le=2_000_000)
+    # Delivery context. ``home_channels`` entries are ``platform:chat[:thread]``
+    # and back the ``home``/``all`` tokens; ``default_room_channel`` names the
+    # one room a room-capable adapter may deliver to. Both are operator-owned.
+    home_channels: list[str] = Field(default_factory=list)
+    default_room_channel: str | None = None
+    # Named durable local conversations: ``bot-chat:<profile>`` and
+    # ``local:<id>`` resolve only to ids listed here.
+    bot_profiles: list[str] = Field(default_factory=list)
+    local_conversations: list[str] = Field(default_factory=list)
 
 
 class ComputerConfig(BaseModel):
@@ -767,7 +795,12 @@ class Settings(BaseModel):
                 "reviewer_enabled", "reviewer_timeout_seconds",
                 "max_tool_calls_per_task", "max_tool_calls_ceiling",
             ],
-            "automation": ["max_concurrent_tasks", "default_task_timeout_seconds"],
+            "automation": [
+                "max_concurrent_tasks", "default_task_timeout_seconds",
+                "allow_scripts", "scripts_root", "script_timeout_seconds",
+                "script_max_output_bytes", "monitor_timeout_seconds",
+                "monitor_max_bytes", "default_room_channel",
+            ],
             "compaction": [
                 "enabled", "threshold", "keep_recent_tokens",
                 "summary_input_chars", "corrective_attempts",
@@ -805,6 +838,10 @@ class Settings(BaseModel):
                         except (TypeError, ValueError) as exc:
                             raise ValueError(f"{env_name} must be a number; got {value!r}") from exc
                     elif isinstance(current, Path):
+                        value = Path(value)
+                    elif field == "scripts_root":
+                        # Default is None, so the runtime type cannot be used to
+                        # decide; an env-provided root is always a path.
                         value = Path(value)
                     if field == "approval_mode":
                         value = str(value).strip().lower()

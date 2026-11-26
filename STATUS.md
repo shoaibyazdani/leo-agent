@@ -8,7 +8,7 @@ narrative changelog.
 - Provider-independent agent platform: streaming chat in the dashboard and in
   the terminal (`leo chat`), durable tasks, layered memory, specialist agents,
   native tools and skills, approvals with audit, integrations adapters.
-- Measured from the live `LeoApp.initialize()` composition root: 103
+- Measured from the live `LeoApp.initialize()` composition root: 108
   registered tools, 42 available slash commands (126 registered slash
   commands in total) and 24 specialist agents.
 - Agent-managed skills: `skill_manage` creates documentation-only skills
@@ -66,12 +66,23 @@ narrative changelog.
   [docs/REASONING.md](docs/REASONING.md).
 - Local-first security model: loopback bind by default, `LEO_API_TOKEN`
   required for any non-loopback bind, HIGH-risk actions gated by approvals.
+- Proactive schedules: nine model tools, durable consent cards, native
+  script/monitor adapters and unified delivery use the existing SQLite, task
+  engine and permission authority. Model-created jobs without an answerable
+  surface stay as `approval_required` proposals; direct operator scheduling is
+  unasked and audited. Details and capability matrix:
+  [docs/SCHEDULES.md](docs/SCHEDULES.md).
 
 ## Limits
 
 - Live messaging delivery needs platform credentials; the adapters are
   mock-tested until then.
 - Remote node / VPS deployment needs a host, token and TLS endpoint.
+- Scheduled scripts are opt-in operator-provisioned executables, not a sandbox;
+  URL monitors are public-address HTTP(S) only. Live Telegram/gateway smoke, a
+  production-copy migration drill, backup/restore and PTY/TUI verification are
+  not claimed by the local suite; see the release receipt in
+  `scripts/release/evidence/receipt.json`.
 - See [LEO_KNOWN_ISSUES.md](LEO_KNOWN_ISSUES.md) for the itemized list.
 
 ## Testing

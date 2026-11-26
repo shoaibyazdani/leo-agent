@@ -12,6 +12,7 @@ still goes through the privileged tool path there.
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
@@ -25,6 +26,13 @@ from ..security.approval_buttons import (
     parse_callback_data,
     resolve_locator,
     session_grant_scopable,
+)
+from ..security.approval_cards import (
+    at_or_after,
+    card_from_row,
+    is_schedule_kind,
+    normalize_choice,
+    schedule_terminal_text,
 )
 from ..security.permissions import reason_is_trustable
 
@@ -121,10 +129,11 @@ async def tap_blocked_reason(approval_id: str, timeout_seconds: float) -> str | 
     like a crash in LEO rather than "you already answered this". Status is read
     first so the operator gets the truth in one short line.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     row = await db.fetchone(
-        "SELECT status, created_at FROM approvals WHERE id=?", (approval_id,)
+        "SELECT status, created_at, kind, expires_at, shown_at FROM approvals WHERE id=?",
+        (approval_id,),
     )
     if row is None:
         return "That approval no longer exists"
@@ -139,6 +148,18 @@ async def tap_blocked_reason(approval_id: str, timeout_seconds: float) -> str | 
         return "Expired \u2014 the request timed out before it was answered"
     if status != "pending":
         return f"No longer pending ({status})"
+    now = datetime.now(timezone.utc)
+    if is_schedule_kind(row["kind"]):
+        # A schedule card has its own deadline (min of the timeout and the
+        # first run it showed). Show the truth before attempting a resolve.
+        if at_or_after(row["expires_at"], now):
+            return "Expired \u2014 this schedule card's deadline passed"
+        if not row["shown_at"]:
+            return (
+                "This schedule card has not been shown on an answerable surface "
+                "yet; open it in the TUI, app or Telegram"
+            )
+        return None
     try:
         created = datetime.fromisoformat(str(row["created_at"]))
         age = (datetime.now(created.tzinfo) - created).total_seconds()
@@ -169,6 +190,7 @@ async def handle_tap(
     chat_id = str(descriptor.get("chat_id") or "")
     message_id = str(descriptor.get("message_id") or "")
     sender_id = str(descriptor.get("sender_id") or "")
+    thread_id = str(descriptor.get("thread_id") or "")
 
     async def reply(note: str) -> None:
         if callback_id and hasattr(adapter, "answer_callback_query"):
@@ -224,10 +246,26 @@ async def handle_tap(
         await reply(blocked)
         _LOG.info("approval tap ignored", extra={
             "channel": channel, "approval_id": approval_id, "reason": blocked})
-        return {"ok": False, "reason": "not actionable", "note": blocked}
+        return {
+            "ok": False, "reason": "not actionable", "note": blocked,
+            **({"thread_id": thread_id} if thread_id else {}),
+        }
+
+    row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (approval_id,))
+    if row is None:
+        await reply("Unknown approval")
+        return {"ok": False, "reason": "unknown approval"}
+    actor = f"{channel}-button:{sender_id}"
+
+    if is_schedule_kind(row["kind"]):
+        return await _resolve_schedule_tap(
+            approval_id, parsed=parsed, row=row, actor=actor,
+            channel=channel, sender_id=sender_id, thread_id=thread_id,
+            chat_id=chat_id, message_id=message_id, adapter=adapter,
+            permissions=permissions, reply=reply,
+        )
 
     decision = str(parsed.get("decision") or "")
-    actor = f"{channel}-button:{sender_id}"
     granted = ""
     grant_label = ""
     if decision in {"session", "trust"}:
@@ -319,9 +357,122 @@ async def handle_tap(
         await adapter.edit_message_text(chat_id, message_id, text, {"inline_keyboard": []})
     _LOG.info("approval tap resolved", extra={
         "channel": channel, "approval_id": approval_id, "decision": verdict,
-        "grant_id": granted or None, "sender_id": sender_id})
-    return {"ok": ok, "decision": verdict, "approval_id": approval_id,
-            "grant_id": granted or None}
+        "grant_id": granted or None, "sender_id": sender_id, "thread_id": thread_id})
+    return {
+        "ok": ok, "decision": verdict, "approval_id": approval_id,
+        "grant_id": granted or None,
+        **({"thread_id": thread_id} if thread_id else {}),
+    }
+
+
+async def _resolve_schedule_tap(
+    approval_id: str,
+    *,
+    parsed: Mapping[str, str],
+    row: Any,
+    actor: str,
+    channel: str,
+    sender_id: str,
+    thread_id: str,
+    chat_id: str,
+    message_id: str,
+    adapter: Any,
+    permissions: Any,
+    reply: Callable[[str], Awaitable[None]],
+) -> dict[str, Any]:
+    """Resolve one schedule card tap through the manager's atomic path.
+
+    The interactive callback carries only a choice and a card locator. The
+    proposal digest comes from the durable row, never from the callback, and
+    the manager re-checks shown/expiry/digest/choice under one transaction.
+    Sender authorization already happened in :func:`handle_tap`.
+    """
+    try:
+        card = card_from_row(row)
+    except ValueError:
+        await reply("This card cannot be decided")
+        return {"ok": False, "reason": "malformed card"}
+    choice = normalize_choice(str(parsed.get("decision") or ""), card.kind)
+    if choice is None:
+        await reply("That choice is not offered on this card")
+        return {"ok": False, "reason": "invalid choice"}
+    try:
+        resolution = await permissions.resolve_schedule_card(
+            approval_id,
+            choice=choice,
+            resolver=actor,
+            confirm_proposal_digest=str(row["digest"] or ""),
+        )
+    except PermissionError as exc:
+        await reply(str(exc))
+        _LOG.info("schedule tap refused", extra={
+            "channel": channel, "approval_id": approval_id, "reason": str(exc)})
+        return {"ok": False, "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - a tap must never crash the poller
+        await reply(f"Could not resolve: {type(exc).__name__}")
+        _LOG.warning("schedule tap failed", extra={
+            "channel": channel, "approval_id": approval_id,
+            "error": type(exc).__name__})
+        return {"ok": False, "reason": type(exc).__name__}
+
+    ok = resolution.status == "approved"
+    verdict = "approved" if ok else "rejected"
+    note = f"{verdict}: {approval_id} · {resolution.outcome or resolution.status}"
+    if resolution.grant_id:
+        note += " · standing allowance recorded"
+    await reply(note)
+
+    updated = await permissions.get_schedule_card(approval_id)
+    if updated is not None:
+        text = schedule_terminal_text(
+            updated, status=resolution.status,
+            grant_label=(
+                "Standing allowance recorded" if resolution.grant_id else None
+            ),
+        )
+    else:
+        text = f"⏰ Schedule approval\nid: {approval_id}\n{verdict}"
+    if chat_id and message_id and hasattr(adapter, "edit_message_text"):
+        if str(channel) == "telegram":
+            from ..integrations.messaging import TELEGRAM_MAX_CHARS
+
+            if len(text) > TELEGRAM_MAX_CHARS:
+                # Never silently clip a frozen card body in the terminal rewrite.
+                # The full literal text remains in the row/dashboard.
+                text = "\n".join([
+                    str(card.title or "⏰ Schedule approval"),
+                    f"id: {approval_id}",
+                    "Full approval text is in the LEO dashboard.",
+                    f"{verdict} · {resolution.outcome or resolution.status}",
+                ])
+        rewrite = adapter.edit_message_text
+        try:
+            names = inspect.signature(rewrite).parameters
+            can_thread = "thread_id" in names or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in names.values()
+            )
+        except (TypeError, ValueError):
+            can_thread = False
+        extra = {"thread_id": thread_id or None} if can_thread else {}
+        if str(channel) == "telegram" and can_thread:
+            extra["plain_text"] = True
+        await rewrite(chat_id, message_id, text, {"inline_keyboard": []}, **extra)
+        try:
+            from .server import mark_terminal_rewrite
+
+            mark_terminal_rewrite(approval_id)
+        except Exception:  # noqa: BLE001 - display bookkeeping never fails a tap
+            pass
+    _LOG.info("schedule tap resolved", extra={
+        "channel": channel, "approval_id": approval_id, "decision": verdict,
+        "choice": choice, "grant_id": resolution.grant_id,
+        "sender_id": sender_id, "thread_id": thread_id})
+    return {
+        "ok": ok, "decision": verdict, "choice": choice,
+        "approval_id": approval_id, "grant_id": resolution.grant_id,
+        "schedule_id": resolution.schedule_id,
+        **({"thread_id": thread_id} if thread_id else {}),
+    }
 
 
 async def _model_tap(

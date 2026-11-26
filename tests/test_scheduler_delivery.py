@@ -147,6 +147,85 @@ async def test_drain_delivers_completed_schedule_result_after_restart(env):
     assert sent == [("ops", None)]
 
 
+async def test_occurrence_keys_are_schedule_id_with_a_legacy_dual_alias(env):
+    scheduler = Scheduler(env.engine, env.settings, env.events)
+    await scheduler.register_interval("keyed", 60, "work")
+    row = await db.fetchone("SELECT * FROM schedules WHERE name='keyed'")
+    when = "2030-01-01T09:00:00+00:00"
+    await db.execute(
+        "UPDATE schedules SET next_run_at=? WHERE name=?", (when, "keyed")
+    )
+    created = await scheduler.tick(now=when)
+    assert len(created) == 1
+    task_id = created[0].id
+    id_key = await db.fetchone(
+        "SELECT value FROM kv WHERE key=?",
+        (f"task:idempotency:schedule:{row['id']}:{when}",),
+    )
+    legacy_key = await db.fetchone(
+        "SELECT value FROM kv WHERE key=?",
+        (f"task:idempotency:schedule:keyed:{when}",),
+    )
+    marker = await db.fetchone(
+        "SELECT value FROM kv WHERE key=?",
+        (f"schedule:occurrence:{row['id']}:{when}",),
+    )
+    assert id_key["value"] == legacy_key["value"] == task_id
+    assert marker["value"] == task_id
+
+    # A retried tick finds both keys and creates neither a second task nor a
+    # second durable trigger event.
+    await db.execute(
+        "UPDATE schedules SET next_run_at=? WHERE name=?", (when, "keyed")
+    )
+    restarted = Scheduler(DurableTaskEngine(env.settings, env.events), env.settings, env.events)
+    again = await restarted.tick(now=when)
+    assert len(again) == 1 and again[0].id == task_id
+    rows = await db.fetchall("SELECT id FROM tasks")
+    assert len(rows) == 1
+    assert len(await env.events.history("schedule.triggered")) == 1
+
+
+async def test_failed_occurrence_transaction_rolls_back_every_mutation(env, monkeypatch):
+    scheduler = Scheduler(env.engine, env.settings, env.events)
+    await scheduler.register_interval("atomic", 60, "work")
+    when = "2030-01-01T09:00:00+00:00"
+    await db.execute(
+        "UPDATE schedules SET next_run_at=? WHERE name=?", (when, "atomic")
+    )
+    row = await db.fetchone("SELECT * FROM schedules WHERE name='atomic'")
+
+    async def _explode(event):
+        raise RuntimeError("event persistence failed")
+
+    monkeypatch.setattr(env.events, "publish", _explode)
+    with pytest.raises(RuntimeError, match="event persistence failed"):
+        await scheduler.tick(now=when)
+
+    # The claim marker, task, cursor and counter all share the failed
+    # transaction: none may survive it, and no phantom event is persisted.
+    assert await db.fetchall("SELECT id FROM tasks") == []
+    assert (
+        await db.fetchone(
+            "SELECT key FROM kv WHERE key=?",
+            (f"schedule:occurrence:{row['id']}:{when}",),
+        )
+        is None
+    )
+    fresh = await db.fetchone("SELECT next_run_at,claimed_count FROM schedules WHERE id=?", (row["id"],))
+    assert fresh["next_run_at"] == when and fresh["claimed_count"] == 0
+    assert await env.events.history("schedule.triggered") == []
+    assert await env.events.history("task.created") == []
+
+    # Restoring the bus lets the same due occurrence run exactly once.
+    monkeypatch.setattr(env.events, "publish", EventBus.publish.__get__(env.events, EventBus))
+    created = await scheduler.tick(now=when)
+    assert len(created) == 1
+    fresh = await db.fetchone("SELECT claimed_count FROM schedules WHERE id=?", (row["id"],))
+    assert fresh["claimed_count"] == 1
+    assert len(await env.events.history("schedule.triggered")) == 1
+
+
 async def test_event_page_keyset_paging_counts_and_filters(env):
     for index in range(25):
         await env.events.emit("task.done" if index % 2 else "chat.done", index=index)

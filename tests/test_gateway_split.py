@@ -122,6 +122,17 @@ class _FakeAdapter:
         return True
 
 
+class _CardAdapter(_FakeAdapter):
+    """Transport with the native callback + terminal rewrite proof."""
+
+    supports_approval_cards = True
+    supports_full_text = True
+
+    async def send(self, target: str, text: str, **kwargs) -> dict:
+        await super().send(target, text, **kwargs)
+        return {"ok": True, "message_id": "m-1"}
+
+
 def _api(store: GatewayStore, token: str = "t0ken", adapters: dict | None = None):
     return create_api(store, token=token, adapters=adapters if adapters is not None else {})
 
@@ -362,3 +373,397 @@ async def test_an_answer_can_replace_the_tapped_menu_card():
     assert adapter.edits == [
         ("100000001", "77", "Reasoning effort: high", {"inline_keyboard": []})
     ]
+
+
+async def test_thread_principal_and_reply_target_survive_admission_and_the_worker():
+    """The gateway hands the brain the admitted identity, not a channel guess."""
+    from leo.gateway import worker as worker_module
+
+    store = GatewayStore()
+    adapter = _FakeAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(
+        channel="telegram",
+        subject="routing-key",
+        principal="sender-9",
+        thread_id="topic-7",
+        reply_target="chat-target",
+        payload=payload("ping", "m-thread"),
+    )
+
+    class _Brain:
+        def __init__(self) -> None:
+            self.turn = None
+
+        async def initialize(self) -> None:
+            return None
+
+        async def ask(self, text, channel=None, subject=None, conversation_id=None, *, turn=None):
+            self.turn = turn
+            return {"content": "pong", "conversation_id": "conv_thread"}
+
+    real_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api),
+        base_url="http://gateway",
+        headers={"Authorization": "Bearer t0ken"},
+    )
+    original = worker_module.GatewayClient
+
+    class _Client(original):
+        def __init__(self, base_url, token, client=None):
+            super().__init__(base_url, token, client=real_client)
+
+    worker_module.GatewayClient = _Client
+    brain = _Brain()
+    try:
+        async with _client(api) as client:
+            claimed = (
+                await client.post("/v1/claim", json={"worker": "w1"})
+            ).json()["admission"]
+            assert claimed["principal"] == "sender-9"
+            assert claimed["thread_id"] == "topic-7"
+            assert claimed["reply_target"] == "chat-target"
+            assert claimed["conversation_id"] is None
+            # Put the admission back so the worker can claim it after the probe.
+            await client.post("/v1/fail", json={
+                "admission_id": admission_id, "error": "probe", "retry": True,
+            })
+        answered = await worker_module.run_worker(
+            "http://gateway", token="t0ken", wait_seconds=0.0, once=True, brain=brain
+        )
+    finally:
+        worker_module.GatewayClient = original
+        await real_client.aclose()
+
+    assert answered == 1
+    assert brain.turn is not None
+    assert brain.turn.principal == "sender-9"
+    assert brain.turn.thread_id == "topic-7"
+    assert brain.turn.target == "chat-target"
+    assert brain.turn.source == "gateway"
+    assert brain.turn.channel == "telegram"
+    # Delivery goes to the admission's reply target, never the routing subject.
+    assert adapter.sent == [("chat-target", "pong")]
+    assert await store.route("telegram", "routing-key") == "conv_thread"
+
+
+async def test_complete_rejects_forged_sender_identity_and_ignores_body_target():
+    store = GatewayStore()
+    adapter = _FakeAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(
+        channel="telegram",
+        subject="routing-key",
+        principal="sender-9",
+        thread_id="topic-7",
+        reply_target="chat-target",
+        payload=payload("ping", "m-identity"),
+    )
+    async with _client(api) as client:
+        await client.post("/v1/claim", json={"worker": "w1"})
+        wrong_principal = await client.post("/v1/complete", json={
+            "admission_id": admission_id,
+            "answer": "spoofed",
+            "principal": "someone-else",
+        })
+        wrong_thread = await client.post("/v1/complete", json={
+            "admission_id": admission_id,
+            "answer": "spoofed-thread",
+            "thread_id": "other-topic",
+        })
+        done = (await client.post("/v1/complete", json={
+            "admission_id": admission_id,
+            "answer": "real answer",
+            "principal": "sender-9",
+            "thread_id": "topic-7",
+            # A body cannot redirect the reply target.
+            "reply_target": "evil-target",
+        })).json()
+
+    assert wrong_principal.status_code == 409
+    assert wrong_thread.status_code == 409
+    assert done["delivered"] is True
+    assert adapter.sent == [("chat-target", "real answer")]
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: schedule cards across the split gateway
+
+
+def _schedule_permissions(settings=None):
+    from leo.config import Settings
+    from leo.security.permissions import PermissionManagerImpl
+
+    settings = settings or Settings()
+    settings.security.approval_poll_seconds = 0.01
+    return PermissionManagerImpl(settings), settings
+
+
+async def _schedule_card(permissions, body='Schedule "Water" (daily): Drink water.'):
+    return await permissions.create_schedule_card(
+        kind="schedule_create", body=body, proposal_digest="gw-card",
+        requested_by="chat:telegram", conversation_id="conv-gw",
+        origin="gateway:telegram",
+    )
+
+
+async def test_health_advertises_the_card_protocol_only_for_capable_channels() -> None:
+    from leo.gateway.server import APPROVAL_RPC_PROTOCOL
+    from leo.integrations.messaging import TelegramAdapter
+
+    api = _api(GatewayStore(), adapters={"telegram": TelegramAdapter(require_verification=False)})
+    async with _client(api) as client:
+        body = (await client.get("/health")).json()
+    assert body["approval_protocol"] == APPROVAL_RPC_PROTOCOL
+    assert body["approval_cards"]["telegram"]["can_present_card"] is True
+    assert body["approval_cards"]["telegram"]["terminal_edit"] is True
+
+
+async def test_present_ack_and_update_rewrite_the_full_card() -> None:
+    from leo import db
+    from leo.security.approval_cards import schedule_terminal_text
+
+    permissions, _ = _schedule_permissions()
+    card = await _schedule_card(permissions)
+    store = GatewayStore()
+    adapter = _CardAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000001", payload=payload(),
+        principal="100000001", thread_id="77",
+    )
+    await store.claim("worker", lease_seconds=60)
+
+    async with _client(api) as client:
+        bad = await client.post("/v1/approval/present", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "wrong",
+        })
+        assert bad.status_code == 409
+        presented = await client.post("/v1/approval/present", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+            "principal": "100000001", "thread_id": "77",
+        })
+        assert presented.status_code == 200
+        assert presented.json()["presented"] is True
+        acked = await client.post("/v1/approval/ack", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+        })
+        assert acked.json()["acked"] is True
+
+    assert len(adapter.sent) == 1
+    target, text = adapter.sent[0]
+    assert target == "100000001"
+    assert card.body in text and card.deadline in text
+    buttons = [b for row in (adapter.markup or {})["inline_keyboard"] for b in row]
+    assert len(buttons) == 4
+    # The gateway only sends; presentation is still recorded by the worker.
+    row = await db.fetchone("SELECT shown_at FROM approvals WHERE id=?", (card.approval_id,))
+    assert row["shown_at"] is None
+
+    await permissions.present_schedule_card(card.approval_id, surface="telegram")
+    resolution = await permissions.resolve_schedule_card(
+        card.approval_id, choice="once", resolver="telegram-button:100000001",
+        confirm_proposal_digest="gw-card",
+    )
+    assert resolution.status == "approved"
+    updated = await permissions.get_schedule_card(card.approval_id)
+    async with _client(api) as client:
+        rewritten = await client.post("/v1/approval/update", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+            "text": schedule_terminal_text(updated, status=resolution.status),
+        })
+    assert rewritten.status_code == 200
+    assert rewritten.json()["updated"] is True
+    assert len(adapter.edits) == 1
+    assert card.body in adapter.edits[0][2]
+    assert adapter.edits[0][3] == {"inline_keyboard": []}
+
+
+async def test_incapable_gateway_channel_and_mixed_version_get_no_card() -> None:
+    from leo import db
+
+    permissions, _ = _schedule_permissions()
+    card = await _schedule_card(permissions)
+    store = GatewayStore()
+    admission_id, _ = await store.admit(channel="whatsapp", subject="1", payload=payload())
+    await store.claim("worker", lease_seconds=60)
+
+    api = _api(store, adapters={"whatsapp": _FakeAdapter()})
+    async with _client(api) as client:
+        refused = await client.post("/v1/approval/present", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+        })
+    assert refused.status_code == 409
+
+    old_api = create_api(GatewayStore(), token="t0ken", adapters={}, approval_protocol=None)
+    async with _client(old_api) as client:
+        health = (await client.get("/health")).json()
+        missing = await client.post("/v1/approval/present", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+        })
+    assert "approval_protocol" not in health and "approval_cards" not in health
+    assert missing.status_code == 404
+    row = await db.fetchone("SELECT shown_at FROM approvals WHERE id=?", (card.approval_id,))
+    assert row["shown_at"] is None
+
+
+async def test_worker_presents_through_gateway_waits_and_rewrites() -> None:
+    """One brain, one gateway, one shared approval row: the split card path."""
+    from leo import db
+    from leo.gateway import worker as worker_module
+
+    permissions, _ = _schedule_permissions()
+    store = GatewayStore()
+    adapter = _CardAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(channel="telegram", subject="100000001",
+                                       payload=payload("schedule it"))
+
+    class Brain:
+        def __init__(self):
+            self.permissions = permissions
+            self.approval_id = ""
+            self.capabilities = None
+
+        async def initialize(self):
+            return None
+
+        async def ask(self, text, channel=None, subject=None, conversation_id=None, turn=None):
+            self.capabilities = turn.capabilities
+            card = await _schedule_card(self.permissions)
+            self.approval_id = card.approval_id
+            await self.permissions.present_schedule_card(
+                card.approval_id, surface=turn.surface, capabilities=turn.capabilities,
+            )
+            return {"content": "waiting for the card", "conversation_id": "conv-gw"}
+
+    brain = Brain()
+
+    async def decide():
+        for _ in range(500):
+            row = await db.fetchone(
+                "SELECT shown_at FROM approvals WHERE id=?", (brain.approval_id,)
+            ) if brain.approval_id else None
+            if row is not None and row["shown_at"]:
+                # Stay pending long enough for the worker's lease renewal to run.
+                await asyncio.sleep(1.2)
+                await permissions.resolve_schedule_card(
+                    brain.approval_id, choice="once",
+                    resolver="telegram-button:100000001",
+                    confirm_proposal_digest="gw-card",
+                )
+                return
+            await asyncio.sleep(0.01)
+
+    real_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api), base_url="http://gateway",
+        headers={"Authorization": "Bearer t0ken"},
+    )
+    original = worker_module.GatewayClient
+
+    class _Client(original):
+        renewals = 0
+
+        def __init__(self, base_url, token, client=None):
+            super().__init__(base_url, token, client=real_client)
+
+        async def renew(self, *args, **kwargs):
+            type(self).renewals += 1
+            return await super().renew(*args, **kwargs)
+
+    worker_module.GatewayClient = _Client
+    decider = asyncio.create_task(decide())
+    try:
+        answered = await worker_module.run_worker(
+            "http://gateway", token="t0ken", wait_seconds=0.0, once=True,
+            lease_seconds=1, brain=brain
+        )
+    finally:
+        worker_module.GatewayClient = original
+        await asyncio.gather(decider, return_exceptions=True)
+        await real_client.aclose()
+
+    assert answered == 1
+    assert brain.capabilities.can_present_card is True
+    assert _Client.renewals >= 1, "the lease must renew while the card is pending"
+    assert len(adapter.sent) == 2  # card, then the turn's final answer
+    assert brain.approval_id in adapter.sent[0][1]
+    row = await db.fetchone("SELECT status, shown_at FROM approvals WHERE id=?", (brain.approval_id,))
+    assert row["status"] == "approved" and row["shown_at"]
+    assert len(adapter.edits) == 1
+    assert "approved" in adapter.edits[0][2]
+
+
+def test_mixed_version_gateway_turn_is_capability_incapable() -> None:
+    from leo.gateway.worker import admission_turn
+
+    admission = {"channel": "telegram", "principal": "1", "subject": "1"}
+    assert admission_turn(admission).capabilities.can_present_card is False
+
+
+async def test_old_gateway_worker_never_presents_a_schedule_card() -> None:
+    """A mixed-version gateway has no approval RPCs: the worker stays incapable."""
+    from leo.gateway import worker as worker_module
+
+    store = GatewayStore()
+    adapter = _CardAdapter()
+    api = create_api(store, token="t0ken", adapters={"telegram": adapter},
+                     approval_protocol=None)
+    await store.admit(channel="telegram", subject="100000001", payload=payload("hello"))
+
+    class Brain:
+        def __init__(self):
+            self.capabilities = None
+
+        async def initialize(self):
+            return None
+
+        async def ask(self, text, channel=None, subject=None, conversation_id=None, turn=None):
+            self.capabilities = turn.capabilities
+            return {"content": "ok", "conversation_id": "conv-old"}
+
+    brain = Brain()
+    real_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api), base_url="http://gateway",
+        headers={"Authorization": "Bearer t0ken"},
+    )
+    original = worker_module.GatewayClient
+
+    class _Client(original):
+        def __init__(self, base_url, token, client=None):
+            super().__init__(base_url, token, client=real_client)
+
+    worker_module.GatewayClient = _Client
+    try:
+        answered = await worker_module.run_worker(
+            "http://gateway", token="t0ken", wait_seconds=0.0, once=True, brain=brain
+        )
+    finally:
+        worker_module.GatewayClient = original
+        await real_client.aclose()
+
+    assert answered == 1
+    assert brain.capabilities.can_present_card is False
+    assert adapter.sent == [("100000001", "ok")]
+
+
+async def test_gateway_refuses_a_card_that_exceeds_the_channel_limit() -> None:
+    permissions, _ = _schedule_permissions()
+    card = await _schedule_card(permissions, body="X" * 5000)
+    store = GatewayStore()
+    adapter = _CardAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(channel="telegram", subject="1", payload=payload())
+    await store.claim("worker", lease_seconds=60)
+    async with _client(api) as client:
+        response = await client.post("/v1/approval/present", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+        })
+    assert response.status_code == 409
+    assert adapter.sent == []

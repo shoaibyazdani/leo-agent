@@ -1,31 +1,43 @@
-"""Automation tools execute through ToolExecutorImpl against the durable store.
+"""Automation tools exercise the one ScheduleService authority end to end.
 
-Assertions are about real rows: a schedule is only reported created/deleted when
-the SQLite row changed, and a manual trigger is only reported as triggered when
-a task row exists with the read-back status.
+The roster is the final-head model surface (create/list/get/update/pause/
+resume/delete/run_now/cancel), schemas are closed, and a create/edit either
+presents a real card on an answerable surface or fails closed with no write.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from leo import db
 from leo.config import Settings
-from leo.contracts import ToolCall
+from leo.contracts import ToolCall, TurnContext, turn_context
 from leo.events import EventBus
 from leo.security.permissions import PermissionManagerImpl
+from leo.schedules.clock import FrozenClock
+from leo.schedules.service import ScheduleService
+from leo.schedules.store import ScheduleStore
 from leo.tasks import DurableTaskEngine, Scheduler
 from leo.tools import ToolExecutorImpl, ToolRegistry, automation_tools
 
+# Intentional roster update: explicit pause/resume tools join the final-head
+# surface; both use ScheduleService.update and the same edit-consent path.
 TOOL_NAMES = [
     "schedule_create",
     "schedule_list",
+    "schedule_get",
+    "schedule_update",
+    "schedule_pause",
+    "schedule_resume",
     "schedule_delete",
     "schedule_run_now",
+    "schedule_cancel",
 ]
+NOW = datetime(2026, 11, 25, 7, 0, tzinfo=timezone.utc)
 
 
 class ServicesExecutor(ToolExecutorImpl):
@@ -41,6 +53,26 @@ class ServicesExecutor(ToolExecutorImpl):
         return ctx
 
 
+def _operator_turn() -> TurnContext:
+    return TurnContext(
+        principal="operator:cli",
+        channel="cli",
+        surface="cli",
+        source="operator",
+    )
+
+
+def _chat_turn(surface: str = "tui") -> TurnContext:
+    return TurnContext(
+        principal="chat:web",
+        channel=surface,
+        conversation_id="conv-a",
+        surface=surface,
+        origin=surface,
+        source="chat",
+    )
+
+
 @pytest.fixture
 async def env(tmp_path):
     db.set_db_path(tmp_path / "test.db")
@@ -48,30 +80,67 @@ async def env(tmp_path):
     settings = Settings()
     settings.security.allowed_roots = [tmp_path]
     events = EventBus()
-    permissions = PermissionManagerImpl(settings, events)
+    clock = FrozenClock(NOW)
+    permissions = PermissionManagerImpl(settings, events, clock=clock)
     engine = DurableTaskEngine(settings, events)
-    scheduler = Scheduler(engine, settings, events)
-    services = {"scheduler": scheduler, "tasks": engine}
+    scheduler = Scheduler(engine, settings, events, clock=clock)
+    store = ScheduleStore(clock=clock)
+    scripts_root = tmp_path / "scripts"
+    scripts_root.mkdir()
+    service = ScheduleService(
+        store=store,
+        scheduler=scheduler,
+        engine=engine,
+        permissions=permissions,
+        events=events,
+        settings=settings,
+        clock=clock,
+        scripts_root=scripts_root,
+        allowed_workdir_roots=[tmp_path],
+    )
+    services = {
+        "scheduler": scheduler,
+        "tasks": engine,
+        "schedule_service": service,
+        "events": events,
+        "permissions": permissions,
+        "settings": settings,
+    }
     registry = ToolRegistry()
     assert automation_tools.register(registry) == TOOL_NAMES
     executor = ServicesExecutor(
         registry, permissions, events, settings, services=services
     )
     return SimpleNamespace(
-        settings=settings, events=events, permissions=permissions,
-        engine=engine, scheduler=scheduler, services=services,
-        registry=registry, executor=executor,
+        tmp_path=tmp_path,
+        settings=settings,
+        events=events,
+        permissions=permissions,
+        engine=engine,
+        scheduler=scheduler,
+        store=store,
+        service=service,
+        services=services,
+        registry=registry,
+        executor=executor,
+        scripts_root=scripts_root,
     )
 
 
-async def run(env, name: str, arguments: dict | None = None):
-    return await env.executor.execute(
-        ToolCall(name=name, arguments=arguments or {})
-    )
+async def run(env, name: str, arguments: dict | None = None, *, turn=None, actor="chat:web"):
+    call = ToolCall(name=name, arguments=arguments or {}, actor=actor)
+    if turn is None:
+        return await env.executor.execute(call)
+    with turn_context(turn):
+        return await env.executor.execute(call)
 
 
-def task_rows(name: str):
-    return db.fetchall(
+async def run_operator(env, name: str, arguments: dict | None = None):
+    return await run(env, name, arguments, turn=_operator_turn(), actor="operator:cli")
+
+
+async def task_rows(name: str):
+    return await db.fetchall(
         "SELECT * FROM tasks WHERE json_extract(metadata, '$.schedule')=?", (name,)
     )
 
@@ -79,184 +148,258 @@ def task_rows(name: str):
 # --------------------------------------------------------------------------- registration
 
 
-async def test_registration_specs_and_schema_validation(env):
+async def test_registration_specs_and_closed_schema(env):
     specs = {spec.name: spec for spec in env.registry.list_specs()}
-    assert set(specs) == set(TOOL_NAMES)
-    assert [spec.name for spec in env.registry.list_specs()] == TOOL_NAMES
+    assert list(specs) == TOOL_NAMES
     for name, spec in specs.items():
         assert spec.category == "automation"
         assert spec.permissions
         assert spec.input_schema["type"] == "object"
         assert spec.input_schema["additionalProperties"] is False
-        assert spec.resource_field == ""  # identifiers are not paths
-    assert specs["schedule_list"].risk.value == "low"
-    for name in ("schedule_create", "schedule_delete", "schedule_run_now"):
-        assert specs[name].risk.value == "medium"
+        assert spec.resource_field == ""
+        # Schedule consent is the authority, not a generic HIGH/MEDIUM card:
+        # the tool itself must never insert an invisible command approval.
+        assert spec.risk.value == "low"
+    create_schema = specs["schedule_create"].input_schema
+    assert create_schema["properties"]["schedule"]["type"] == "string"
+    # repeat is an integer *or* a numeric string, matching the runtime parser.
+    assert create_schema["properties"]["repeat"]["type"] == ["integer", "string"]
+    for forbidden in ("provider", "model", "base_url", "grace_minutes", "reasoning_effort", "interpreter"):
+        assert forbidden not in create_schema["properties"]
 
-    missing = await run(env, "schedule_create", {"name": "x", "expression": "* * * * *"})
+    missing = await run(env, "schedule_create", {"prompt": "x"})
     assert missing.success is False and missing.decision == "invalid_arguments"
-    assert "objective" in missing.error
+    assert "schedule" in missing.error
 
     extra = await run(env, "schedule_list", {"unknown": True})
     assert extra.success is False and extra.decision == "invalid_arguments"
     assert "unknown field" in extra.error
 
-    wrong_type = await run(env, "schedule_run_now", {"name": "x", "run_at": 123})
-    assert wrong_type.success is False and wrong_type.decision == "invalid_arguments"
+    operator_only = await run(env, "schedule_create", {
+        "schedule": "1h", "prompt": "x", "model": "gpt-x",
+    })
+    assert operator_only.success is False and operator_only.decision == "invalid_arguments"
     assert await db.fetchone("SELECT id FROM schedules WHERE name='x'") is None
 
 
-# --------------------------------------------------------------------------- create/list
+# --------------------------------------------------------------------------- operator direct
 
 
-async def test_create_persists_schedule_and_list_reads_it(env):
-    created = await run(env, "schedule_create", {
+async def test_operator_direct_create_get_list_and_audit(env):
+    created = await run_operator(env, "schedule_create", {
         "name": "digest",
-        "expression": "*/5 * * * *",
-        "objective": "Summarise new items",
-        "payload": {"owner": "ops"},
+        "schedule": "*/5 * * * *",
+        "prompt": "Summarise new items",
+    })
+    assert created.success, created.error
+    assert created.output["status"] == "created"
+    row = await db.fetchone("SELECT * FROM schedules WHERE name='digest'")
+    assert row is not None
+    assert row["kind"] == "cron" and row["expression"] == "*/5 * * * *"
+    assert row["config_revision"] == 1 and row["consent_digest"]
+    assert json.loads(row["payload"])["objective"] == "Summarise new items"
+    assert await db.fetchall("SELECT id FROM approvals") == []
+
+    got = await run_operator(env, "schedule_get", {"name": "digest"})
+    assert got.success and got.output["schedule"]["id"] == row["id"]
+    listed = await run_operator(env, "schedule_list")
+    assert listed.success and listed.output["count"] == 1
+    assert listed.output["schedules"][0]["id"] == row["id"]
+
+    audit = await db.fetchone(
+        "SELECT actor, action, decision FROM audit_log WHERE action='schedule.created'"
+    )
+    assert dict(audit) == {
+        "actor": "operator:cli", "action": "schedule.created", "decision": "allowed",
+    }
+
+
+async def test_operator_update_noop_cas_and_repeat_merge(env):
+    created = await run_operator(env, "schedule_create", {
+        "name": "digest", "schedule": "1h", "prompt": "first", "repeat": 5,
     })
     assert created.success, created.error
     row = await db.fetchone("SELECT * FROM schedules WHERE name='digest'")
-    assert row is not None
-    assert created.output["id"] == row["id"]
-    assert row["kind"] == "cron" and row["expression"] == "*/5 * * * *"
-    assert row["next_run_at"] and row["enabled"] == 1
-    assert '"owner":"ops"' in row["payload"] and "Summarise new items" in row["payload"]
-    assert created.output["next_run_at"] == row["next_run_at"]
+    original_next = row["next_run_at"]
+    await db.execute(
+        "UPDATE schedules SET claimed_count=2, completed_count=1 WHERE id=?", (row["id"],)
+    )
 
-    listed = await run(env, "schedule_list")
-    assert listed.success, listed.error
-    assert listed.output["count"] == 1
-    assert listed.output["schedules"][0]["id"] == row["id"]
-    assert listed.output["schedules"][0]["payload"]["owner"] == "ops"
-
-    await env.scheduler.disable("digest")
-    enabled_only = await run(env, "schedule_list", {"enabled_only": True})
-    assert enabled_only.success and enabled_only.output["count"] == 0
-    all_rows = await run(env, "schedule_list")
-    assert all_rows.output["count"] == 1
-    assert all_rows.output["schedules"][0]["enabled"] is False
-
-
-async def test_create_accepts_interval_and_every_expressions(env):
-    numeric = await run(env, "schedule_create", {
-        "name": "beat", "expression": 60, "objective": "heartbeat",
+    noop = await run_operator(env, "schedule_update", {
+        "name": "digest", "prompt": "first",
     })
-    assert numeric.success, numeric.error
-    row = await db.fetchone("SELECT * FROM schedules WHERE name='beat'")
-    assert row is not None and row["kind"] == "interval"
-    assert row["expression"] == "60.0"
+    assert noop.success, noop.error
+    assert noop.output["status"] == "no_change"
+    unchanged = await db.fetchone("SELECT * FROM schedules WHERE id=?", (row["id"],))
+    assert unchanged["config_revision"] == 1 and unchanged["next_run_at"] == original_next
 
-    every = await run(env, "schedule_create", {
-        "name": "hourly", "expression": "@every 1h", "objective": "hourly job",
+    stale = await run_operator(env, "schedule_update", {
+        "name": "digest", "prompt": "second", "config_revision": 99,
     })
-    assert every.success, every.error
-    row = await db.fetchone("SELECT * FROM schedules WHERE name='hourly'")
-    assert row is not None and row["next_run_at"]
+    assert stale.success is False and "stale_update" in stale.error
 
-
-async def test_invalid_cron_interval_and_iso_are_rejected(env):
-    bad_cron = await run(env, "schedule_create", {
-        "name": "bad-cron", "expression": "not a cron", "objective": "x",
+    updated = await run_operator(env, "schedule_update", {
+        "name": "digest", "prompt": "second", "repeat": 2, "config_revision": 1,
     })
-    assert bad_cron.success is False and "cron" in bad_cron.error.lower()
-    assert await db.fetchone("SELECT id FROM schedules WHERE name='bad-cron'") is None
+    assert updated.success, updated.error
+    assert updated.output["status"] == "updated"
+    row2 = await db.fetchone("SELECT * FROM schedules WHERE id=?", (row["id"],))
+    assert row2["config_revision"] == 2
+    assert row2["repeat_limit"] == 2
+    assert row2["claimed_count"] == 2 and row2["completed_count"] == 1
+    assert json.loads(row2["payload"])["objective"] == "second"
 
-    bad_every = await run(env, "schedule_create", {
-        "name": "bad-every", "expression": "@every 0s", "objective": "x",
-    })
-    assert bad_every.success is False and "@every" in bad_every.error
-    assert await db.fetchone("SELECT id FROM schedules WHERE name='bad-every'") is None
 
-    assert (await run(env, "schedule_create", {
-        "name": "bad-steps", "expression": "*/0 * * * *", "objective": "x",
-    })).success is False
-
-    created = await run(env, "schedule_create", {
-        "name": "iso-check", "expression": "@every 1h", "objective": "x",
+async def test_operator_delete_records_a_tombstone(env):
+    created = await run_operator(env, "schedule_create", {
+        "name": "temp", "schedule": "1h", "prompt": "temporary",
     })
     assert created.success, created.error
-    bad_iso = await run(env, "schedule_run_now", {
-        "name": "iso-check", "run_at": "yesterday",
-    })
-    assert bad_iso.success is False and "invalid ISO 8601 run_at" in bad_iso.error
-    assert await task_rows("iso-check") == []
-
-
-# --------------------------------------------------------------------------- delete
-
-
-async def test_delete_removes_persisted_row_and_reports_truthfully(env):
-    created = await run(env, "schedule_create", {
-        "name": "temp", "expression": "*/5 * * * *", "objective": "temporary",
-    })
-    assert created.success, created.error
-    assert await db.fetchone("SELECT id FROM schedules WHERE name='temp'") is not None
-
-    deleted = await run(env, "schedule_delete", {"name": "temp"})
+    deleted = await run_operator(env, "schedule_delete", {"name": "temp"})
     assert deleted.success, deleted.error
-    assert deleted.output == {
-        "name": "temp", "schedule_id": created.output["id"], "deleted": True,
-    }
+    assert deleted.output["status"] == "removed"
     assert await db.fetchone("SELECT id FROM schedules WHERE name='temp'") is None
+    tomb = await db.fetchone(
+        "SELECT schedule_id, name, reason FROM schedule_tombstones WHERE name='temp'"
+    )
+    assert tomb is not None and tomb["reason"] == "removed"
+    again = await run_operator(env, "schedule_delete", {"name": "temp"})
+    assert again.success is False and "unknown_schedule" in again.error
 
-    again = await run(env, "schedule_delete", {"name": "temp"})
-    assert again.success is False and "unknown schedule" in again.error
+
+# --------------------------------------------------------------------------- model consent
 
 
-# --------------------------------------------------------------------------- run now
-
-
-async def test_run_now_creates_persisted_task_and_reports_no_execution(env):
+async def test_model_create_on_answerable_surface_presents_one_card(env):
     created = await run(env, "schedule_create", {
-        "name": "nightly", "expression": "@every 1h", "objective": "build report",
+        "name": "water", "schedule": "every day at 8am", "prompt": "Drink water.",
+    }, turn=_chat_turn("tui"))
+    assert created.success, created.error
+    out = created.output
+    assert out["status"] == "approval_required"
+    assert out["applied"] is False and out["scheduled"] is False
+    assert out["approval_id"] and out["proposal_id"] and out["card"]
+    assert "Drink water." in out["card"]["body"]
+    assert out["card"]["choices"] == ["once", "session", "always", "deny"]
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='water'") is None
+    approval = await db.fetchone(
+        "SELECT status, kind, shown_at, presented_surface, digest "
+        "FROM approvals WHERE id=?", (out["approval_id"],)
+    )
+    assert approval["status"] == "pending"
+    assert approval["kind"] == "schedule_create"
+    assert approval["shown_at"] and approval["presented_surface"] == "tui"
+    proposal = await db.fetchone(
+        "SELECT status, active_name, schedule_id FROM schedule_proposals WHERE id=?",
+        (out["proposal_id"],),
+    )
+    assert proposal["status"] == "pending" and proposal["active_name"] == "water"
+
+
+async def test_model_create_on_incapable_surface_fails_closed(env):
+    created = await run(env, "schedule_create", {
+        "name": "cli-job", "schedule": "1h", "prompt": "Check.",
+    }, turn=_chat_turn("cli"))
+    assert created.success, created.error
+    out = created.output
+    assert out["status"] == "approval_required"
+    assert out["approval_id"] is None and out["card"] is None
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='cli-job'") is None
+    assert await db.fetchall("SELECT id FROM approvals") == []
+    proposal = await db.fetchone(
+        "SELECT status, active_name FROM schedule_proposals WHERE id=?",
+        (out["proposal_id"],),
+    )
+    assert proposal["status"] == "pending" and proposal["active_name"] == "cli-job"
+
+
+async def test_model_delete_requires_an_edit_card(env):
+    created = await run_operator(env, "schedule_create", {
+        "name": "remove-me", "schedule": "1h", "prompt": "x",
     })
     assert created.success, created.error
-    before = await env.scheduler.get("nightly")
+    removed = await run(env, "schedule_delete", {"name": "remove-me"}, turn=_chat_turn("web"))
+    assert removed.success, removed.error
+    assert removed.output["status"] == "approval_required"
+    assert removed.output["card"]["kind"] == "schedule_edit"
+    assert "remove this schedule" in removed.output["card"]["body"]
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='remove-me'") is not None
 
-    result = await run(env, "schedule_run_now", {"name": "nightly"})
+
+# --------------------------------------------------------------------------- fields
+
+
+async def test_script_monitor_and_no_agent_validation(env):
+    bad_no_agent = await run_operator(env, "schedule_create", {
+        "name": "scriptless", "schedule": "1h", "prompt": "x", "no_agent": True,
+    })
+    assert bad_no_agent.success is False and "no_agent" in bad_no_agent.error
+
+    missing_script = await run_operator(env, "schedule_create", {
+        "name": "missing", "schedule": "1h", "script": "missing.py", "no_agent": True,
+    })
+    assert missing_script.success is False and "script file does not exist" in missing_script.error
+
+    script = env.scripts_root / "check.py"
+    script.write_text("print('ok')", encoding="utf-8")
+    created = await run_operator(env, "schedule_create", {
+        "name": "scripted",
+        "schedule": "1h",
+        "script": "check.py",
+        "no_agent": True,
+    })
+    assert created.success, created.error
+    row = await db.fetchone("SELECT config FROM schedules WHERE name='scripted'")
+    stored = json.loads(row["config"])
+    assert stored["execution"]["script"] == "check.py"
+    assert stored["execution"]["no_agent"] is True
+
+    bad_monitor = await run_operator(env, "schedule_create", {
+        "name": "monitor", "schedule": "1h", "prompt": "x",
+        "monitor": "file:///etc/passwd",
+    })
+    assert bad_monitor.success is False
+
+
+# --------------------------------------------------------------------------- run / cancel
+
+
+async def test_run_now_is_a_background_handle_with_no_cadence_consumption(env):
+    created = await run_operator(env, "schedule_create", {
+        "name": "nightly", "schedule": "1h", "prompt": "build report",
+    })
+    assert created.success, created.error
+    before = await db.fetchone(
+        "SELECT next_run_at, last_run_at, claimed_count FROM schedules WHERE name='nightly'"
+    )
+
+    result = await run_operator(env, "schedule_run_now", {"name": "nightly"})
     assert result.success, result.error
     out = result.output
-    assert out["triggered"] is True and out["task_count"] == 1
-    assert out["executed"] is False and "no worker executed" in out["note"]
-    # A manual occurrence is anchored to the request, not the future cursor.
-    assert out["scheduled_for"] == out["run_at"]
-    assert out["target_next_run_at"] == before["next_run_at"]
-
+    assert out["status"] == "running"
+    assert out["manual_run"] is True and out["triggered"] is True
+    assert out["executed"] is False and out["task_status"] == "created"
     rows = await task_rows("nightly")
     assert len(rows) == 1
-    task = rows[0]
-    assert task["status"] == "created"
-    assert out["task_id"] == task["id"] and out["task_status"] == "created"
-    assert "build report" in task["objective"]
-    assert out["next_run_at"] != before["next_run_at"]
-    assert out["last_run_at"] is not None
-    assert (await env.engine.get(task["id"])).status.value == "created"
+    metadata = json.loads(rows[0]["metadata"])
+    assert metadata["manual_run"] is True and metadata["schedule_id"]
+    after = await db.fetchone(
+        "SELECT next_run_at, last_run_at, claimed_count FROM schedules WHERE name='nightly'"
+    )
+    assert dict(after) == dict(before), "a manual run never moves cadence or counters"
 
-    history = await env.events.history("schedule.triggered")
-    assert any(event.payload.get("name") == "nightly" for event in history)
+    cancelled = await run_operator(env, "schedule_cancel", {"name": "nightly"})
+    assert cancelled.success, cancelled.error
+    assert cancelled.output["status"] == "cancelled"
+    assert cancelled.output["cancelled"] is True
+    assert cancelled.output["schedule_deleted"] is False
+    task = await db.fetchone("SELECT status FROM tasks WHERE id=?", (rows[0]["id"],))
+    assert task["status"] == "cancelled"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='nightly'") is not None
 
-
-async def test_run_now_honours_iso_run_at_and_does_not_run_disabled(env):
-    created = await run(env, "schedule_create", {
-        "name": "iso-run", "expression": "@every 1h", "objective": "iso job",
-    })
-    assert created.success, created.error
-    row = await db.fetchone("SELECT next_run_at FROM schedules WHERE name='iso-run'")
-    result = await run(env, "schedule_run_now", {
-        "name": "iso-run", "run_at": row["next_run_at"],
-    })
-    assert result.success, result.error
-    assert result.output["run_at"] == row["next_run_at"]
-    assert result.output["requested_run_at"] == row["next_run_at"]
-    assert result.output["triggered"] is True and result.output["executed"] is False
-    assert len(await task_rows("iso-run")) == 1
-
-    await env.scheduler.disable("iso-run")
-    disabled = await run(env, "schedule_run_now", {"name": "iso-run"})
-    assert disabled.success is False and "disabled" in disabled.error
-    assert len(await task_rows("iso-run")) == 1  # no silent extra task
+    noop = await run_operator(env, "schedule_cancel", {"name": "nightly"})
+    assert noop.success, noop.error
+    assert noop.output["status"] == "no_live_run"
 
 
 async def test_missing_services_never_fake_success(env):
@@ -265,74 +408,20 @@ async def test_missing_services_never_fake_success(env):
     empty = ServicesExecutor(
         registry, env.permissions, env.events, env.settings, services={}
     )
-    call = ToolCall(name="schedule_create", arguments={
-        "name": "no-service", "expression": "*/5 * * * *", "objective": "x",
-    })
-    result = await empty.execute(call)
-    assert result.success is False and "scheduler service unavailable" in result.error
+    result = await empty.execute(ToolCall(name="schedule_create", arguments={
+        "name": "no-service", "schedule": "1h", "prompt": "x",
+    }, actor="operator:cli"))
+    assert result.success is False and "schedule service unavailable" in result.error
     assert await db.fetchone("SELECT id FROM schedules WHERE name='no-service'") is None
 
-    no_engine = ServicesExecutor(
-        registry, env.permissions, env.events, env.settings,
-        services={"scheduler": env.scheduler},
-    )
-    created = await run(env, "schedule_create", {
-        "name": "no-engine", "expression": "@every 1h", "objective": "x",
-    })
-    assert created.success, created.error
-    failed = await no_engine.execute(
-        ToolCall(name="schedule_run_now", arguments={"name": "no-engine"})
-    )
-    assert failed.success is False and "tasks service unavailable" in failed.error
-    assert await task_rows("no-engine") == []
-
-
-async def test_registration_time_services_fallback_works(env):
-    """The executor need not inject services when register() was given them."""
-    registry = ToolRegistry()
-    assert automation_tools.register(registry, services=env.services) == TOOL_NAMES
-    executor = ToolExecutorImpl(registry, env.permissions, env.events, env.settings)
-    result = await executor.execute(ToolCall(name="schedule_create", arguments={
-        "name": "via-register", "expression": "@every 5m", "objective": "fallback",
-    }))
-    assert result.success, result.error
+    # Registration-time services still work without executor injection.
+    registry2 = ToolRegistry()
+    automation_tools.register(registry2, services=env.services)
+    executor = ToolExecutorImpl(registry2, env.permissions, env.events, env.settings)
+    fallback = await executor.execute(ToolCall(
+        name="schedule_create",
+        arguments={"name": "via-register", "schedule": "5m", "prompt": "fallback"},
+        actor="operator:cli",
+    ))
+    assert fallback.success, fallback.error
     assert await db.fetchone("SELECT id FROM schedules WHERE name='via-register'") is not None
-
-
-async def test_run_now_triggers_only_named_schedule_at_requested_time(env):
-    for name in ("manual", "bystander"):
-        created = await run(env, "schedule_create", {
-            "name": name, "expression": "@every 1h", "objective": f"{name} job",
-        })
-        assert created.success, created.error
-
-    request_at = "2030-01-01T09:00:00+00:00"
-    future_cursor = "2031-01-01T00:00:00+00:00"
-    due_cursor = "2030-01-01T08:00:00+00:00"
-    await db.execute(
-        "UPDATE schedules SET next_run_at=? WHERE name=?", (future_cursor, "manual")
-    )
-    await db.execute(
-        "UPDATE schedules SET next_run_at=? WHERE name=?", (due_cursor, "bystander")
-    )
-
-    result = await run(env, "schedule_run_now", {
-        "name": "manual", "run_at": request_at,
-    })
-    assert result.success, result.error
-    out = result.output
-    assert out["triggered"] is True and out["task_count"] == 1
-    assert out["run_at"] == out["scheduled_for"] == request_at
-    assert out["target_next_run_at"] == future_cursor
-    assert out["next_run_at"] == future_cursor  # never move the cursor backwards
-
-    rows = await task_rows("manual")
-    assert len(rows) == 1
-    assert json.loads(rows[0]["metadata"])["scheduled_for"] == request_at
-    assert await task_rows("bystander") == []
-    bystander = await db.fetchone(
-        "SELECT next_run_at FROM schedules WHERE name='bystander'"
-    )
-    assert bystander["next_run_at"] == due_cursor
-    triggered = await env.events.history("schedule.triggered")
-    assert [event.payload["name"] for event in triggered] == ["manual"]

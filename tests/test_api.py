@@ -138,6 +138,110 @@ async def test_approval_resolve_rejects_cross_site_and_blind_clients(
 
 
 @pytest.mark.asyncio
+async def test_schedule_card_projection_ack_and_digest_bound_resolve(
+    offline_app: LeoApp,
+) -> None:
+    """The card endpoints never decide without a shown, digest-bound choice."""
+    from leo import db
+
+    permissions = offline_app.permissions
+    card = await permissions.create_schedule_card(
+        kind="schedule_create",
+        body='Schedule "Water" (every day at 8am): Drink water.',
+        proposal_digest="api-digest",
+        requested_by="chat:web",
+        conversation_id="conv-api",
+    )
+
+    transport = httpx.ASGITransport(app=api_module.api)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        listing = await client.get("/approvals")
+        projected = listing.json()["cards"]
+        assert [item["approval_id"] for item in projected] == [card.approval_id]
+        assert projected[0]["body"] == card.body
+        assert [item["value"] for item in projected[0]["choices"]] == card.choices
+        # Raw rows stay available for existing callers.
+        assert listing.json()["approvals"][0]["id"] == card.approval_id
+
+        # A blind resolve before any presentation is refused.
+        unshown = await client.post(
+            f"/approvals/{card.approval_id}/resolve",
+            json={"choice": "once", "confirm_proposal_digest": "api-digest"},
+            headers={"origin": "http://test"},
+        )
+        assert unshown.status_code == 403
+
+        cross = await client.post(
+            f"/approvals/{card.approval_id}/ack", json={},
+            headers={"origin": "http://evil.example"},
+        )
+        assert cross.status_code == 403
+        ack = await client.post(
+            f"/approvals/{card.approval_id}/ack", json={},
+            headers={"origin": "http://test"},
+        )
+        assert ack.status_code == 200
+        assert ack.json()["card"]["approval_id"] == card.approval_id
+        assert ack.json()["card"]["acknowledged_at"]
+        assert ack.json()["card"]["acknowledged_surface"] == "web"
+        assert ack.json()["card"]["shown_at"], "ack records the client presentation"
+
+        no_digest = await client.post(
+            f"/approvals/{card.approval_id}/resolve", json={"choice": "once"}
+        )
+        assert no_digest.status_code == 409
+        stale = await client.post(
+            f"/approvals/{card.approval_id}/resolve",
+            json={"choice": "once", "confirm_proposal_digest": "wrong"},
+            headers={"origin": "http://test"},
+        )
+        assert stale.status_code == 409
+        row = await db.fetchone(
+            "SELECT status FROM approvals WHERE id=?", (card.approval_id,)
+        )
+        assert row["status"] == "pending"
+
+        approved = await client.post(
+            f"/approvals/{card.approval_id}/resolve",
+            json={
+                "choice": "session",
+                "confirm_proposal_digest": "api-digest",
+            },
+            headers={"origin": "http://test"},
+        )
+        assert approved.status_code == 200
+        body = approved.json()
+        assert body["status"] == "approved" and body["grant_id"]
+        assert body["card"]["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_api_refuses_a_schedule_card_the_route_principal_requested(
+    offline_app: LeoApp,
+) -> None:
+    """The unauthenticated local API principal cannot approve its own card."""
+    permissions = offline_app.permissions
+    card = await permissions.create_schedule_card(
+        kind="schedule_create",
+        body='Schedule "Water": drink water.',
+        proposal_digest="self-digest",
+        requested_by="local",
+        conversation_id="conv-self",
+    )
+    await permissions.present_schedule_card(card.approval_id, surface="web")
+
+    transport = httpx.ASGITransport(app=api_module.api)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/approvals/{card.approval_id}/resolve",
+            json={"choice": "once", "confirm_proposal_digest": "self-digest"},
+            headers={"origin": "http://test"},
+        )
+    assert response.status_code == 403
+    assert "requester cannot resolve" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_api_health_chat_tasks_and_audit(offline_app: LeoApp) -> None:
     transport = httpx.ASGITransport(app=api_module.api)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1650,3 +1754,126 @@ async def test_stop_while_a_run_is_active_is_not_rejected(offline_app: LeoApp) -
             assert offline_app._active_conversations == {conversation_id}
     finally:
         offline_app._active_conversations.discard(conversation_id)
+
+
+@pytest.mark.asyncio
+async def test_chat_route_identity_wins_over_body_fields(offline_app: LeoApp) -> None:
+    """A request body cannot choose the principal or surface of a chat turn."""
+    captured: dict = {}
+
+    async def fake_ask(text, channel="cli", subject=None, conversation_id=None,
+                       attachments=None, *, turn=None):
+        captured["turn"] = turn
+        return {
+            "conversation_id": "conv_identity",
+            "content": "ok",
+            "status": "completed",
+            "provider": "", "model": "",
+        }
+
+    offline_app.ask = fake_ask  # type: ignore[method-assign]
+    transport = httpx.ASGITransport(app=api_module.api)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/chat", json={
+            "message": "hello",
+            # Routing hints and forged authority fields; none may become authority.
+            "channel": "telegram",
+            "subject": "body-subject",
+            "principal": "operator",
+            "surface": "tui",
+        })
+    assert response.status_code == 200
+    turn = captured["turn"]
+    assert turn is not None
+    assert turn.principal == "local"          # authenticated route identity
+    assert turn.surface == "api"              # blocking route is incapable
+    assert turn.source == "api"
+    assert turn.channel == "telegram"         # display/routing hint only
+    assert turn.capabilities.can_present_card is False
+    assert turn.capabilities.can_wait_for_decision is False
+
+
+@pytest.mark.asyncio
+async def test_api_token_principal_wins_over_body_fields(
+    offline_app: LeoApp, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    async def fake_ask(text, channel="cli", subject=None, conversation_id=None,
+                       attachments=None, *, turn=None):
+        captured["turn"] = turn
+        return {
+            "conversation_id": "conv_token",
+            "content": "ok",
+            "status": "completed",
+            "provider": "", "model": "",
+        }
+
+    offline_app.ask = fake_ask  # type: ignore[method-assign]
+    monkeypatch.setenv("LEO_API_TOKEN", "operator-token")
+    transport = httpx.ASGITransport(app=api_module.api)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers={"Authorization": "Bearer operator-token"},
+    ) as client:
+        response = await client.post("/chat", json={
+            "message": "hello", "principal": "forged", "surface": "web",
+        })
+    assert response.status_code == 200
+    assert captured["turn"].principal == "api-token"
+    assert captured["turn"].surface == "api"
+
+
+@pytest.mark.asyncio
+async def test_tool_route_identity_wins_over_body_fields(offline_app: LeoApp) -> None:
+    """The HTTP executor route records its own actor/principal, not body values."""
+    captured: dict = {}
+
+    async def fake_execute(call, approval_id=None):
+        captured["call"] = call
+        from leo.contracts import ToolResult
+
+        return ToolResult(call_id=call.id, tool=call.name, success=True, output={})
+
+    offline_app.executor.execute = fake_execute  # type: ignore[method-assign]
+    transport = httpx.ASGITransport(app=api_module.api)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/tools/calculator/execute", json={
+            "arguments": {"expression": "1+1"},
+            "principal": "operator",
+            "actor": "operator",
+            "source": "chat",
+        })
+    assert response.status_code == 200
+    call = captured["call"]
+    assert call.actor == "api"
+    assert call.principal == "local"
+    assert call.source == "api"
+    assert call.capabilities["can_present_card"] is False
+
+
+@pytest.mark.asyncio
+async def test_stream_route_uses_the_authenticated_web_surface(offline_app: LeoApp) -> None:
+    """The authenticated web/Electron stream is the capable dashboard surface,
+    while a body channel remains only a routing hint."""
+    captured: dict = {}
+
+    async def fake_stream(*args, **kwargs):
+        captured["turn"] = kwargs.get("turn")
+        yield {"type": "run.finished", "status": "completed", "seq": 0}
+
+    offline_app.ask_stream = fake_stream  # type: ignore[method-assign]
+    transport = httpx.ASGITransport(app=api_module.api)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with client.stream("POST", "/chat/stream", json={
+            "message": "hello", "channel": "telegram",
+        }) as response:
+            assert response.status_code == 200
+            async for _line in response.aiter_lines():
+                pass
+    turn = captured["turn"]
+    assert turn is not None
+    assert turn.principal == "local"
+    assert turn.surface == "web"
+    assert turn.channel == "telegram"
+    assert turn.capabilities.can_present_card is True

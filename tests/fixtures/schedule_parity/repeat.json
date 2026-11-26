@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "oracle_commit": "7cf9e92cd6277b327b36a51fb897cdc8403902d6",
+  "normalization": [
+    {
+      "input": null,
+      "stored_times": null,
+      "meaning": "forever for recurring; one-shot creation overrides to 1"
+    },
+    {
+      "input": "once",
+      "stored_times": 1
+    },
+    {
+      "input": "one",
+      "stored_times": 1
+    },
+    {
+      "input": "1x",
+      "stored_times": 1
+    },
+    {
+      "input": "forever",
+      "stored_times": null
+    },
+    {
+      "input": "infinite",
+      "stored_times": null
+    },
+    {
+      "input": "inf",
+      "stored_times": null
+    },
+    {
+      "input": "none",
+      "stored_times": null
+    },
+    {
+      "input": "",
+      "stored_times": null
+    },
+    {
+      "input": "3",
+      "stored_times": 3
+    },
+    {
+      "input": 3,
+      "stored_times": 3
+    },
+    {
+      "input": 0,
+      "stored_times": null,
+      "oracle_gap": "non-positive normalizes to forever"
+    },
+    {
+      "input": -2,
+      "stored_times": null,
+      "oracle_gap": "non-positive normalizes to forever"
+    },
+    {
+      "input": true,
+      "stored_times": 1,
+      "oracle_gap": "bool is accepted as an integer"
+    },
+    {
+      "input": false,
+      "stored_times": null,
+      "oracle_gap": "bool is accepted as an integer"
+    },
+    {
+      "input": 3.9,
+      "stored_times": 3,
+      "oracle_gap": "fractional numbers are truncated"
+    },
+    {
+      "input": "banana",
+      "error": "Invalid repeat value"
+    }
+  ],
+  "declared_schema_type": "integer",
+  "runtime_accepts_numeric_strings": true,
+  "one_shot_default": 1,
+  "completed_counter_preserved_on_update": true,
+  "manual_runs_do_not_consume_repeat_or_cadence": true,
+  "leo_hardening": "reject zero/negative/unknown values instead of converting them to forever"
+}

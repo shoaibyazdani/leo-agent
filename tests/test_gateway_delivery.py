@@ -589,3 +589,63 @@ async def test_interrupt_commands_are_handled_at_admission_not_in_the_outbox():
         (admitted["conversation_id"],),
     )
     assert row is not None and row["text"] == "/stop"
+
+
+# ------------------------------------------------- 7. Phase 8 local/none delivery
+
+
+async def test_local_note_delivery_needs_no_adapter() -> None:
+    """A ``local`` target is a durable assistant note, not an external send."""
+    from types import SimpleNamespace
+
+    from leo.core.app import LeoApp
+    from leo.schedules.domain import DeliveryTarget
+
+    app = object.__new__(LeoApp)
+
+    async def _terminal(*a, **k):
+        return None
+
+    app.task_reporting = SimpleNamespace(on_terminal=_terminal)
+    task = SimpleNamespace(
+        id="task-local", objective="local brief", status="completed",
+        metadata={"schedule_id": "sch_local", "schedule": "local brief"},
+    )
+    result = await app._channel_delivery(
+        task, "local", "local-conv",
+        {
+            "status": "completed",
+            "delivery_lane": "result",
+            "schedule_payload": {"name": "local brief", "text": "LOCAL-ONLY-NOTE"},
+            "delivery_target": DeliveryTarget(
+                kind="local", platform="local", chat_id="local-conv"
+            ).model_dump(mode="json"),
+        },
+    )
+    assert result == "local:note:local-conv"
+    row = await db.fetchone(
+        "SELECT content,metadata FROM messages WHERE conversation_id='local-conv'"
+    )
+    assert row is not None and "LOCAL-ONLY-NOTE" in row["content"]
+    metadata = json.loads(row["metadata"])
+    assert metadata["schedule_id"] == "sch_local"
+    assert metadata["schedule_note"] is True
+
+
+async def test_external_delivery_refuses_a_none_address() -> None:
+    """A corrupt target must fail before any adapter sees the string None."""
+    from types import SimpleNamespace
+
+    from leo.core.app import LeoApp
+
+    app = object.__new__(LeoApp)
+
+    async def _terminal(*a, **k):
+        return None
+
+    app.task_reporting = SimpleNamespace(on_terminal=_terminal)
+    task = SimpleNamespace(id="task-none", objective="x", status="completed", metadata={})
+    with pytest.raises(ValueError, match="no delivery address"):
+        await app._channel_delivery(
+            task, "telegram", None, {"status": "completed"}
+        )

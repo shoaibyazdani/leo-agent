@@ -12,6 +12,7 @@ from .. import db
 from ..config import Settings
 from ..contracts import TaskRecord, new_id
 from ..events import Event, EventBus
+from ..schedules.clock import Clock, SystemClock
 
 _EVERY = re.compile(
     r"^@every\s+(\d+(?:\.\d+)?)\s*"
@@ -231,14 +232,31 @@ def _advance_past_due(
 class Scheduler:
     """Create tasks from durable schedules and event subscriptions."""
 
-    def __init__(self, engine: Any, settings: Settings, events: EventBus) -> None:
+    def __init__(
+        self,
+        engine: Any,
+        settings: Settings,
+        events: EventBus,
+        clock: Clock | None = None,
+        execution: Any = None,
+    ) -> None:
         self.engine = engine
         self.settings = settings
         self.events = events
+        # One injectable clock for registration, ticks and manual triggers.
+        self.clock = clock or SystemClock()
+        # Optional Phase 6 execution registry. It only *preflights* an
+        # occurrence (monitor suppression, worker selection); the engine still
+        # owns task creation, execution and delivery.
+        self.execution = execution
         self._event_handlers: list[tuple[str, Any]] = []
         # Per-process guard against re-emitting terminal events to in-process
         # subscribers. Durable history is deduplicated by deterministic ids.
         self._terminal_events_emitted: set[str] = set()
+
+    def attach_execution(self, execution: Any) -> None:
+        """Attach the native execution registry after the app graph is built."""
+        self.execution = execution
 
     # ------------------------------------------------------------------
     # Registration
@@ -248,22 +266,31 @@ class Scheduler:
             raise ValueError("schedule name and objective are required")
         stored = dict(payload or {})
         stored["objective"] = objective
-        now = datetime.now(timezone.utc)
+        now = self.clock.now()
         next_at = next_run(kind, expression, now)
         row = await db.fetchone("SELECT * FROM schedules WHERE name=?", (name,))
         if row is None:
             schedule_id = new_id("sch")
             await db.execute(
-                """INSERT INTO schedules(id,name,kind,expression,payload,enabled,next_run_at,last_run_at,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
-                (schedule_id, name, kind, expression, _dump(stored), 1, next_at.isoformat(), None, now.isoformat()),
+                """INSERT INTO schedules(id,name,kind,expression,payload,enabled,next_run_at,last_run_at,created_at,
+                                        schedule_type,status,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    schedule_id, name, kind, expression, _dump(stored), 1,
+                    next_at.isoformat(), None, now.isoformat(), kind, "active",
+                    now.isoformat(),
+                ),
             )
         else:
             schedule_id = row["id"]
             await db.execute(
-                """UPDATE schedules SET kind=?,expression=?,payload=?,enabled=1,next_run_at=?
+                """UPDATE schedules SET kind=?,expression=?,payload=?,enabled=1,
+                          next_run_at=?,schedule_type=?,status='active',updated_at=?
                    WHERE id=?""",
-                (kind, expression, _dump(stored), next_at.isoformat(), schedule_id),
+                (
+                    kind, expression, _dump(stored), next_at.isoformat(), kind,
+                    now.isoformat(), schedule_id,
+                ),
             )
         return await self.get(name)
 
@@ -313,8 +340,20 @@ class Scheduler:
         return [_row_to_schedule(row) for row in await db.fetchall(sql)]
 
     async def set_enabled(self, name: str, enabled: bool) -> dict[str, Any]:
-        await self.get(name)
-        await db.execute("UPDATE schedules SET enabled=? WHERE name=?", (int(bool(enabled)), name))
+        existing = await self.get(name)
+        # Keep the Phase 1 status field aligned with the legacy enabled flag so
+        # the partial unique index only reserves names of active schedules.
+        # Target the row `get` resolved: a paused legacy duplicate must not be
+        # flipped active alongside the row this call actually addressed.
+        await db.execute(
+            "UPDATE schedules SET enabled=?, status=?, updated_at=? WHERE id=?",
+            (
+                int(bool(enabled)),
+                "active" if enabled else "paused",
+                self.clock.now().isoformat(),
+                existing["id"],
+            ),
+        )
         updated = await self.get(name)
         await self.events.emit(
             "schedule.enabled" if enabled else "schedule.disabled",
@@ -377,12 +416,277 @@ class Scheduler:
             return flag.strip().lower() in ("1", "true", "yes", "on")
         return False
 
+    @classmethod
+    def _is_one_shot_row(cls, row: Mapping[str, Any]) -> bool:
+        """Migrated rows use ``kind='once'``; legacy runtime rows use payload."""
+        keys = row.keys() if hasattr(row, "keys") else ()
+        if "kind" in keys and row["kind"] == "once":
+            return True
+        if "schedule_type" in keys and row["schedule_type"] == "once":
+            return True
+        return cls._wants_one_shot(_load(row["payload"]))
+
+    @staticmethod
+    def _row_get(row: Mapping[str, Any], key: str, default: Any = None) -> Any:
+        keys = row.keys() if hasattr(row, "keys") else ()
+        return row[key] if key in keys else default
+
+    @classmethod
+    def _repeat_limit(cls, row: Mapping[str, Any]) -> int | None:
+        """The effective finite run limit, or None for an unlimited schedule."""
+        value = cls._row_get(row, "repeat_limit")
+        try:
+            limit = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            limit = None
+        if limit is not None and limit > 0:
+            return limit
+        # A migrated one-shot is finite even if a legacy row lost the explicit
+        # repeat_limit; preserving its single-occurrence guarantee matters more
+        # than treating the missing value as "forever".
+        return 1 if cls._is_one_shot_row(row) else None
+
     async def _retire(self, row: Mapping[str, Any], reason: str) -> None:
-        """Delete a schedule that must not fire again, and record why."""
+        """Tombstone then delete a schedule that must not fire again.
+
+        The tombstone is the inspectable terminal record (queried by schedule
+        ID only) and the delete is in the same caller-owned transaction, so a
+        crash can never leave a retired row active or a tombstone without the
+        removal.
+        """
+        now = self.clock.now().isoformat()
+        created_at = self._row_get(row, "created_at") or now
+        await db.execute(
+            "INSERT INTO schedule_tombstones("
+            "id,schedule_id,name,reason,payload,origin,created_by,created_at,"
+            "removed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                new_id("tomb"),
+                str(row["id"]),
+                str(row["name"]),
+                reason,
+                str(self._row_get(row, "payload") or "{}"),
+                self._row_get(row, "origin"),
+                self._row_get(row, "created_by"),
+                str(created_at),
+                now,
+                _dump({"retired": True, "reason": reason}),
+            ),
+        )
         await db.execute("DELETE FROM schedules WHERE id=?", (row["id"],))
         await self.events.emit(
             "schedule.completed", name=row["name"], schedule_id=row["id"], reason=reason,
         )
+
+    async def _retire_exhausted(self) -> list[str]:
+        """Turn terminal finite schedules into tombstones before a tick scan.
+
+        The task engine marks a schedule ``completed``/disabled when its last
+        finite terminal task is counted. This sweep is the only place that
+        removes such a row, so the schedule lifecycle still has one authority.
+        """
+        rows = await db.fetchall(
+            "SELECT * FROM schedules WHERE status='completed' "
+            "OR (repeat_limit IS NOT NULL AND completed_count >= repeat_limit)"
+        )
+        retired: list[str] = []
+        for row in rows:
+            async with db.transaction():
+                fresh = await db.fetchone(
+                    "SELECT * FROM schedules WHERE id=?", (row["id"],)
+                )
+                if fresh is None:
+                    continue
+                limit = self._repeat_limit(fresh)
+                completed = int(self._row_get(fresh, "completed_count") or 0)
+                status = str(self._row_get(fresh, "status") or "active")
+                if status != "completed" and not (
+                    limit is not None and completed >= limit
+                ):
+                    continue
+                await self._retire(fresh, reason="repeat limit reached")
+                retired.append(str(fresh["id"]))
+        return retired
+
+    async def _apply_runtime_updates(
+        self, schedule_id: str, updates: Mapping[str, Any]
+    ) -> None:
+        """Commit preflight runtime kv writes inside the occurrence transaction."""
+        now = self.clock.now().isoformat()
+        for key, value in updates.items():
+            text = value if isinstance(value, str) else _dump(value)
+            await db.execute(
+                "INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (f"schedule.runtime:{schedule_id}:{key}", text, now),
+            )
+
+    async def _existing_keyed_task(self, keys: list[str]) -> TaskRecord | None:
+        """Return the task already claimed under any idempotency key, if live."""
+        for key in keys:
+            row = await db.fetchone(
+                "SELECT value FROM kv WHERE key=?", (f"task:idempotency:{key}",)
+            )
+            if row is None:
+                continue
+            task_id = str(row["value"] or "")
+            if not task_id:
+                continue
+            task = await self.engine.get(task_id)
+            if task is not None:
+                return task
+            # A stale claim whose task row is gone must not block a fresh one.
+            await db.execute(
+                "DELETE FROM kv WHERE key=? AND value=?",
+                (f"task:idempotency:{key}", task_id),
+            )
+        return None
+
+    async def _existing_occurrence_task(
+        self, schedule_id: str, name: str, scheduled_for: str
+    ) -> TaskRecord | None:
+        return await self._existing_keyed_task(
+            [
+                f"schedule:{schedule_id}:{scheduled_for}",
+                # Legacy name-keyed claim: adopt it instead of creating a
+                # second task for the same in-flight occurrence.
+                f"schedule:{name}:{scheduled_for}",
+            ]
+        )
+
+    async def _record_occurrence_aliases(
+        self, schedule_id: str, name: str, scheduled_for: str, task_id: str
+    ) -> None:
+        """Write both the schedule-ID key and the legacy name key.
+
+        The dual keys make a downgrade/upgrade or an in-flight pre-migration
+        occurrence resolve to the same task; neither key can mint a duplicate.
+        """
+        now = self.clock.now().isoformat()
+        for key in (
+            f"task:idempotency:schedule:{schedule_id}:{scheduled_for}",
+            f"task:idempotency:schedule:{name}:{scheduled_for}",
+        ):
+            await db.execute(
+                "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+                (key, task_id, now),
+            )
+
+    async def _claim_occurrence(
+        self,
+        row: Mapping[str, Any],
+        cursor: datetime,
+        objective: str,
+        occurrence_payload: dict[str, Any],
+        create_kwargs: dict[str, Any],
+    ) -> tuple[TaskRecord | None, bool]:
+        """Atomically admit and create one occurrence.
+
+        Runs inside the caller's ``db.transaction``. Returns ``(task, created)``
+        where ``created`` is False when a retry adopted the task from a durable
+        claim marker or a legacy idempotency key. ``(None, False)`` means the
+        finite repeat budget is exhausted and the schedule was retired.
+        """
+        schedule_id = str(row["id"])
+        name = str(row["name"])
+        scheduled_for = cursor.isoformat()
+        now = self.clock.now().isoformat()
+        marker = f"schedule:occurrence:{schedule_id}:{scheduled_for}"
+
+        def _adopt(task: TaskRecord | None) -> tuple[TaskRecord | None, bool]:
+            return task, False
+
+        claimed = await db.execute(
+            "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+            (marker, "", now),
+        )
+        if int(getattr(claimed, "rowcount", 0) or 0) < 1:
+            row_marker = await db.fetchone(
+                "SELECT value FROM kv WHERE key=?", (marker,)
+            )
+            task_id = str(row_marker["value"] or "") if row_marker else ""
+            if task_id:
+                task = await self.engine.get(task_id)
+                if task is not None:
+                    await self._record_occurrence_aliases(
+                        schedule_id, name, scheduled_for, task.id
+                    )
+                    return _adopt(task)
+            # Stale marker (its task is gone): take the occurrence over.
+            await db.execute("DELETE FROM kv WHERE key=?", (marker,))
+            claimed = await db.execute(
+                "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+                (marker, "", now),
+            )
+            if int(getattr(claimed, "rowcount", 0) or 0) < 1:
+                return _adopt(None)
+
+        # Another process may have retired the row between this tick's scan and
+        # its transaction; never resurrect it with a task or a duplicate
+        # tombstone.
+        exists = await db.fetchone(
+            "SELECT 1 AS present FROM schedules WHERE id=?", (schedule_id,)
+        )
+        if exists is None:
+            await db.execute("DELETE FROM kv WHERE key=?", (marker,))
+            return _adopt(None)
+
+        limit = self._repeat_limit(row)
+        if limit is not None:
+            admitted = await db.execute(
+                "UPDATE schedules SET claimed_count=claimed_count+1 "
+                "WHERE id=? AND claimed_count < ?",
+                (schedule_id, limit),
+            )
+            if int(getattr(admitted, "rowcount", 0) or 0) < 1:
+                # No repeat slot left. The durable marker we just wrote must not
+                # survive the retirement, or a tombstoned name could not be
+                # inspected by its old schedule ID.
+                await db.execute("DELETE FROM kv WHERE key=?", (marker,))
+                still_there = await db.fetchone(
+                    "SELECT 1 AS present FROM schedules WHERE id=?", (schedule_id,)
+                )
+                if still_there is not None:
+                    await self._retire(row, reason="repeat limit reached")
+                return _adopt(None)
+        else:
+            admitted = await db.execute(
+                "UPDATE schedules SET claimed_count=claimed_count+1 WHERE id=?",
+                (schedule_id,),
+            )
+            if int(getattr(admitted, "rowcount", 0) or 0) < 1:
+                await db.execute("DELETE FROM kv WHERE key=?", (marker,))
+                return _adopt(None)
+
+        existing = await self._existing_occurrence_task(
+            schedule_id, name, scheduled_for
+        )
+        if existing is not None:
+            task = existing
+            created = False
+        else:
+            metadata = {
+                "schedule": name,
+                "schedule_id": schedule_id,
+                "scheduled_for": scheduled_for,
+                "schedule_payload": occurrence_payload,
+            }
+            task = await self.engine.create(
+                objective,
+                metadata=metadata,
+                idempotency_key=f"schedule:{schedule_id}:{scheduled_for}",
+                **create_kwargs,
+            )
+            created = True
+        await db.execute(
+            "UPDATE kv SET value=?, updated_at=? WHERE key=?",
+            (task.id, now, marker),
+        )
+        await self._record_occurrence_aliases(
+            schedule_id, name, scheduled_for, task.id
+        )
+        return task, created
 
     async def tick(self, now: datetime | str | None = None) -> list[TaskRecord]:
         """Create tasks for every enabled schedule due at ``now`` and persist next_run_at.
@@ -391,11 +695,18 @@ class Scheduler:
         moment), bounded missed occurrences are caught up, and a global
         ``max_concurrent_tasks`` gate defers bursts without losing the due
         occurrence (next_run_at is left untouched when deferred).
+
+        For each schedule every durable mutation - repeat admission, the
+        occurrence claim marker, task creation, monitor baseline, cursor and
+        counter update, and the aggregate ``schedule.triggered`` event - is one
+        ``db.transaction``. The event bus defers delivery until that commit, so
+        a rollback leaves neither a phantom event nor a second task.
         """
-        moment = as_utc(now)
+        moment = as_utc(now) if now is not None else self.clock.now()
         due: list[TaskRecord] = []
         limit = self._concurrency_limit()
         backlog = await self._scheduled_backlog() if limit else 0
+        await self._retire_exhausted()
         rows = await db.fetchall(
             "SELECT * FROM schedules WHERE enabled=1 AND next_run_at IS NOT NULL ORDER BY created_at"
         )
@@ -403,95 +714,245 @@ class Scheduler:
             scheduled_for = as_utc(row["next_run_at"])
             if scheduled_for > moment:
                 continue
-            if limit and backlog >= limit:
-                await self.events.emit(
-                    "schedule.deferred", name=row["name"], scheduled_for=scheduled_for.isoformat(),
-                    reason="max_concurrent_tasks reached",
-                )
-                continue  # leave next_run_at in place; retry on the next tick
-            payload = _load(row["payload"])
-            one_shot = self._wants_one_shot(payload)
+            one_shot = self._is_one_shot_row(row)
             objective, payload, create_kwargs = self._occurrence_payload(row)
+            grace_seconds = self._grace_seconds(row)
 
-            # Catch up bounded missed occurrences; each one keeps its own
-            # scheduled_for identity (and idempotency key), so a repeated or
-            # late tick can never duplicate or silently drop an occurrence.
+            # Plan every occurrence first. Preflight is the only network step
+            # and must stay outside the write transaction; its monitor baseline
+            # is returned as a deferred write and committed with the task.
             cursor = scheduled_for
             skipped = 0
-            first_task: TaskRecord | None = None
-            start_index = len(due)
-            # A one-shot schedule has exactly one occurrence to create; running
-            # the recurring catch-up over it minted a burst of duplicate tasks
-            # (and duplicate messages) that the retirement could never undo.
+            plans: list[tuple[str, datetime, Any]] = []
+            baseline_cache: dict[str, Any] = {}
             occurrences = 1 if one_shot else _MAX_CATCHUP
             for _ in range(occurrences):
                 if cursor > moment:
                     break
-                if limit and backlog >= limit:
-                    await self.events.emit(
-                        "schedule.deferred", name=row["name"], scheduled_for=cursor.isoformat(),
-                        reason="max_concurrent_tasks reached",
+                if (
+                    grace_seconds is not None
+                    and not one_shot
+                    and (moment - cursor).total_seconds() > grace_seconds
+                ):
+                    # Operator late-run policy: an occurrence older than grace
+                    # is skipped (not replayed) and the cursor advances.
+                    plans.append(("skip", cursor, grace_seconds / 60.0))
+                    cursor = next_run(row["kind"], row["expression"], cursor)
+                    continue
+
+                occurrence_objective = objective
+                occurrence_payload = dict(payload)
+                decision = await self._preflight_occurrence(
+                    row,
+                    occurrence_payload,
+                    cursor,
+                    baseline_override=baseline_cache.get(str(row["id"])),
+                )
+                if decision is not None and decision.baseline_candidate:
+                    baseline_cache[str(row["id"])] = decision.baseline_candidate
+                if decision is not None:
+                    if decision.suppress:
+                        plans.append(("suppress", cursor, decision))
+                        if one_shot:
+                            cursor = None  # type: ignore[assignment]
+                            break
+                        cursor = next_run(row["kind"], row["expression"], cursor)
+                        continue
+                    if decision.objective:
+                        occurrence_objective = str(decision.objective)
+                    if decision.worker:
+                        occurrence_payload["worker"] = decision.worker
+                    if decision.payload_updates:
+                        occurrence_payload.update(decision.payload_updates)
+                plans.append(
+                    ("claim", cursor, (occurrence_objective, occurrence_payload, decision))
+                )
+                if not one_shot:
+                    # A once schedule has no recurrence to compute. Migrated
+                    # rows use kind='once', which next_run() cannot parse.
+                    cursor = next_run(row["kind"], row["expression"], cursor)
+
+            created = 0
+            claimed_any = False
+            first_task: TaskRecord | None = None
+            deferred = False
+            retired = False
+            async with db.transaction():
+                for kind, at, data in plans:
+                    if limit and backlog >= limit:
+                        await self.events.emit(
+                            "schedule.deferred",
+                            name=row["name"],
+                            scheduled_for=at.isoformat(),
+                            reason="max_concurrent_tasks reached",
+                        )
+                        deferred = True
+                        break
+                    if kind == "skip":
+                        skipped += 1
+                        await self.events.emit(
+                            "schedule.skipped",
+                            name=row["name"],
+                            schedule_id=row["id"],
+                            scheduled_for=at.isoformat(),
+                            reason="outside grace window",
+                            grace_minutes=data,
+                        )
+                        continue
+                    if kind == "suppress":
+                        decision = data
+                        if decision.runtime_updates:
+                            await self._apply_runtime_updates(
+                                str(row["id"]), decision.runtime_updates
+                            )
+                        if decision.event_topic:
+                            await self.events.emit(
+                                decision.event_topic, **decision.event_payload
+                            )
+                        continue
+
+                    occurrence_objective, occurrence_payload, decision = data
+                    if decision is not None:
+                        if decision.runtime_updates:
+                            await self._apply_runtime_updates(
+                                str(row["id"]), decision.runtime_updates
+                            )
+                        if decision.event_topic:
+                            await self.events.emit(
+                                decision.event_topic, **decision.event_payload
+                            )
+                    task, was_created = await self._claim_occurrence(
+                        row,
+                        at,
+                        occurrence_objective,
+                        occurrence_payload,
+                        create_kwargs,
                     )
-                    cursor = None  # type: ignore[assignment]
-                    break
-                metadata = {
-                    "schedule": row["name"],
-                    "schedule_id": row["id"],
-                    "scheduled_for": cursor.isoformat(),
-                    "schedule_payload": payload,
-                }
-                task = await self.engine.create(
-                    objective,
-                    metadata=metadata,
-                    idempotency_key=f"schedule:{row['name']}:{cursor.isoformat()}",
-                    **create_kwargs,
-                )
-                due.append(task)
-                if first_task is None:
-                    first_task = task
-                backlog += 1
-                cursor = next_run(row["kind"], row["expression"], cursor)
-            if cursor is None:
-                # Deferred: keep next_run_at so the occurrence is retried.
-                continue
-            if not one_shot and cursor <= moment:
-                # More occurrences were missed than the cap: skip the rest
-                # and record the truncation instead of replaying history.
-                cursor, skipped = _advance_past_due(
-                    row["kind"], row["expression"], cursor, moment
-                )
-                await self.events.emit(
-                    "schedule.catchup_truncated", name=row["name"],
-                    skipped=skipped, next_run_at=cursor.isoformat(),
-                )
-            # Publish the occurrence event *before* advancing next_run_at.
-            # A crash between the two leaves the durable event in history; on
-            # restart the tick repeats the same (idempotent) publish with the
-            # same deterministic id, so history has exactly one occurrence and
-            # no second task is created (engine.create is idempotent by key).
-            await self.events.publish(
-                Event(
-                    id=f"schedule-triggered:{row['id']}:{scheduled_for.isoformat()}",
-                    topic="schedule.triggered",
-                    payload={
-                        "name": row["name"],
-                        "task_id": first_task.id if first_task else None,
-                        "task_count": len(due) - start_index,
-                        "scheduled_for": scheduled_for.isoformat(),
-                        "next_run_at": cursor.isoformat(),
-                        "skipped": skipped,
-                    },
-                )
-            )
-            await db.execute(
-                "UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?",
-                (moment.isoformat(), cursor.isoformat(), row["id"]),
-            )
-            if one_shot:
-                # A one-shot schedule exists to fire once. Leaving it enabled
-                # made a delivered reminder repeat on the next due slot.
-                await self._retire(row, reason="one-shot occurrence created")
+                    if task is None:
+                        retired = True
+                        break
+                    due.append(task)
+                    claimed_any = True
+                    if first_task is None:
+                        first_task = task
+                    if was_created:
+                        created += 1
+                        if limit:
+                            backlog += 1
+
+                if deferred or retired:
+                    # Keep next_run_at so a deferred occurrence is retried; a
+                    # retired row no longer exists to update.
+                    continue
+                if one_shot:
+                    # A one-shot schedule exists to fire once. Leaving it
+                    # enabled made a delivered reminder repeat on the next due
+                    # slot. A suppressed occurrence is still consumed/retired.
+                    reason = (
+                        "one-shot occurrence created"
+                        if claimed_any
+                        else "one-shot occurrence suppressed"
+                    )
+                    await self._retire(row, reason=reason)
+                    continue
+                if cursor is not None and cursor <= moment:
+                    # More occurrences were missed than the cap: skip the rest
+                    # and record the truncation instead of replaying history.
+                    cursor, more = _advance_past_due(
+                        row["kind"], row["expression"], cursor, moment
+                    )
+                    skipped += more
+                    await self.events.emit(
+                        "schedule.catchup_truncated",
+                        name=row["name"],
+                        skipped=more,
+                        next_run_at=cursor.isoformat(),
+                    )
+                # The occurrence event is persisted inside this same transaction.
+                # On retry the durable occurrence marker suppresses a second task
+                # and the deterministic event id suppresses a second event.
+                if created:
+                    await self.events.publish(
+                        Event(
+                            id=f"schedule-triggered:{row['id']}:{scheduled_for.isoformat()}",
+                            topic="schedule.triggered",
+                            payload={
+                                "name": row["name"],
+                                "task_id": first_task.id if first_task else None,
+                                "task_count": created,
+                                "scheduled_for": scheduled_for.isoformat(),
+                                "next_run_at": cursor.isoformat() if cursor else None,
+                                "skipped": skipped,
+                            },
+                        )
+                    )
+                if cursor is not None:
+                    await db.execute(
+                        "UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?",
+                        (moment.isoformat(), cursor.isoformat(), row["id"]),
+                    )
         return due
+
+    async def _preflight_occurrence(
+        self,
+        row: Mapping[str, Any],
+        payload: dict[str, Any],
+        cursor: datetime,
+        *,
+        baseline_override: Any = None,
+    ) -> Any:
+        """Ask the optional execution registry what to do, fail-closed on error."""
+        if self.execution is None:
+            return None
+        preflight = getattr(self.execution, "preflight", None)
+        if not callable(preflight):
+            return None
+        kwargs: dict[str, Any] = {
+            "schedule_id": str(row["id"]),
+            "name": str(row["name"]),
+            "payload": payload,
+            "scheduled_for": cursor,
+        }
+        try:
+            parameters = inspect.signature(preflight).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "baseline_override" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            kwargs["baseline_override"] = baseline_override
+        try:
+            return await preflight(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - preflight must not stop the tick
+            await self.events.emit(
+                "schedule.execution_error",
+                name=row["name"],
+                schedule_id=row["id"],
+                scheduled_for=cursor.isoformat(),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+
+    @staticmethod
+    def _grace_seconds(row: Mapping[str, Any]) -> float | None:
+        """Operator grace window in seconds, or None when unset."""
+        try:
+            keys = row.keys() if hasattr(row, "keys") else ()
+        except TypeError:  # pragma: no cover - defensive
+            return None
+        if "grace_minutes" not in keys:
+            return None
+        value = row["grace_minutes"]
+        if value is None:
+            return None
+        try:
+            minutes = float(value)
+        except (TypeError, ValueError):
+            return None
+        if minutes < 0:
+            return None
+        return minutes * 60.0
 
     async def trigger(
         self, name: str, now: datetime | str | None = None
@@ -510,7 +971,7 @@ class Scheduler:
         if not row["enabled"]:
             raise ValueError(f"schedule is disabled: {name}")
 
-        moment = as_utc(now)
+        moment = as_utc(now) if now is not None else self.clock.now()
         limit = self._concurrency_limit()
         if limit and await self._scheduled_backlog() >= limit:
             await self.events.emit(
@@ -521,44 +982,67 @@ class Scheduler:
 
         objective, payload, create_kwargs = self._occurrence_payload(row)
         scheduled_for = moment.isoformat()
-        metadata = {
-            "schedule": row["name"],
-            "schedule_id": row["id"],
-            "scheduled_for": scheduled_for,
-            "schedule_payload": payload,
-        }
-        task = await self.engine.create(
-            objective,
-            metadata=metadata,
-            idempotency_key=f"schedule:{row['name']}:{scheduled_for}",
-            **create_kwargs,
-        )
-        following = next_run(row["kind"], row["expression"], moment)
-        cursor = as_utc(row["next_run_at"]) if row["next_run_at"] else following
-        if following > cursor:
-            cursor = following
-        await self.events.publish(
-            Event(
-                id=f"schedule-triggered:{row['id']}:{scheduled_for}",
-                topic="schedule.triggered",
-                payload={
-                    "name": row["name"],
-                    "task_id": task.id,
-                    "task_count": 1,
+        one_shot = self._is_one_shot_row(row)
+        if one_shot:
+            # No recurrence for a migrated/legacy one-shot; it is retired below.
+            cursor = moment
+        else:
+            following = next_run(row["kind"], row["expression"], moment)
+            cursor = as_utc(row["next_run_at"]) if row["next_run_at"] else following
+            if following > cursor:
+                cursor = following
+        keys = [
+            f"schedule:{row['id']}:manual:{scheduled_for}",
+            f"schedule:{row['name']}:manual:{scheduled_for}",
+            # Pre-Phase-7 manual triggers used the bare name/instant key.
+            f"schedule:{row['name']}:{scheduled_for}",
+        ]
+        async with db.transaction():
+            task = await self._existing_keyed_task(keys)
+            if task is None:
+                metadata = {
+                    "schedule": row["name"],
+                    "schedule_id": row["id"],
                     "scheduled_for": scheduled_for,
-                    "next_run_at": cursor.isoformat(),
-                    "skipped": 0,
-                },
+                    "schedule_payload": payload,
+                    # A manual trigger never spends a repeat slot or cadence.
+                    "manual_run": True,
+                }
+                task = await self.engine.create(
+                    objective,
+                    metadata=metadata,
+                    idempotency_key=keys[0],
+                    **create_kwargs,
+                )
+            now = self.clock.now().isoformat()
+            for key in keys:
+                await db.execute(
+                    "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+                    (f"task:idempotency:{key}", task.id, now),
+                )
+            await self.events.publish(
+                Event(
+                    id=f"schedule-triggered:{row['id']}:{scheduled_for}",
+                    topic="schedule.triggered",
+                    payload={
+                        "name": row["name"],
+                        "task_id": task.id,
+                        "task_count": 1,
+                        "scheduled_for": scheduled_for,
+                        "next_run_at": cursor.isoformat(),
+                        "skipped": 0,
+                        "manual_run": True,
+                    },
+                )
             )
-        )
-        await db.execute(
-            "UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?",
-            (moment.isoformat(), cursor.isoformat(), row["id"]),
-        )
-        if self._wants_one_shot(payload):
-            # A manual trigger of a one-shot consumes it, exactly like a
-            # scheduled occurrence would.
-            await self._retire(row, reason="one-shot triggered manually")
+            await db.execute(
+                "UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?",
+                (moment.isoformat(), cursor.isoformat(), row["id"]),
+            )
+            if one_shot:
+                # A manual trigger of a one-shot consumes it, exactly like a
+                # scheduled occurrence would.
+                await self._retire(row, reason="one-shot triggered manually")
         return [task]
 
     # ------------------------------------------------------------------
@@ -656,6 +1140,36 @@ class Scheduler:
             redelivered.append(task.id)
         return redelivered
 
+    async def recover_cancelled(self, limit: int = 100) -> list[str]:
+        """Settle scheduled tasks whose cancellation outlived a restart.
+
+        A cancellation requested while a worker owned the task leaves the flag
+        durable. After a restart there is no in-process claim to observe it, so
+        the task would otherwise sit non-terminal forever (and could be
+        reclaimed). Finalizing it here makes cancellation absorbing: terminal
+        replay may re-emit its event, but nothing resurrects or reruns it.
+        """
+        rows = await db.fetchall(
+            """SELECT id FROM tasks
+               WHERE cancellation_requested=1
+                 AND status NOT IN ('completed','failed','cancelled')
+                 AND json_extract(metadata, '$.schedule') IS NOT NULL
+               ORDER BY updated_at LIMIT ?""",
+            (max(1, min(int(limit), 1000)),),
+        )
+        active = getattr(self.engine, "_active_claims", None) or {}
+        settled: list[str] = []
+        for row in rows:
+            task_id = str(row["id"])
+            if task_id in active:
+                continue  # a live local worker still owns the flag
+            try:
+                await self.engine.cancel(task_id)
+            except (KeyError, ValueError):
+                continue
+            settled.append(task_id)
+        return settled
+
     async def drain(self, limit: int | None = None) -> dict[str, Any]:
         """Dispatch ready tasks and deliver terminal results via the engine.
 
@@ -669,6 +1183,7 @@ class Scheduler:
             raise RuntimeError("task engine has no registered-worker dispatch API (dispatch_ready)")
         batch = limit or 100
         outcome: dict[str, Any] = {
+            "recovered_cancellations": await self.recover_cancelled(batch),
             "dispatch": await self._call_hook(dispatch, limit),
             "delivery": None,
             "redelivered": [],
