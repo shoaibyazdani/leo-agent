@@ -68,7 +68,8 @@ model. `request_key` is an idempotency control handled by trusted callers.
   lists, and five- or six-field cron with named months/weekdays.
 - Duration units: minutes (`m`, `min`, `mins`, `minute`, `minutes`), hours
   (`h`, `hr`, `hrs`, `hour`, `hours`) and days (`d`, `day`, `days`). A missing
-  count means one; seconds and weeks are rejected.
+  count means one; seconds and weeks are rejected. Counts are capped at about
+  ten years, including absurd digit strings that would otherwise overflow.
 - Repeats: omitted means forever; `once`, `one`, `1x`, numeric strings and the
   `forever` family normalize; zero, negative, fractional and boolean repeats
   are rejected by LEO hardening. Repeat 1 retires after one claimed run.
@@ -77,8 +78,9 @@ model. `request_key` is an idempotency control handled by trusted callers.
   legacy rows with no timezone remain UTC.
 - `@every` is legacy-readable only: existing LEO rows still parse through the
   reader, while new schedules reject it with a stable `invalid_schedule` error
-  and point at `30m` / `every 30m`. It is not a writable LEO extension and no
-  source-parity claim is made for it.
+  and point at `30m` / `every 30m`. Legacy cadences are capped at the same ten
+  years as new durations, so a corrupt row cannot create an unbounded interval.
+  It is not a writable LEO extension and no source-parity claim is made for it.
 
 Semantic equality is kind plus cadence/expression or exact instant. Relative
 durations measure elapsed time; cron uses IANA wall time. An aware one-shot is
@@ -153,7 +155,9 @@ Every surviving field has a runtime consumer:
 - `attach_to_session` uses a durable job conversation; `pinned` stores the
   operator-owned provider/model at creation and fails closed with a needs-you
   notice when the target disappears; `grace_minutes` is operator-only late-run
-  policy.
+  policy on cron and interval jobs. A legacy one-shot carrying a grace window
+  is retired as missed rather than dispatched after the window; an edit that
+  turns a recurring job into a one-shot must set the window to zero first.
 
 Removed intermediate scope stays absent: watcher skills/templates, inline
 script content, per-job script state directories, gate-context/watchdog and a

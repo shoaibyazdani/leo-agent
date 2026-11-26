@@ -492,6 +492,12 @@ class MessagingAdapter:
     # webhook-capable; the base poll() simply raises.
     supports_webhook: bool = True
     supports_polling: bool = False
+    # A thread is part of the destination. Declare these explicitly rather than
+    # guessing from method signatures: a ``**kwargs`` sink is not proof that a
+    # channel can place a message in a named thread (or in a threaded media
+    # post). The gateway fails closed when the relevant flag is absent.
+    supports_threaded_text: bool = False
+    supports_threaded_media: bool = False
 
     def __init__(
         self,
@@ -572,27 +578,17 @@ class MessagingAdapter:
         *,
         caption: str = "",
         root: str | Path | None = None,
+        thread_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one local file as an attachment.
 
         Default is "unsupported", not "silently send the caption only": a
         channel without attachment support must make the caller see that the
-        file did not arrive.
+        file did not arrive. ``thread_id`` is part of the destination: a media
+        sender that advertises ``supports_threaded_media`` must honour it or
+        raise; it must never silently post to the root.
         """
         raise MessagingError(f"{self.channel} does not support outbound media")
-
-    async def send_typing(self, target: str) -> None:
-        """sendChatAction(typing). Cosmetic: failures are swallowed by the caller."""
-        token = credential("TELEGRAM_BOT_TOKEN")
-        if not token:
-            return None
-        url = f"{self.API_BASE}/bot{token}/sendChatAction"
-        response = await self._http().post(
-            url, json={"chat_id": str(target), "action": "typing"}, timeout=self.timeout
-        )
-        if response.status_code >= 400:
-            raise MessagingError(f"telegram typing failed: HTTP {response.status_code}")
-        return None
 
     async def react(self, target: str, message_id: str, emoji: str = "\U0001F44D") -> bool:
         """setMessageReaction on one message. Best effort, never raises.
@@ -692,13 +688,15 @@ class TelegramAdapter(MessagingAdapter):
         *,
         caption: str = "",
         root: str | Path | None = None,
+        thread_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one whitelisted local file via ``sendPhoto`` or ``sendDocument``.
 
         The path is confined to the outbound media root (resolved, so a symlink
         cannot escape) and refused above 50 MB *before* any bytes leave the box.
         Every failure raises ``MessagingError``: an attachment that did not
-        arrive must never be reported as sent.
+        arrive must never be reported as sent. A named forum topic is carried
+        as ``message_thread_id`` on the very same upload.
         """
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -715,6 +713,8 @@ class TelegramAdapter(MessagingAdapter):
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/{method}"
         form: dict[str, Any] = {"chat_id": str(target)}
+        if thread_id not in (None, ""):
+            form["message_thread_id"] = str(thread_id)
         if caption:
             # 1024 is Telegram's caption limit; a longer one is rejected outright.
             form["caption"] = str(caption)[:1024]
@@ -767,6 +767,21 @@ class TelegramAdapter(MessagingAdapter):
     supports_delivery = True
     supports_approval_cards = True
     supports_full_text = True
+    supports_threaded_text = True
+    supports_threaded_media = True
+
+    async def send_typing(self, target: str) -> None:
+        """sendChatAction(typing) on one chat. Callers treat failures as cosmetic."""
+        token = credential("TELEGRAM_BOT_TOKEN")
+        if not token:
+            return None
+        url = f"{self.API_BASE}/bot{token}/sendChatAction"
+        response = await self._http().post(
+            url, json={"chat_id": str(target), "action": "typing"}, timeout=self.timeout
+        )
+        if response.status_code >= 400:
+            raise MessagingError(f"telegram typing failed: HTTP {response.status_code}")
+        return None
 
     def verify_webhook(self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None) -> bool:
         secret = credential("TELEGRAM_WEBHOOK_SECRET")

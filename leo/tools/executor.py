@@ -52,16 +52,21 @@ _RESOURCE_KEYS = ("path", "cwd", "resource", "file", "directory", "root", "targe
 # an approval the scheduled run could never answer.
 _UNATTENDED_SOURCES = frozenset({"scheduled", "schedule", "unattended"})
 _UNATTENDED_RISKS = frozenset({RiskLevel.MEDIUM, RiskLevel.HIGH})
-# The only MEDIUM/HIGH calls an unattended turn may make: state inspection and
-# delivery back to a configured destination. Everything else that writes,
-# mutates memory, creates tasks/schedules or edits files is refused even when
-# its tool category is uncategorized. Outbound sends to other targets are still
-# refused by the category check below.
+# The MEDIUM/HIGH calls an unattended turn may make: state inspection and
+# read-only research fetches. Everything else that writes, mutates memory,
+# creates tasks/schedules or edits files is refused even when its tool category
+# is uncategorized. Outbound sends are refused by category below, including a
+# reply into the originating conversation; scheduled results use the engine's
+# delivery lane, not this tool path.
 _UNATTENDED_ALLOWED_TOOLS = frozenset(
     {
         "read_file", "list_files", "search_files", "schedule_list",
         "schedule_get", "task_list", "task_status", "metrics_snapshot",
         "webhook_verify", "channel_send", "gateway.send", "send_message",
+        # Read-only research fetches are the most natural scheduled network
+        # work. They are MEDIUM by registration but write no local state; the
+        # egress policy in their handlers remains the authority on destinations.
+        "http_get", "http_json", "http_json_paths",
     }
 )
 _OUTBOUND_TOOLS = frozenset({"channel_send", "gateway.send", "send_message"})
@@ -78,6 +83,12 @@ _HINT_HISTORY_TTL_SECONDS = 300.0
 _HINT_HISTORY_MAX_KEYS = 128
 # An idle gap on the same conversation key means a new user turn began.
 _TURN_IDLE_SECONDS = 60.0
+# Operator notices are deduplicated per turn. The claim map is bounded in both
+# size and age: a long-lived worker must not grow it forever, and a new turn on
+# the same key always gets its own notice. Denials themselves are never dropped
+# from tool_calls/audit_log.
+_NOTICE_HISTORY_MAX_KEYS = 128
+_NOTICE_WINDOW_SECONDS = _TURN_IDLE_SECONDS
 _ERROR_FIELD_RE = re.compile(r"field '([^']+)'")
 # A timeout on a binary payload is a tool-choice problem, not a reason to retry
 # the same command with a bigger timeout. The 30s deadline itself is untouched.
@@ -239,6 +250,9 @@ class ToolExecutorImpl:
         # Per-turn retry counters for advisory hints only (never a policy gate).
         self._failure_history: dict[tuple[str, str], dict[str, Any]] = {}
         self._history_lock = threading.Lock()
+        # Per-turn claims for operator-visible needs-you notices. This only
+        # suppresses duplicate notices; it never suppresses a denial or audit.
+        self._notice_history: dict[tuple[str, str], float] = {}
         # Quotas live in SQLite (tool_quotas), not in this process: restarts and
         # multiple workers see the same counters. Only actually dispatched
         # calls are charged; invalid, denied and dry-run calls stay free.
@@ -711,11 +725,18 @@ class ToolExecutorImpl:
         source: str,
     ) -> str | None:
         """Return the side-effect class for a refused unattended call."""
-        if source not in _UNATTENDED_SOURCES or risk not in _UNATTENDED_RISKS:
+        if source not in _UNATTENDED_SOURCES:
             return None
+        # Category is authority over tier: a reply into the originating
+        # conversation is LOW for attended turns, but an unattended turn has no
+        # human on the other end. Every outbound/browser/computer/plugin/shell
+        # side effect is refused here. Scheduled results are delivered by the
+        # task engine's delivery lane, which never dispatches through this gate.
         category = self._side_effect_category(registration)
         if category is not None:
             return category
+        if risk not in _UNATTENDED_RISKS:
+            return None
         name = str(getattr(getattr(registration, "spec", None), "name", "") or "")
         if name in _UNATTENDED_ALLOWED_TOOLS:
             return None
@@ -751,12 +772,29 @@ class ToolExecutorImpl:
         origin: str,
         turn: Any,
     ) -> None:
-        """Emit exactly one durable operator-visible notice for a refused call.
+        """Emit one durable operator-visible notice per unattended turn.
 
-        This is a notice, never an approval: it carries no authority and no
-        approval row is created. EventBus persists it after any open write
-        transaction commits, so a rollback cannot expose a phantom notice.
+        Repeated refusals in one turn share a single notice; every refusal is
+        still denied, audited and returned to the model separately. This is a
+        notice, never an approval: it carries no authority and no approval row
+        is created. EventBus persists it after any open write transaction
+        commits, so a rollback cannot expose a phantom notice.
         """
+        key = self._turn_key(call)
+        now = time.monotonic()
+        with self._history_lock:
+            history = self._notice_history
+            if len(history) >= _NOTICE_HISTORY_MAX_KEYS:
+                for stale in [k for k, seen in history.items()
+                              if now - seen > _NOTICE_WINDOW_SECONDS]:
+                    history.pop(stale, None)
+                while len(history) >= _NOTICE_HISTORY_MAX_KEYS:
+                    oldest = min(history, key=lambda k: history[k])
+                    history.pop(oldest, None)
+            seen = history.get(key)
+            if seen is not None and now - seen <= _NOTICE_WINDOW_SECONDS:
+                return
+            history[key] = now
         try:
             await self.events.publish(
                 Event(
@@ -785,6 +823,11 @@ class ToolExecutorImpl:
                 )
             )
         except Exception:  # noqa: BLE001 - a notice failure must not change the denial
+            # Release the claim so a later refusal in the same turn can retry
+            # the notice instead of losing it entirely.
+            with self._history_lock:
+                if self._notice_history.get(key) == now:
+                    self._notice_history.pop(key, None)
             _LOG.exception("failed to emit automation.needs_you notice",
                            extra={"tool": call.name})
 

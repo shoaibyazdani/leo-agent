@@ -948,5 +948,92 @@ async def test_oversized_terminal_rewrite_degrades_to_a_dashboard_pointer() -> N
     text = adapter.edits[0][2]
     assert len(text) <= TELEGRAM_MAX_CHARS
     assert "Full approval text is in the LEO dashboard." in text
+    # The worker supplied this verdict; no durable decision exists yet.
     assert "approved · once" in text
     assert "X" * 100 not in text
+
+
+async def test_update_verdict_reports_the_real_edit_result() -> None:
+    """A failed rewrite must not be reported as a successful terminal edit."""
+    permissions, _ = _schedule_permissions()
+    card = await _schedule_card(permissions)
+    store = GatewayStore()
+
+    class _FailedEdit(_CardAdapter):
+        async def edit_message_text(self, target, message_id, text, reply_markup=None) -> bool:
+            await super().edit_message_text(target, message_id, text, reply_markup)
+            return False
+
+    adapter = _FailedEdit()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000001", payload=payload(),
+        principal="100000001",
+    )
+    await store.claim("worker", lease_seconds=60)
+    async with _client(api) as client:
+        assert (await client.post("/v1/approval/present", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+        })).status_code == 200
+        await client.post("/v1/approval/ack", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+        })
+        rewritten = await client.post("/v1/approval/update", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card", "text": "terminal card",
+        })
+
+    assert rewritten.status_code == 200
+    assert rewritten.json()["updated"] is False
+    assert len(adapter.edits) == 1
+
+
+async def test_oversized_rewrite_verdict_comes_from_the_recorded_decision() -> None:
+    """A trailing note must not be reported as the card's verdict."""
+    from leo.integrations.messaging import TELEGRAM_MAX_CHARS
+    from leo.security.approval_cards import schedule_terminal_text
+
+    permissions, _ = _schedule_permissions()
+    card = await _schedule_card(permissions)
+    store = GatewayStore()
+    adapter = _CardAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000001", payload=payload(),
+        principal="100000001", thread_id="77",
+    )
+    await store.claim("worker", lease_seconds=60)
+    async with _client(api) as client:
+        assert (await client.post("/v1/approval/present", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+        })).status_code == 200
+        await client.post("/v1/approval/ack", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+        })
+    await permissions.present_schedule_card(card.approval_id, surface="telegram")
+    resolution = await permissions.resolve_schedule_card(
+        card.approval_id, choice="deny", resolver="telegram-button:100000001",
+        confirm_proposal_digest="gw-card", deny_reason="not now",
+    )
+    assert resolution.status == "denied"
+    updated = await permissions.get_schedule_card(card.approval_id)
+    terminal = schedule_terminal_text(
+        updated, status=resolution.status, note="a trailing operator note",
+    )
+    assert terminal.splitlines()[-1] == "a trailing operator note"
+
+    async with _client(api) as client:
+        rewritten = await client.post("/v1/approval/update", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+            "text": "⏰ Schedule approval\n" + ("X" * (TELEGRAM_MAX_CHARS + 100))
+                    + "\n\n✅ approved\n" + terminal.splitlines()[-1],
+        })
+
+    assert rewritten.status_code == 200
+    text = adapter.edits[0][2]
+    assert "⛔ denied" in text
+    assert "approved" not in text
+    assert "a trailing operator note" not in text

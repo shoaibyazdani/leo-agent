@@ -375,14 +375,26 @@ class ScheduleCompiler:
         repeat_limit = self._merged_repeat(args, base, parsed, operation=operation)
         execution = self._merged_execution(args, base, parsed, operator=operator)
 
-        if self.known_skills is not None:
-            for skill in execution.skills:
-                if skill not in self.known_skills:
-                    raise _fail(
-                        "unknown_skill",
-                        f"Unknown skill {skill!r}; it is not in the live skill registry.",
-                        field="skills",
-                    )
+        # Validation follows the effective spec, not just the fields present in
+        # this request. An edit that turns a cron/interval job into a one-shot
+        # must not silently carry a grace window the runtime would still apply.
+        # An unchanged legacy one-shot may keep its stored window.
+        if (
+            execution.grace_minutes
+            and parsed.kind not in ("cron", "interval")
+            and (
+                operation == "create"
+                or "grace_minutes" in args
+                or (base is not None and base.expression.kind != parsed.kind)
+            )
+        ):
+            raise _fail(
+                "grace_requires_recurring",
+                "grace_minutes only applies to a cron or interval schedule.",
+                field="grace_minutes",
+            )
+
+        self._validate_supplied_skills(args, base, operation, execution.skills)
 
         if execution.no_agent and not execution.script:
             raise _fail(
@@ -700,10 +712,12 @@ class ScheduleCompiler:
             if existing.tzinfo is None:
                 existing = existing.replace(tzinfo=UTC)
             existing = existing.astimezone(UTC)
-            if parsed.kind == "once":
+            if parsed.kind == "once" and not paused:
                 # Keeping the old instant must not silently re-arm a stale
                 # one-shot. Operators keep the same compile-time grace as a
                 # re-anchored edit; model edits may never preserve a past time.
+                # A job that stays paused has no live instant to re-arm; the
+                # check applies when it is resumed instead.
                 delta = (existing - now.astimezone(UTC)).total_seconds()
                 if delta < (-self.past_grace_seconds if operator else 0):
                     raise _fail(
@@ -722,7 +736,11 @@ class ScheduleCompiler:
             if operation == "create" or reanchors:
                 delta = (candidate - now.astimezone(UTC)).total_seconds()
                 if operator:
-                    if delta < -self.past_grace_seconds:
+                    # A paused edit does not arm the new instant; re-check it
+                    # if and when the job is resumed.
+                    if delta < -self.past_grace_seconds and not (
+                        operation == "update" and paused
+                    ):
                         raise _fail(
                             "one_shot_in_past",
                             "The requested one-shot time is in the past.",
@@ -936,14 +954,7 @@ class ScheduleCompiler:
                 field="base_url",
             )
         if "grace_minutes" in args:
-            grace = self._normalize_grace_minutes(args["grace_minutes"])
-            if grace is not None and parsed.kind not in ("cron", "interval"):
-                raise _fail(
-                    "grace_requires_recurring",
-                    "grace_minutes only applies to a cron or interval schedule.",
-                    field="grace_minutes",
-                )
-            data["grace_minutes"] = grace
+            data["grace_minutes"] = self._normalize_grace_minutes(args["grace_minutes"])
 
         if "pinned" in args:
             pinned = self._as_bool(args["pinned"], "pinned", default=False)
@@ -1014,6 +1025,36 @@ class ScheduleCompiler:
                 raise _fail("invalid_skills", "skill must be text.", field="skill")
             return [value.strip()] if value.strip() else []
         return list(base.execution.skills) if base else []
+
+    def _validate_supplied_skills(
+        self,
+        args: Mapping[str, Any],
+        base: ScheduleSpec | None,
+        operation: str,
+        skills: Sequence[str],
+    ) -> None:
+        """Reject only skill names newly supplied by this request.
+
+        Base skills were checked against the registry when the job was created.
+        The registry is live and may have dropped a skill since then; an
+        unrelated edit must not be blocked by that drift.
+        """
+        if self.known_skills is None:
+            return
+        if operation == "create":
+            supplied = skills
+        else:
+            if "skills" not in args and "skill" not in args:
+                return
+            preserved = frozenset(base.execution.skills) if base else frozenset()
+            supplied = [name for name in skills if name not in preserved]
+        for skill in supplied:
+            if skill not in self.known_skills:
+                raise _fail(
+                    "unknown_skill",
+                    f"Unknown skill {skill!r}; it is not in the live skill registry.",
+                    field="skills",
+                )
 
     def _skill_snapshot(
         self,

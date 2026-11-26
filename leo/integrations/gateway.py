@@ -156,15 +156,15 @@ def _send_accepts_reply_to(send: Any) -> bool:
     )
 
 
-def _send_accepts_thread_id(send: Any) -> bool:
-    """True when an adapter can actually place a message in a named thread."""
-    try:
-        params = inspect.signature(send).parameters
-    except (TypeError, ValueError):
-        return False
-    return "thread_id" in params or any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-    )
+def _adapter_accepts_thread(adapter: MessagingAdapter, *, media: bool) -> bool:
+    """Explicit adapter declaration, not a signature guess.
+
+    A ``**kwargs`` sender may ignore an unknown keyword and post to the group
+    root. Only a declared capability entitles the gateway to claim a threaded
+    delivery in the receipt.
+    """
+    attribute = "supports_threaded_media" if media else "supports_threaded_text"
+    return bool(getattr(adapter, attribute, False))
 
 
 class Gateway:
@@ -848,10 +848,21 @@ class Gateway:
     TYPING_INTERVAL_SECONDS = 4.0
 
     async def typing(self, channel: str, target: str) -> None:
-        """The one public typing API: route a presence hint to its adapter."""
+        """Best-effort presence hint; never raises to the reply path.
+
+        Typing is cosmetic: a transport failure must not fail or delay delivery.
+        The adapter may raise, so the boundary logs and swallows here.
+        """
         adapter = self.adapters.get(str(channel))
-        if adapter is not None:
+        if adapter is None:
+            return
+        try:
             await adapter.send_typing(str(target))
+        except Exception as exc:  # noqa: BLE001 - a failed hint is never fatal
+            _LOG.warning("typing indicator failed", extra={
+                "channel": str(channel), "target": str(target),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
 
     async def _typing_heartbeat(self, payload: dict[str, Any]) -> None:
         channel = str(payload.get("channel") or "")
@@ -1013,16 +1024,7 @@ class Gateway:
         adapter = self._adapter(channel)
         subject = subject or str(target)
         target_str = str(target)
-        # A requested thread is part of the destination. If the adapter cannot
-        # honour it, fail the send: a "sent" receipt for the group root would be
-        # a false claim for a job aimed at a topic.
-        if thread_id not in (None, "") and not _send_accepts_thread_id(adapter.send):
-            return {
-                "channel": channel,
-                "target": target_str,
-                "success": False,
-                "error": f"{channel} adapter cannot address a thread",
-            }
+        thread = str(thread_id) if thread_id not in (None, "") else None
         media_path: Path | None = None
         if media is not None and str(media).strip() != "":
             # Confine and canonicalize before authorizing: the digest must cover
@@ -1030,6 +1032,21 @@ class Gateway:
             media_path = resolve_outbound_media(media, self.outbound_media_root)
             if not callable(getattr(adapter, "send_media", None)):
                 raise MessagingError(f"{channel} does not support outbound media")
+        # A requested thread is part of the destination. Gate on the sender that
+        # will actually be used: media takes a different path from text, so a
+        # text-only thread capability says nothing about an attachment. Fail the
+        # send rather than recording a "sent" receipt for the group root.
+        if thread and not _adapter_accepts_thread(adapter, media=media_path is not None):
+            return {
+                "channel": channel,
+                "target": target_str,
+                "success": False,
+                "error": (
+                    f"{channel} adapter cannot address a thread"
+                    if media_path is None else
+                    f"{channel} adapter cannot address a thread with media"
+                ),
+            }
         # The resource is the immutable destination, never a caller-chosen
         # subject: changing only the subject must not forge a new resource.
         resource = f"{channel}:{target_str}"
@@ -1038,8 +1055,8 @@ class Gateway:
         }
         if reply_to:
             send_arguments["reply_to"] = str(reply_to)
-        if thread_id not in (None, ""):
-            send_arguments["thread_id"] = str(thread_id)
+        if thread:
+            send_arguments["thread_id"] = thread
         if media_path is not None:
             # Keys are added only when media is actually attached so existing
             # text-only digests stay byte-identical (no spurious approval churn).
@@ -1074,11 +1091,15 @@ class Gateway:
         conversation_id = await self._conversation(channel, subject)
         try:
             if media_path is not None:
+                media_extra = (
+                    {"thread_id": thread} if thread else {}
+                )
                 result = await adapter.send_media(
                     target,
                     media_path,
                     caption=str(caption) if caption is not None else str(text),
                     root=self.outbound_media_root,
+                    **media_extra,
                 )
             else:
                 extra = {"reply_markup": reply_markup} if (
@@ -1086,8 +1107,8 @@ class Gateway:
                 ) else {}
                 if reply_to and _send_accepts_reply_to(adapter.send):
                     extra["reply_to"] = str(reply_to)
-                if thread_id not in (None, ""):
-                    extra["thread_id"] = str(thread_id)
+                if thread:
+                    extra["thread_id"] = thread
                 result = await adapter.send(target, text, **extra)
             if not isinstance(result, Mapping):
                 raise MessagingError(f"{channel} adapter returned an invalid send result")
@@ -1106,7 +1127,7 @@ class Gateway:
             "provider_message_id": result.get("message_id"),
             "idempotency_key": idempotency_key,
             "reply_to": str(reply_to) if reply_to else None,
-            "thread_id": str(thread_id) if thread_id not in (None, "") else None,
+            "thread_id": thread,
         }
         if media_path is not None:
             # Name and size only: the absolute local path is not stored in the

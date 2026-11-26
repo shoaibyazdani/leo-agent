@@ -7,12 +7,14 @@ recording permission stub over the isolated test database from conftest.py.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import httpx
 import pytest
 
+from leo import db
 from leo.config import ChannelsConfig
 from leo.contracts import Decision, RiskLevel
 from leo.events import EventBus
@@ -215,18 +217,22 @@ class MediaAdapter(MessagingAdapter):
     channel = "telegram"
     credential_env = ()
     supports_webhook = False
+    supports_threaded_text = True
+    supports_threaded_media = True
 
     def __init__(self) -> None:
         super().__init__()
         self.text_calls: list[tuple[str, str]] = []
-        self.media_calls: list[tuple[str, str, str]] = []
+        self.media_calls: list[tuple[str, str, str, str | None]] = []
 
     async def send(self, target: str, text: str) -> dict:
         self.text_calls.append((target, text))
         return {"channel": self.channel, "success": True, "message_id": "text-1"}
 
-    async def send_media(self, target, media, *, caption="", root=None) -> dict:
-        self.media_calls.append((target, str(media), caption))
+    async def send_media(
+        self, target, media, *, caption="", root=None, thread_id=None,
+    ) -> dict:
+        self.media_calls.append((target, str(media), caption, thread_id))
         return {
             "channel": self.channel,
             "success": True,
@@ -273,7 +279,7 @@ async def test_gateway_digest_binds_the_resolved_media_path(outbox: Path):
     assert result["success"] is True
     assert result["message_id"] == "media-1"
     assert adapter.text_calls == []          # the media branch really ran
-    assert adapter.media_calls == [("chat-1", str(path.resolve()), "caption text")]
+    assert adapter.media_calls == [("chat-1", str(path.resolve()), "caption text", None)]
 
     authorized = permission.calls[-1]
     assert authorized["risk"] is RiskLevel.MEDIUM
@@ -323,6 +329,88 @@ async def test_gateway_refuses_media_outside_the_whitelist(tmp_path: Path, outbo
     assert adapter.media_calls == []
     assert adapter.text_calls == []
     assert permission.calls == []
+
+
+async def test_threaded_media_reaches_the_sender_and_the_receipt(outbox: Path):
+    """A topic-bound attachment must not land in the group root."""
+    adapter, permission = MediaAdapter(), RecordingPermission()
+    gateway = build_gateway(adapter, permission, outbox)
+    path = make_file(outbox, "topic.png")
+
+    result = await gateway.send(
+        "telegram", "chat-1", "topic brief", media=str(path), thread_id="7"
+    )
+
+    assert result["success"] is True
+    assert adapter.media_calls == [
+        ("chat-1", str(path.resolve()), "topic brief", "7")
+    ]
+    assert permission.calls[-1]["arguments"]["thread_id"] == "7"
+    row = await db.fetchone(
+        "SELECT metadata FROM messages WHERE content='topic brief' ORDER BY id DESC LIMIT 1"
+    )
+    assert json.loads(row["metadata"])["thread_id"] == "7"
+
+
+async def test_threaded_media_is_refused_when_the_media_sender_cannot_thread(
+    outbox: Path,
+):
+    """Text thread support says nothing about attachments; fail closed."""
+    class _TextThreadOnly(MediaAdapter):
+        supports_threaded_media = False
+
+    adapter, permission = _TextThreadOnly(), RecordingPermission()
+    gateway = build_gateway(adapter, permission, outbox)
+    path = make_file(outbox, "topic.png")
+
+    result = await gateway.send(
+        "telegram", "chat-1", "topic brief", media=str(path), thread_id="7"
+    )
+
+    assert result["success"] is False
+    assert "thread with media" in result["error"]
+    assert adapter.media_calls == []
+    assert permission.calls == []
+    assert await db.fetchone(
+        "SELECT id FROM messages WHERE content='topic brief'"
+    ) is None
+
+
+async def test_undeclared_media_thread_capability_is_not_inferred(outbox: Path):
+    """A **kwargs media sink that may ignore thread_id is not a capability."""
+    class _Undeclared(MediaAdapter):
+        supports_threaded_media = False  # accepts **kwargs, declares nothing
+
+        async def send_media(self, target, media, *, caption="", root=None, **kwargs):
+            self.media_calls.append((target, str(media), caption, kwargs.get("thread_id")))
+            return {"channel": self.channel, "success": True, "message_id": "root"}
+
+    adapter, permission = _Undeclared(), RecordingPermission()
+    gateway = build_gateway(adapter, permission, outbox)
+
+    result = await gateway.send(
+        "telegram", "chat-1", "topic brief",
+        media=str(make_file(outbox, "topic.png")), thread_id="7",
+    )
+
+    assert result["success"] is False
+    assert adapter.media_calls == []
+
+
+async def test_telegram_send_media_carries_the_message_thread_id(
+    monkeypatch, outbox: Path,
+):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    path = make_file(outbox, "topic.png")
+    adapter, requests = telegram_with(
+        lambda request: httpx.Response(200, json={"ok": True, "result": {"message_id": 9}})
+    )
+
+    async with adapter:
+        await adapter.send_media("-10055", path, root=outbox, thread_id="77")
+
+    body = requests[0].content
+    assert b'name="message_thread_id"' in body and b"77" in body
 
 
 async def test_media_send_without_a_supported_adapter_is_refused(outbox: Path):

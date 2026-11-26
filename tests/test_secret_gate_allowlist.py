@@ -31,3 +31,35 @@ def test_reviewed_entries_are_explicit_and_pattern_restricted() -> None:
     for entry, reasons in scanner.REVIEWED_ALLOWLIST.items():
         for line_spec, reason in reasons.items():
             assert reason.strip(), (entry, line_spec)
+
+
+def test_dead_line_exceptions_are_removed_and_current_ones_are_explicit() -> None:
+    """Exceptions must track real fixtures, not accumulate line-number drift."""
+    scanner = _scanner()
+    dead = [
+        ("tests/channels/test_credential_enrollment.py", "153", "assigned secret"),
+        ("tests/test_enrollment.py", "203", "discord webhook"),
+        ("tests/test_harden_config.py", "185", "anthropic key"),
+        ("tests/test_harden_config.py", "196", "openai key"),
+        ("tests/test_harden_config.py", "313", "assigned secret"),
+        ("tests/test_harden_events.py", "236", "assigned secret"),
+        ("tests/test_integrations.py", "209", "assigned secret"),
+        ("tests/test_tool_agent_integration.py", "387", "assigned secret"),
+        ("tests/test_tools_context.py", "88", "bearer token"),
+        ("tests/test_tools_run.py", "213", "bearer token"),
+    ]
+    for path, line, label in dead:
+        assert line not in scanner.REVIEWED_ALLOWLIST.get(path, {}), (path, line)
+        assert not scanner.is_reviewed(path, int(line), label)
+
+    current = [
+        ("tests/test_agents_automation_operator.py", 41, "assigned secret"),
+        ("tests/test_tools_http.py", 669, "assigned secret"),
+        ("tests/test_tools_http.py", 686, "openai key"),
+        ("tests/test_tools_http.py", 686, "assigned secret"),
+        ("tests/test_tools_http.py", 1373, "openai key"),
+    ]
+    for path, line, label in current:
+        assert scanner.is_reviewed(path, line, label)
+    # A synthetic fixture line is not a blanket exception for the file.
+    assert not scanner.is_reviewed("tests/test_tools_http.py", 99999, "openai key")

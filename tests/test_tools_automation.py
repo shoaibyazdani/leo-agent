@@ -402,6 +402,26 @@ async def test_run_now_is_a_background_handle_with_no_cadence_consumption(env):
     assert noop.output["status"] == "no_live_run"
 
 
+async def test_run_and_cancel_copy_is_routine_and_the_gate_still_holds(env):
+    """Plain descriptions must not imply elevated rights or bypass the gate."""
+    specs = {spec.name: spec for spec in env.registry.list_specs()}
+    for name in ("schedule_run_now", "schedule_cancel"):
+        description = specs[name].description.lower()
+        for privileged in ("operator", "admin", "privileg", "approval", "authorized"):
+            assert privileged not in description, (name, privileged)
+        assert "schedule" in description and "task" in description
+
+    await run_operator(env, "schedule_create", {
+        "name": "gated", "schedule": "1h", "prompt": "build report",
+    })
+    fired = await run(env, "schedule_run_now", {"name": "gated"})
+    assert fired.success is False
+    assert await task_rows("gated") == []
+
+    stopped = await run(env, "schedule_cancel", {"name": "gated"})
+    assert stopped.success is False
+
+
 async def test_missing_services_never_fake_success(env):
     registry = ToolRegistry()
     assert automation_tools.register(registry) == TOOL_NAMES

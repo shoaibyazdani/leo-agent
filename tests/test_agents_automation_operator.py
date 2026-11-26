@@ -1,9 +1,9 @@
 """Automation-operator specialist: canonical schedule consent plus exact gates.
 
 Create/update converge on the same ScheduleService proposal/card as a direct
-model call, so there is exactly one consent gate. Delete, manual trigger and
-task enqueue keep the specialist's exact durable ``automation:mutate`` gate.
-Queued is never reported as executed or completed.
+model call, so there is exactly one consent gate. Delete, manual trigger,
+cancel and task enqueue keep the specialist's exact durable
+``automation:mutate`` gate. Queued is never reported as executed or completed.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from leo.agents import AgentEngine, AgentRegistry
 from leo.agents.registry import SPECIALIST_SPECS
 from leo.agents.verification import digest as evidence_digest
 from leo.agents.specs.automation_operator import (
+    _ACTIONS,
     AGENT_ID,
     APPROVAL_ACTION,
     SEED,
@@ -423,6 +424,33 @@ async def test_trigger_keeps_the_exact_gate_and_reports_queued(env) -> None:
     assert_verifiable_evidence(result)
 
 
+async def test_cancel_declares_and_enforces_the_same_exact_gate(env) -> None:
+    """The grant table and the specialist's policy both gate cancellation."""
+    assert _ACTIONS["cancel_schedule"] == ("schedule_cancel", True)
+    await _service_create(env, name="cancel-me")
+    args = {"name": "cancel-me"}
+
+    blocked = await run(env, action="cancel_schedule", **args)
+    assert not blocked.success
+    assert blocked.output["status"] == "blocked_approval_required"
+    with turn_context(_operator_turn()):
+        blocked_operator = await run(env, action="cancel_schedule", **args)
+    assert not blocked_operator.success
+    assert blocked_operator.output["status"] == "blocked_approval_required"
+
+    wrong = await approve(env, "schedule_run_now", args)
+    mismatched = await run(env, action="cancel_schedule", **args, approval_id=wrong)
+    assert not mismatched.success
+    assert mismatched.output["status"] == "blocked_approval_required"
+
+    approval_id = await approve(env, "schedule_cancel", args)
+    result = await run(env, action="cancel_schedule", **args, approval_id=approval_id)
+    assert result.success, result.error
+    assert result.output["approval"]["approval_id"] == approval_id
+    assert result.output["status"] in ("cancelled", "no_live_run")
+    assert_verifiable_evidence(result)
+
+
 async def test_missing_trusted_services_fail_closed_for_gated_actions(env) -> None:
     await _service_create(env, name="fail-closed")
     args = {"name": "fail-closed"}
@@ -539,9 +567,14 @@ async def test_every_declared_grant_has_a_real_delegated_execution(env) -> None:
         env, action="trigger_schedule", **trigger_args,
         approval_id=await approve(env, "schedule_run_now", trigger_args),
     )
-    # Stopping a live run needs operator authority even through the specialist.
+    # Stopping a live run keeps the exact durable mutation gate even when the
+    # caller is an operator turn: declared grant and enforced policy agree.
+    cancel_args = {"name": "grant-check"}
     with turn_context(_operator_turn()):
-        await run(env, action="cancel_schedule", name="grant-check")
+        await run(
+            env, action="cancel_schedule", **cancel_args,
+            approval_id=await approve(env, "schedule_cancel", cancel_args),
+        )
     delete_args = {"name": "grant-check"}
     await run(
         env, action="delete_schedule", **delete_args,

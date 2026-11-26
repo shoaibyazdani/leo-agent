@@ -81,14 +81,11 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "uv.lock": {"1-": "only=long hex: lockfile integrity hashes, not credentials"},
     "tests/test_harden_config.py": {
-        "185": "synthetic sk-ant fixture",
-        "196": "synthetic sk fixture",
         "280-281": "synthetic invalid-token parameter",
-        "313-334": "synthetic multi-provider fixtures",
         "430-458": "synthetic provider fixtures and hex fixture",
     },
     "tests/channels/test_bluebubbles.py": {"23": "test fixture", "25": "test fixture"},
-    "tests/channels/test_credential_enrollment.py": {"70": "test fixture", "153": "test fixture"},
+    "tests/channels/test_credential_enrollment.py": {"70": "test fixture"},
     "tests/channels/test_dingtalk.py": {
         "26": "test fixture", "28": "test fixture", "29": "test fixture",
     },
@@ -101,6 +98,7 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "tests/channels/test_teams.py": {"32": "test fixture"},
     "tests/test_agents_automation_operator.py": {
         "40": "test fixture",
+        "41": "synthetic fixture at its current line",
         "33": "only=assigned secret: synthetic fixture in an earlier revision",
     },
     "tests/test_agents_reviewer.py": {"143": "test fixture"},
@@ -118,17 +116,28 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "937": "synthetic fixture", "980": "synthetic fixture",
         "990": "synthetic fixture", "1021": "synthetic fixture",
         "1260": "synthetic fixture", "1347": "synthetic fixture",
+        # The same fixtures after later test insertions; the older line
+        # numbers stay for historical blobs. Each synthetic fixture can match
+        # more than one pattern family, so these are per-line, not restricted.
+        "669": "synthetic fixture at its current line",
+        "686": "synthetic fixture at its current line",
+        "736": "redaction assertion at its current line",
+        "814": "synthetic fixture at its current line",
+        "831": "redaction assertion at its current line",
+        "892": "synthetic fixture at its current line",
+        "963": "synthetic fixture at its current line",
+        "1006": "synthetic fixture at its current line",
+        "1016": "redaction assertion at its current line",
+        "1047": "synthetic fixture at its current line",
+        "1286": "synthetic fixture at its current line",
+        "1373": "synthetic fixture at its current line",
     },
     "tests/test_tools_webhook.py": {"33": "test fixture"},
-    "tests/test_integrations.py": {"209": "test fixture", "270": "test fixture", "306": "test fixture"},
     "tests/channels/test_a2a.py": {"42": "test fixture"},
     "tests/channels/test_wechat_crypto.py": {"61": "only=long hex: synthetic hex fixture"},
-    "tests/test_enrollment.py": {"35": "test fixture", "203": "test fixture"},
+    "tests/test_enrollment.py": {"35": "test fixture"},
     "tests/test_agent_activity_dashboard.py": {"95": "test fixture", "151": "test fixture"},
-    "tests/test_tools_context.py": {"88-89": "test fixture"},
-    "tests/test_tools_run.py": {"156": "test fixture", "202": "test fixture", "213": "test fixture", "232": "test fixture"},
-    "tests/test_harden_events.py": {"236": "test fixture", "243": "test fixture"},
-    "tests/test_tool_agent_integration.py": {"387": "test fixture"},
+    "tests/test_tools_run.py": {"156": "test fixture", "202": "test fixture"},
     "leo/integrations/whatsapp_bridge/manager.py": {
         "84": "only=long hex: SHA-256 integrity pin of the shipped bridge.js",
     },

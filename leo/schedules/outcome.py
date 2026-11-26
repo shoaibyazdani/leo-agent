@@ -89,6 +89,24 @@ def _bounded_stored_reason(value: Any) -> str | None:
     return text[:500] if text else None
 
 
+# Surfaces that cannot capture free text store an explicit sentinel instead of
+# pretending the human gave a reason. Keep that record for audit, but do not
+# present the sentinel to the model as if it were a human-authored reason.
+_PLACEHOLDER_DENY_REASONS = frozenset({"no reason supplied"})
+
+
+def _is_placeholder_deny_reason(reason: str | None) -> bool:
+    return bool(reason) and reason.strip().lower() in _PLACEHOLDER_DENY_REASONS
+
+
+def _model_deny_reason(value: Any) -> str | None:
+    """Project a stored reason to the model without leaking a sentinel string."""
+    reason = _bounded_stored_reason(value)
+    if reason is None:
+        return None
+    return "no reason given" if _is_placeholder_deny_reason(reason) else reason
+
+
 _STATUS_COPY: dict[str, str] = {
     "created": "created",
     "updated": "updated",
@@ -139,10 +157,15 @@ class ScheduleOutcome:
             "message": self.message,
         }
         reason = _bounded_stored_reason(self.deny_reason)
+        detail = dict(self.detail)
         if reason:
-            data["deny_reason"] = reason
-        if self.detail:
-            data["detail"] = dict(self.detail)
+            data["deny_reason"] = _model_deny_reason(reason)
+            if _is_placeholder_deny_reason(reason):
+                # The gap stays explicit in the auditable tool result even
+                # though the model-facing field is normalized.
+                detail.setdefault("deny_reason_placeholder", reason)
+        if detail:
+            data["detail"] = detail
         return data
 
 
@@ -279,7 +302,7 @@ def summary_line(outcome: ScheduleOutcome) -> str:
     elif outcome.message:
         line += f" ({outcome.message})"
     if outcome.status == "denied":
-        reason = _bounded_stored_reason(outcome.deny_reason)
+        reason = _model_deny_reason(outcome.deny_reason)
         if reason:
             line += f" (reason: {reason})"
     return line

@@ -47,6 +47,7 @@ from ..security.approval_cards import (
     is_schedule_kind,
     proposal_digest_matches,
     schedule_card_text,
+    schedule_terminal_text,
 )
 from .sessions import SessionStore
 from .store import GatewayStore
@@ -72,6 +73,38 @@ def mark_terminal_rewrite(approval_id: str) -> None:
 
 def terminal_rewrite_done(approval_id: str) -> bool:
     return str(approval_id) in _TERMINAL_REWRITES
+
+
+_TERMINAL_STATUSES = frozenset({"approved", "denied", "expired"})
+
+
+async def _pointer_verdict(approval_id: str, text: str) -> str:
+    """Verdict line for a shortened card, from the decision actually recorded.
+
+    The worker's terminal text can carry a grant label or a note *after* its
+    verdict line, and a caller can send arbitrary text. Copying the last line
+    would present that trailer (or a hard-coded success) as the decision. The
+    durable approval row is the authority, exactly as on the tap path.
+    """
+    row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (str(approval_id),))
+    if row is not None and str(row["status"] or "") in _TERMINAL_STATUSES:
+        try:
+            card = card_from_row(row)
+        except (ValueError, TypeError, KeyError):
+            card = None
+        if card is not None:
+            lines = schedule_terminal_text(
+                card, status=str(row["status"] or "")
+            ).splitlines()
+            if lines:
+                return lines[-1].strip()
+    # Without a durable decision, show only a verdict the worker actually wrote.
+    for line in reversed(text.splitlines()):
+        value = line.strip()
+        lowered = value.lower()
+        if any(marker in lowered for marker in ("approved", "denied", "rejected", "expired")):
+            return value
+    return "decision recorded in the LEO dashboard"
 
 
 class ClaimRequest(BaseModel):
@@ -211,7 +244,9 @@ def create_api(
                 }
         return advertised
 
-    async def _typing_until(adapter: Any, subject: str, interval: float = 4.0) -> None:
+    async def _typing_until(
+        adapter: Any, subject: str, channel: str = "", interval: float = 4.0,
+    ) -> None:
         """Repeat the channel's typing action until the turn finishes.
 
         In the split the brain answers over the API, so nothing in the reply path
@@ -221,8 +256,11 @@ def create_api(
         while True:
             try:
                 await adapter.send_typing(subject)
-            except Exception:  # cosmetic only: never fail a turn for a typing hint
-                pass
+            except Exception as exc:  # cosmetic only: never fail a turn for a hint
+                _LOG.warning("typing indicator failed", extra={
+                    "channel": channel, "target": subject,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
             await asyncio.sleep(interval)
 
     def _start_typing(admission_id: str, channel: str, subject: str) -> None:
@@ -233,7 +271,7 @@ def create_api(
         if previous is not None:
             previous.cancel()
         typing_tasks[admission_id] = asyncio.create_task(
-            _typing_until(adapter, subject), name=f"typing-{admission_id}"
+            _typing_until(adapter, subject, channel), name=f"typing-{admission_id}"
         )
 
     def _stop_typing(admission_id: str) -> None:
@@ -546,7 +584,7 @@ def create_api(
                 # and the dashboard; this rewrite is only a short pointer.
                 lines = text.splitlines()
                 title = lines[0].strip() if lines else "⏰ Schedule approval"
-                verdict = lines[-1].strip() if len(lines) > 1 else ""
+                verdict = await _pointer_verdict(request.approval_id, text)
                 text = "\n".join([
                     title or "⏰ Schedule approval",
                     f"id: {request.approval_id}",

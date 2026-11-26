@@ -469,7 +469,8 @@ async def test_create_grant_cannot_write_silently_in_unattended_turns(env, sourc
     assert len(await db.fetchall("SELECT id FROM approvals")) == 1
 
 
-async def test_edit_card_of_disabled_schedule_expires_instead_of_committing(env):
+async def test_stay_paused_edit_commits_without_changing_enabled_state(env):
+    """An unrelated edit to a paused row does not re-enable it."""
     await _create_operator(env, name="job", schedule="1h", prompt="a")
     await env.service.update(
         name="job", arguments={"paused": True, "paused_reason": "hold"},
@@ -482,10 +483,38 @@ async def test_edit_card_of_disabled_schedule_expires_instead_of_committing(env)
         env, pending["card"]["approval_id"], choice="once",
         digest=pending["card"]["proposal_digest"],
     )
-    assert resolved.status == "expired"
-    assert resolved.decline_message == DECLINE_MESSAGES["stale_edit"]
-    row = await db.fetchone("SELECT payload FROM schedules WHERE name='job'")
-    assert json.loads(row["payload"])["objective"] == "a"
+    assert resolved.status == "approved"
+    row = await db.fetchone(
+        "SELECT payload, enabled, status FROM schedules WHERE name='job'"
+    )
+    assert json.loads(row["payload"])["objective"] == "b"
+    assert row["enabled"] == 0 and row["status"] == "paused"
+
+
+async def test_edit_card_for_retired_row_declines_as_paused_or_disabled(env):
+    """The decline names the disabled row; it must not blame a passed run time."""
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    pending = await env.service.update(
+        name="job", arguments={"prompt": "b"}, actor="chat:web", turn=_chat("tui")
+    )
+    # The row is retired while the operator's card is still waiting.
+    await db.execute(
+        "UPDATE schedules SET enabled=0, status='retired' WHERE name='job'"
+    )
+    resolved = await _resolve(
+        env, pending["card"]["approval_id"], choice="once",
+        digest=pending["card"]["proposal_digest"],
+    )
+    assert resolved.status == "expired" and resolved.allowed is False
+    assert resolved.decline_message == DECLINE_MESSAGES["disabled_edit"]
+    assert "paused or disabled" in resolved.decline_message
+    assert "run time" not in resolved.decline_message
+    stored = await db.fetchone(
+        "SELECT status, json_extract(metadata,'$.decline_message') AS decline "
+        "FROM approvals WHERE id=?", (pending["card"]["approval_id"],),
+    )
+    assert stored["status"] == "expired"
+    assert stored["decline"] == DECLINE_MESSAGES["disabled_edit"]
 
 
 async def test_model_turns_cannot_fire_or_kill_runs(env):
@@ -501,10 +530,12 @@ async def test_model_turns_cannot_fire_or_kill_runs(env):
     assert await db.fetchall("SELECT id FROM tasks") == []
 
 
-async def test_approved_edit_card_authorizes_manual_run_and_cancel(env):
-    await _create_operator(env, name="job", schedule="1h", prompt="run")
+async def _approved_edit_card(env, name: str = "job") -> dict:
+    """Create and approve one fresh edit card for the named job."""
+    seq = int(getattr(env, "card_seq", 0)) + 1
+    env.card_seq = seq
     pending = await env.service.update(
-        name="job", arguments={"prompt": "revised"},
+        name=name, arguments={"prompt": f"revised-{name}-{seq}"},
         actor="chat:web", turn=_chat("tui"),
     )
     card = pending["card"]
@@ -512,15 +543,23 @@ async def test_approved_edit_card_authorizes_manual_run_and_cancel(env):
         env, card["approval_id"], choice="once", digest=card["proposal_digest"]
     )
     assert resolved.status == "approved"
+    return card
+
+
+async def test_approved_edit_card_authorizes_one_manual_run_and_one_cancel(env):
+    await _create_operator(env, name="job", schedule="1h", prompt="run")
+    run_card = await _approved_edit_card(env)
 
     run = await env.service.run_now(
         name="job", actor="chat:web", turn=_chat("tui"),
-        authorized_by=card["approval_id"],
+        authorized_by=run_card["approval_id"],
     )
     assert run["status"] == "running"
+    # One card is one capability: cancel needs its own approved edit.
+    cancel_card = await _approved_edit_card(env)
     cancelled = await env.service.cancel(
         name="job", actor="chat:web", turn=_chat("tui"),
-        authorized_by=card["approval_id"],
+        authorized_by=cancel_card["approval_id"],
     )
     assert cancelled["status"] == "cancelled"
 
@@ -534,6 +573,58 @@ async def test_approved_edit_card_authorizes_manual_run_and_cancel(env):
             authorized_by=other["approval_id"],
         )
     assert caught.value.code == "invalid_authorization"
+
+
+async def test_approved_edit_card_is_single_use_for_live_actions(env):
+    await _create_operator(env, name="job", schedule="1h", prompt="run")
+    card = await _approved_edit_card(env)
+
+    run = await env.service.run_now(
+        name="job", actor="chat:web", turn=_chat("tui"),
+        authorized_by=card["approval_id"],
+    )
+    assert run["status"] == "running"
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=card["approval_id"],
+        )
+    assert caught.value.code == "authorization_consumed"
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.cancel(
+            name="job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=card["approval_id"],
+        )
+    assert caught.value.code == "authorization_consumed"
+    row = await db.fetchone(
+        "SELECT json_extract(metadata,'$.live_authorization_used_at') AS used_at "
+        "FROM approvals WHERE id=?", (card["approval_id"],),
+    )
+    assert row["used_at"]
+    manual_tasks = await db.fetchone(
+        "SELECT COUNT(*) AS n FROM tasks WHERE metadata LIKE '%manual_run%'"
+    )
+    assert manual_tasks["n"] == 1
+
+
+async def test_approved_edit_card_live_authorization_has_one_concurrent_winner(env):
+    await _create_operator(env, name="job", schedule="1h", prompt="run")
+    card = await _approved_edit_card(env)
+    results = await asyncio.gather(
+        env.service.run_now(
+            name="job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=card["approval_id"], request_key="race-a",
+        ),
+        env.service.run_now(
+            name="job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=card["approval_id"], request_key="race-b",
+        ),
+        return_exceptions=True,
+    )
+    successes = [item for item in results if isinstance(item, dict)]
+    failures = [item for item in results if isinstance(item, ScheduleServiceError)]
+    assert len(successes) == 1 and len(failures) == 1
+    assert failures[0].code == "authorization_consumed"
 
 
 async def test_recurring_card_can_be_answered_after_its_first_tick(env):

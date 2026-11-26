@@ -656,6 +656,7 @@ async def test_external_delivery_refuses_a_none_address() -> None:
 
 class _ThreadedAdapter(MessagingAdapter):
     channel = "telegram"
+    supports_threaded_text = True
 
     def verify_webhook(self, payload, headers=None, *, raw_body=None) -> bool:
         return True
@@ -672,6 +673,8 @@ class _ThreadedAdapter(MessagingAdapter):
 
 
 class _NoThreadAdapter(_ThreadedAdapter):
+    supports_threaded_text = False
+
     async def send(self, target: str, text: str) -> dict:
         self.calls.append((str(target), str(text), {}))
         return {"channel": self.channel, "target": str(target), "success": True,
@@ -742,6 +745,38 @@ async def test_delivery_fails_when_the_adapter_cannot_honour_the_thread() -> Non
         await app._channel_delivery(task, "telegram", "555", context)
 
     assert adapter.calls == []
+
+
+async def test_thread_capability_is_declared_not_guessed_from_a_signature() -> None:
+    """A **kwargs sink is not proof that a channel can address a topic."""
+
+    class _SinkSignature(_ThreadedAdapter):
+        supports_threaded_text = False  # no declaration, despite **kwargs
+
+    adapter = _SinkSignature()
+    gateway = make_gateway(adapters={"telegram": adapter})
+    result = await gateway.send("telegram", "555", "hello", thread_id="7")
+
+    assert result["success"] is False
+    assert "cannot address a thread" in result["error"]
+    assert adapter.calls == []
+    assert await db.fetchone(
+        "SELECT id FROM messages WHERE content='hello'"
+    ) is None
+
+    # The declaration, not the presence/absence of a **kwargs signature, grants
+    # the capability: a narrow send() with an explicit flag still carries it.
+    class _Declared(_ThreadedAdapter):
+        async def send(self, target, text, **kwargs):
+            self.calls.append((str(target), str(text), dict(kwargs)))
+            return {"channel": self.channel, "target": str(target), "success": True,
+                    "message_id": "m-topic"}
+
+    declared = _Declared()
+    gateway = make_gateway(adapters={"telegram": declared})
+    result = await gateway.send("telegram", "555", "hello", thread_id="7")
+    assert result["success"] is True
+    assert declared.calls[0][2] == {"thread_id": "7"}
 
 
 async def test_room_delivery_sends_on_the_resolved_channel() -> None:

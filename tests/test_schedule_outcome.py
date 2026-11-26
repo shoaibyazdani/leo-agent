@@ -120,6 +120,56 @@ async def test_a_denied_outcome_exposes_the_stored_reason_to_the_model() -> None
         assert "reason: the reminder is too expensive" in truthful_summary([resolved])
 
 
+def test_placeholder_deny_reason_is_normalized_for_the_model_but_audited() -> None:
+    """Tap/web denials have no free text; never present their sentinel as a reason."""
+    outcome = ScheduleOutcome(
+        operation="create",
+        status="denied",
+        name="Water",
+        deny_reason="no reason supplied",
+    )
+    projected = outcome.as_dict()
+    assert projected["deny_reason"] == "no reason given"
+    assert projected["detail"]["deny_reason_placeholder"] == "no reason supplied"
+    # The durable record itself is untouched.
+    assert outcome.deny_reason == "no reason supplied"
+
+    summary = truthful_summary([outcome])
+    assert "reason: no reason given" in summary
+    assert "no reason supplied" not in summary
+
+
+async def test_resolved_placeholder_deny_reason_reaches_the_model_normalized() -> None:
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db.set_db_path(Path(tmp) / "test.db")
+        await db.initialize()
+        await db.execute(
+            "INSERT INTO approvals(id,created_at,status,actor,action,resource,risk,"
+            "reason,requested_by,metadata,kind,protocol_version,proposal_id,digest,"
+            "choices,expires_at,deny_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "apr-placeholder", NOW.isoformat(), "denied", "chat:web",
+                "schedule.create", "Water", "high", "denied", "chat:web", "{}",
+                "schedule_create", 1, "prop-tap", "digest", '["deny"]',
+                NOW.isoformat(), "no reason supplied",
+            ),
+        )
+        resolved = await resolve_outcome_truth(
+            ScheduleOutcome(
+                operation="create", status="approval_required", name="Water",
+                approval_id="apr-placeholder", proposal_id="prop-tap",
+            )
+        )
+        assert resolved.as_dict()["deny_reason"] == "no reason given"
+        answer = enforce_truthful_answer("Done — created it.", [resolved])
+        assert "no reason given" in answer
+        assert "no reason supplied" not in answer
+        assert resolved.deny_reason == "no reason supplied"
+
+
 async def test_a_created_outcome_without_a_row_becomes_failed() -> None:
     import tempfile
     from pathlib import Path

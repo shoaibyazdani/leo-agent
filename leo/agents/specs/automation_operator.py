@@ -114,9 +114,9 @@ SEED: dict[str, Any] = {
 # create/update/pause/resume are deliberately ungated here: they converge on
 # the same canonical ScheduleService proposal/edit card as a direct model call.
 # Doubling the gate would require a human to approve an automation:mutate row
-# *and* then the schedule card. Remove/trigger/enqueue keep the exact existing
-# gate because they are lifecycle/execution mutations with no schedule card of
-# their own.
+# *and* then the schedule card. Delete/trigger/cancel/enqueue keep the exact
+# existing gate because they are lifecycle/execution mutations with no schedule
+# card of their own, and the declared grant must match the enforced policy.
 _ACTIONS: dict[str, tuple[str, bool]] = {
     "list_schedules": ("schedule_list", False),
     "get_schedule": ("schedule_get", False),
@@ -126,7 +126,7 @@ _ACTIONS: dict[str, tuple[str, bool]] = {
     "resume_schedule": ("schedule_resume", False),
     "delete_schedule": ("schedule_delete", True),
     "trigger_schedule": ("schedule_run_now", True),
-    "cancel_schedule": ("schedule_cancel", False),
+    "cancel_schedule": ("schedule_cancel", True),
     "enqueue_task": ("task_create", True),
     "task_status": ("task_status", False),
     "task_result": ("task_result", False),

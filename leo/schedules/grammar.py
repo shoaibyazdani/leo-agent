@@ -23,6 +23,7 @@ DST policy (LEO-native, tested):
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -49,6 +50,12 @@ ErrorCode = Literal[
 # ``timedelta``'s ~2.7-million-year range, so an absurd model-supplied count
 # cannot overflow the interval/one-shot arithmetic downstream.
 _MAX_DURATION_MINUTES = 10 * 365 * 24 * 60
+# Reject an absurd digit string *before* ``int()``: CPython caps decimal
+# conversions at 4300 digits and would otherwise leak a bare ValueError.
+_MAX_DURATION_DIGITS = len(str(_MAX_DURATION_MINUTES))
+# Legacy rows are read-only: keep their cadence, but never materialize an
+# unbounded (or non-finite) interval from an absurd stored ``@every`` string.
+_MAX_LEGACY_EVERY_SECONDS = _MAX_DURATION_MINUTES * 60
 
 _DURATION_UNITS: dict[str, int] = {
     "m": 1,
@@ -177,7 +184,17 @@ def parse_duration(text: Any) -> int:
             f"Invalid duration: {text.strip()!r}. "
             "Use '30m', '2h', '1d', or a bare unit such as 'hour'.",
         )
-    count = int(match.group("count")) if match.group("count") else 1
+    raw_count = match.group("count")
+    if raw_count:
+        digits = raw_count.lstrip("0") or "0"
+        if len(digits) > _MAX_DURATION_DIGITS:
+            raise _DurationTooLarge(
+                "invalid_duration",
+                "Invalid duration: the interval is too large. Use at most about 10 years.",
+            )
+        count = int(digits)
+    else:
+        count = 1
     minutes = count * _DURATION_UNITS[match.group("unit")]
     if minutes > _MAX_DURATION_MINUTES:
         raise _DurationTooLarge(
@@ -793,6 +810,11 @@ def _parse_legacy_every(text: str) -> float:
         seconds = amount * 60.0
     else:
         seconds = amount
+    if not math.isfinite(seconds) or seconds > _MAX_LEGACY_EVERY_SECONDS:
+        raise _error(
+            "invalid_schedule",
+            "Invalid schedule: '@every' interval is too large; legacy rows are capped at about 10 years.",
+        )
     if seconds <= 0:
         raise _error("invalid_schedule", "@every interval must be positive.")
     # Legacy rows keep their exact second cadence, including sub-second ones.

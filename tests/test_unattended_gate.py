@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import pytest
 
 from leo import db
@@ -69,6 +72,13 @@ async def env(tmp_path):
         _schema(command={"type": "string"}),
     )
     register("read_probe", "utility", RiskLevel.LOW)
+    # A reply into the originating conversation is LOW under the risk policy;
+    # it must still be refused when nobody is watching the unattended turn.
+    register(
+        "channel_send", "integrations", RiskLevel.HIGH,
+        _schema(target={"type": "string"}, subject={"type": "string"},
+                text={"type": "string"}),
+    )
     # MEDIUM tools outside the five original categories: an unattended turn
     # must not use them to write files, memory, tasks or schedules.
     for name in ("write_file", "patch", "memory_add", "task_create", "schedule_create"):
@@ -85,7 +95,9 @@ async def env(tmp_path):
     }
 
 
-def _call(name: str, arguments: dict, *, source: str) -> ToolCall:
+def _call(
+    name: str, arguments: dict, *, source: str, correlation_id: str | None = None
+) -> ToolCall:
     return ToolCall(
         name=name,
         arguments=arguments,
@@ -94,6 +106,7 @@ def _call(name: str, arguments: dict, *, source: str) -> ToolCall:
         origin="scheduled",
         principal="scheduled",
         conversation_id="conv_scheduled",
+        correlation_id=correlation_id,
     )
 
 
@@ -109,7 +122,10 @@ CASES = [
 @pytest.mark.parametrize("source", ["scheduled", "unattended"])
 async def test_unattended_side_effects_are_denied_without_an_approval(env, source):
     for name, arguments, category in CASES:
-        result = await env["executor"].execute(_call(name, arguments, source=source))
+        # One call per turn: each distinct turn earns its own notice.
+        result = await env["executor"].execute(
+            _call(name, arguments, source=source, correlation_id=f"turn-{name}")
+        )
         assert result.success is False, name
         assert result.decision == "denied", name
         assert "unattended" in (result.error or ""), name
@@ -201,3 +217,99 @@ async def test_attended_high_risk_still_uses_the_ordinary_approval(env):
         "SELECT COUNT(*) AS n FROM events WHERE topic='automation.needs_you'"
     )
     assert notices["n"] == 0
+
+
+async def test_unattended_reply_to_origin_is_denied_but_attended_reply_still_runs(env):
+    """LOW tier for a reply is an attended convenience, not unattended consent."""
+    args = {
+        "target": "chat:origin", "subject": "chat:origin", "text": "a scheduled reply",
+    }
+    attended = await env["executor"].execute(
+        ToolCall(
+            name="channel_send", arguments=args, actor="chat:web",
+            source="chat", origin="tui", principal="operator",
+        )
+    )
+    assert attended.success is True and "channel_send" in env["executed"]
+    assert attended.risk.value == "low"
+
+    denied = await env["executor"].execute(
+        _call("channel_send", args, source="scheduled", correlation_id="turn-reply")
+    )
+    assert denied.success is False and denied.decision == "denied"
+    assert denied.metadata["unattended_gate"]["category"] == "outbound"
+    assert denied.metadata["unattended_gate"]["risk"] == "low"
+    assert env["executed"].count("channel_send") == 1  # only the attended call
+    assert (await db.fetchone("SELECT COUNT(*) AS n FROM approvals"))["n"] == 0
+    notices = await db.fetchall(
+        "SELECT payload FROM events WHERE topic='automation.needs_you'"
+    )
+    assert len(notices) == 1
+    envelope = json.loads(notices[0]["payload"])
+    assert (envelope.get("payload") or envelope)["category"] == "outbound"
+
+
+async def test_repeated_denials_in_one_turn_emit_one_notice_and_keep_every_audit(env):
+    args = {"target": "stranger", "text": "hello"}
+    for _ in range(3):
+        result = await env["executor"].execute(
+            _call("outbound_probe", args, source="scheduled",
+                  correlation_id="turn-three-denials")
+        )
+        assert result.success is False and result.decision == "denied"
+
+    notices = await db.fetchall(
+        "SELECT payload FROM events WHERE topic='automation.needs_you'"
+    )
+    assert len(notices) == 1
+    calls = await db.fetchall("SELECT id FROM tool_calls WHERE tool='outbound_probe'")
+    audits = await db.fetchall(
+        "SELECT id FROM audit_log WHERE action='tool.execute' AND decision='denied'"
+    )
+    assert len(calls) == len(audits) == 3
+
+
+async def test_new_turn_on_the_same_conversation_gets_a_new_notice(env):
+    args = {"target": "stranger", "text": "hello"}
+    for turn in ("turn-a", "turn-b"):
+        await env["executor"].execute(
+            _call("outbound_probe", args, source="scheduled", correlation_id=turn)
+        )
+    notices = await db.fetchall(
+        "SELECT payload FROM events WHERE topic='automation.needs_you'"
+    )
+    assert len(notices) == 2
+
+
+async def test_declared_schedule_results_still_leave_by_the_delivery_lane():
+    """The gate closes tool sends, not the task engine's terminal delivery."""
+    from leo.core import LeoApp
+
+    sends: list[dict] = []
+
+    class Gateway:
+        async def send(self, channel, target, text, **kwargs):
+            sends.append({"channel": channel, "target": target, "text": text, **kwargs})
+            return {"success": True, "message_id": "msg-1"}
+
+    class Reporting:
+        async def on_terminal(self, task, status):
+            return None
+
+    app = LeoApp.__new__(LeoApp)
+    app.gateway = Gateway()
+    app.task_reporting = Reporting()
+    task = SimpleNamespace(
+        id="task-1", status="completed", metadata={"schedule_id": "s1"}
+    )
+    context = {
+        "status": "completed",
+        "delivery_text_override": "the scheduled result",
+        "delivery_target": {"kind": "channel"},
+    }
+    receipt = await app._channel_delivery(task, "telegram", "chat:origin", context)
+    assert receipt == "telegram:msg-1"
+    assert sends == [{
+        "channel": "telegram", "target": "chat:origin",
+        "text": "the scheduled result", "subject": "task:task-1", "thread_id": None,
+    }]

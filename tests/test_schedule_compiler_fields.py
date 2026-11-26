@@ -376,3 +376,125 @@ def test_unknown_skill_names_are_rejected_when_the_registry_is_available(roots) 
 def test_unknown_skill_is_permissive_without_a_registry(roots) -> None:
     result = _create(roots, skills=["ghost"])
     assert result.spec.execution.skills == ["ghost"]
+
+
+def test_edit_does_not_revalidate_skills_checked_at_creation(roots) -> None:
+    """Registry drift must not block an edit that supplies no new skill."""
+    creation = _compiler(
+        roots, known_skills=["maps"], skill_docs={"maps": "Map documentation."}
+    )
+    created = creation.compile_create({**BASE, "skills": ["maps"]})
+
+    # The live registry no longer knows 'maps'; that is not a reason to refuse
+    # an unrelated prompt edit or a re-supplied, already-validated skill.
+    drifted = _compiler(
+        roots, known_skills=["brief"], skill_docs={"brief": "Brief documentation."}
+    )
+    edited = drifted.compile_update(created.spec, {"prompt": "revised"}, base_revision=1)
+    assert edited.spec.execution.skills == ["maps"]
+
+    readded = drifted.compile_update(
+        created.spec, {"skills": ["maps", "brief"]}, base_revision=1
+    )
+    assert readded.spec.execution.skills == ["maps", "brief"]
+
+    # A genuinely new name is still checked against the current registry.
+    with pytest.raises(ScheduleCompileError) as caught:
+        drifted.compile_update(
+            created.spec, {"skills": ["maps", "ghost"]}, base_revision=1
+        )
+    assert caught.value.code == "unknown_skill"
+    assert caught.value.field == "skills"
+
+
+def test_paused_one_shot_edit_ignores_the_stale_instant_until_resume(roots) -> None:
+    """A paused job has no live instant to re-arm until it is resumed."""
+    compiler = _compiler(roots)
+    created = compiler.compile_create(
+        {**BASE, "schedule": (NOW + timedelta(hours=1)).isoformat(), "paused": True},
+        operator=True,
+    )
+    stale = (NOW - timedelta(hours=3)).isoformat()
+
+    stay_paused = compiler.compile_update(
+        created.spec, {"prompt": "revised"}, current_next_run=stale, base_revision=1
+    )
+    assert stay_paused.spec.paused is True
+    assert stay_paused.next_run_at is None
+    assert stay_paused.first_run_at == datetime.fromisoformat(stale)
+
+    with pytest.raises(ScheduleCompileError) as caught:
+        compiler.compile_update(
+            created.spec,
+            {"paused": False},
+            current_next_run=stale,
+            base_revision=1,
+            allow_pause_edit=True,
+        )
+    assert caught.value.code == "one_shot_in_past"
+
+    # Re-anchoring a paused job to a past instant is equally inert until resume.
+    reanchored = compiler.compile_update(
+        created.spec, {"schedule": stale}, operator=True, base_revision=1
+    )
+    assert reanchored.spec.paused is True
+    assert reanchored.next_run_at is None
+    assert reanchored.first_run_at == datetime.fromisoformat(stale)
+
+    with pytest.raises(ScheduleCompileError) as caught:
+        compiler.compile_update(
+            reanchored.spec,
+            {"paused": False},
+            current_next_run=stale,
+            base_revision=1,
+            allow_pause_edit=True,
+        )
+    assert caught.value.code == "one_shot_in_past"
+
+
+def test_grace_validation_matches_the_effective_schedule_kind(roots) -> None:
+    """An edit must not leave a one-shot with a recurring-only grace window."""
+    compiler = _compiler(roots)
+    recurring = compiler.compile_create(
+        {**BASE, "schedule": "0 9 * * *", "grace_minutes": 5}, operator=True
+    )
+    with pytest.raises(ScheduleCompileError) as caught:
+        compiler.compile_update(
+            recurring.spec,
+            {"schedule": (NOW + timedelta(hours=2)).isoformat()},
+            operator=True,
+            base_revision=1,
+        )
+    assert caught.value.code == "grace_requires_recurring"
+
+    legacy_once = compiler.compile_create(
+        {**BASE, "schedule": (NOW + timedelta(hours=2)).isoformat()},
+        operator=True,
+    ).spec
+    legacy_once = legacy_once.model_copy(
+        update={
+            "execution": legacy_once.execution.model_copy(update={"grace_minutes": 5})
+        }
+    )
+    # An unchanged legacy one-shot keeps its stored window; converting it to a
+    # recurring kind keeps a valid window too.
+    unchanged = compiler.compile_update(
+        legacy_once, {"prompt": "revised"}, operator=True, base_revision=1
+    )
+    assert unchanged.spec.execution.grace_minutes == 5
+    converted = compiler.compile_update(
+        legacy_once, {"schedule": "0 9 * * *"}, operator=True, base_revision=1
+    )
+    assert converted.spec.execution.grace_minutes == 5
+
+    # Zero disables the window, so the same conversion is legal after clearing.
+    cleared = compiler.compile_update(
+        recurring.spec,
+        {
+            "schedule": (NOW + timedelta(hours=2)).isoformat(),
+            "grace_minutes": 0,
+        },
+        operator=True,
+        base_revision=1,
+    )
+    assert cleared.spec.execution.grace_minutes == 0

@@ -49,10 +49,14 @@ async def test_telegram_typing_posts_send_chat_action(monkeypatch):
     assert "100000001" in body and "typing" in body
 
 
-async def test_base_adapter_typing_is_a_no_op():
+async def test_base_adapter_typing_is_a_no_op(monkeypatch):
+    """The Telegram HTTP implementation must not leak into the base adapter."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+
     class _Silent(MessagingAdapter):
         channel = "silent"
 
+    assert MessagingAdapter.send_typing is not TelegramAdapter.send_typing
     assert await _Silent().send_typing("anyone") is None
 
 
@@ -109,6 +113,28 @@ async def test_typing_failure_does_not_block_the_reply():
     summary = await gateway.drain_outbox(limit=5)
 
     assert summary["processed"] == 1 and summary["failed"] == 0
+
+
+async def test_gateway_typing_swallows_and_logs_adapter_failures(caplog):
+    """Best-effort typing never raises to a caller, but failures are visible."""
+    class _Broken(MessagingAdapter):
+        channel = "broken"
+
+        async def send_typing(self, target: str) -> None:
+            raise RuntimeError("indicator down")
+
+    gateway = Gateway(
+        {"broken": _Broken()},
+        events=EventBus(persist=False),
+        permissions=_AllowAll(),
+        admission=ChannelAdmission(ChannelsConfig(default_mode="open")),
+    )
+    with caplog.at_level("WARNING", logger="integrations.gateway"):
+        assert await gateway.typing("broken", "42") is None
+        assert await gateway.typing("missing-channel", "42") is None
+
+    assert "typing indicator failed" in caplog.text
+    assert any("indicator down" in getattr(record, "error", "") for record in caplog.records)
 
 
 async def _confirm(gateway: Gateway, payload: dict) -> dict:

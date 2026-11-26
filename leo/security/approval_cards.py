@@ -82,6 +82,10 @@ DECLINE_MESSAGES: dict[str, str] = {
         "The change card was answered after the new run time it showed had passed; "
         "nothing was saved. Offer the change again with a later time if it is still wanted."
     ),
+    "disabled_edit": (
+        "The schedule is now paused or disabled; nothing was saved. Resume it from "
+        "an operator turn and offer the change again if it is still wanted."
+    ),
 }
 
 

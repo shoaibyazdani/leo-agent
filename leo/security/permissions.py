@@ -963,7 +963,8 @@ class PermissionManagerImpl:
             await asyncio.sleep(min(poll, max(0.01, deadline - loop.time())))
 
     async def _expire_schedule_card(
-        self, approval_id: str, *, stale: bool = False
+        self, approval_id: str, *, stale: bool = False,
+        decline_override: str | None = None,
     ) -> Any:
         row = await self._schedule_row(approval_id)
         card = card_from_row(row)
@@ -971,7 +972,7 @@ class PermissionManagerImpl:
             return card
         config = kind_config(card.kind)
         outcome = config.stale_outcome if stale else config.timeout_outcome
-        decline = (
+        decline = decline_override or (
             DECLINE_MESSAGES["stale_create"]
             if stale and card.kind == KIND_SCHEDULE_CREATE
             else DECLINE_MESSAGES["stale_edit"]
@@ -1176,23 +1177,30 @@ class PermissionManagerImpl:
                         card=card, choice=canonical, resolver=str(resolver)
                     )
                 except ValueError as exc:
-                    # A CAS loss/removal discovered at commit time is the same
-                    # human-facing outcome as a card answered after its window:
-                    # an expired edit, never an exception with a pending card.
+                    # A CAS loss/removal discovered at commit time is an expired
+                    # edit, never an exception with a pending card. A row that
+                    # is now paused/disabled gets its own honest decline instead
+                    # of being blamed on a passed run time.
+                    code = getattr(exc, "code", "")
                     if (
                         card.kind != KIND_SCHEDULE_EDIT
-                        or getattr(exc, "code", "") not in {"stale_update", "unknown_schedule"}
+                        or code not in {"stale_update", "unknown_schedule", "disabled_update"}
                     ):
                         raise
+                    decline = (
+                        DECLINE_MESSAGES["disabled_edit"]
+                        if code == "disabled_update"
+                        else DECLINE_MESSAGES["stale_edit"]
+                    )
                     expired = await self._expire_schedule_card(
-                        approval_id, stale=True
+                        approval_id, stale=True, decline_override=decline
                     )
                     return ScheduleResolution(
                         approval_id=approval_id, kind=expired.kind,
                         status="expired", allowed=False,
-                        reason=str(expired.outcome or "stale"),
+                        reason=str(exc) or str(expired.outcome or "stale"),
                         outcome=expired.outcome,
-                        decline_message=DECLINE_MESSAGES["stale_edit"],
+                        decline_message=decline,
                     )
             committed_schedule = (
                 commit_result.get("schedule_id")

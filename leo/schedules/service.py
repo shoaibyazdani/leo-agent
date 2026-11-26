@@ -845,15 +845,14 @@ class ScheduleService:
         revision = int(meta.get("config_revision", expected + 1) or expected + 1)
         config = strip_commit_meta(spec.config)
         now = self._now_iso()
-        # A row disabled/retired after the card was shown cannot silently be
-        # re-enabled by an unrelated edit. A genuine resume edit (paused row,
-        # target unpaused) keeps working.
-        if current.status not in ("active", "paused") or (
-            not current.enabled and spec.paused
-        ):
+        # Only a row retired/disabled outside the active/paused states needs
+        # this guard: an edit card must never silently re-enable it. A paused
+        # row is different - an unrelated edit inherits ``paused=True`` and a
+        # resume card deliberately asks for ``paused=False``; both commit.
+        if current.status not in ("active", "paused"):
             raise _fail(
-                "stale_update",
-                "The schedule is no longer active; this edit cannot be applied.",
+                "disabled_update",
+                "This schedule is paused or disabled; an edit cannot re-enable it.",
                 field="config_revision",
             )
         # A paused row is not claimable because ``enabled=0``. Keeping its
@@ -1356,6 +1355,24 @@ class ScheduleService:
                 "The supplied approval does not authorize this schedule run.",
                 field="authorization",
             )
+        if edit_card:
+            # An approved edit is a one-shot capability for live work, not a
+            # permanent grant. The conditional metadata write is the atomic
+            # marker: of two concurrent users of the same card exactly one
+            # wins, and every later reuse fails closed.
+            claimed = await db.execute(
+                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+                "'$.live_authorization_used_at',?) "
+                "WHERE id=? AND status='approved' AND kind=? "
+                "AND COALESCE(json_extract(metadata,'$.live_authorization_used_at'),'')=''",
+                (self._now_iso(), card_id, KIND_SCHEDULE_EDIT),
+            )
+            if int(getattr(claimed, "rowcount", 0) or 0) < 1:
+                raise _fail(
+                    "authorization_consumed",
+                    "This approved edit was already used to authorize a run or cancel.",
+                    field="authorization",
+                )
 
     @staticmethod
     def _can_answer(turn: TurnContext | None) -> bool:

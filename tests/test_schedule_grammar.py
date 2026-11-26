@@ -103,6 +103,44 @@ def test_absurd_durations_are_stable_invalid_duration(text: str) -> None:
     assert caught.value.code == "invalid_duration"
 
 
+def test_oversized_digit_strings_are_stable_invalid_duration() -> None:
+    """A >4300-digit count must not leak CPython's int() ValueError."""
+    huge = "9" * 4301
+    for text in (f"{huge}m", f"{huge}d", f"{'0' * 4301}{huge}m"):
+        with pytest.raises(ScheduleGrammarError) as caught:
+            parse_duration(text)
+        assert caught.value.code == "invalid_duration"
+        assert "too large" in str(caught.value)
+
+    for text in (f"in {huge}m", f"every {huge}m"):
+        with pytest.raises(ScheduleGrammarError) as caught:
+            _parse(text)
+        assert caught.value.code == "invalid_duration"
+
+    # Bounded leading zeros are still a normal duration.
+    assert parse_duration(f"{'0' * 100}7m") == 7
+
+
+def test_legacy_every_is_capped_for_readers() -> None:
+    """Legacy rows stay readable, but never yield an unbounded cadence."""
+    for text in (
+        f"@every {'9' * 4301}s",
+        "@every 999999999999999999999999w",
+        "@every 999999999999999999999999d",
+    ):
+        with pytest.raises(ScheduleGrammarError) as caught:
+            parse_schedule(
+                text, now=NOW, default_timezone="UTC", allow_legacy_every=True
+            )
+        assert caught.value.code == "invalid_schedule"
+        assert "too large" in str(caught.value)
+
+    # Writers still reject the legacy form outright.
+    with pytest.raises(ScheduleGrammarError) as caught:
+        _parse("@every 999999999999999999999999w")
+    assert caught.value.code == "invalid_schedule"
+
+
 def test_interval_next_occurrence_wraps_overflow() -> None:
     """A corrupt/stored huge interval still rejects with a stable code."""
     parsed = ParsedSchedule(
