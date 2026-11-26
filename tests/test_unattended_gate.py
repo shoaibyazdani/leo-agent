@@ -69,6 +69,13 @@ async def env(tmp_path):
         _schema(command={"type": "string"}),
     )
     register("read_probe", "utility", RiskLevel.LOW)
+    # MEDIUM tools outside the five original categories: an unattended turn
+    # must not use them to write files, memory, tasks or schedules.
+    for name in ("write_file", "patch", "memory_add", "task_create", "schedule_create"):
+        register(name, "utility", RiskLevel.MEDIUM, _schema(path={"type": "string"}))
+    # Read-only allowlisted name deliberately registered above LOW to prove
+    # the allowlist is consulted, not just the risk tier.
+    register("read_file", "utility", RiskLevel.MEDIUM, _schema(path={"type": "string"}))
     executor = ToolExecutorImpl(registry, permissions, events, settings)
     return {
         "executed": executed,
@@ -131,6 +138,27 @@ async def test_unattended_side_effects_are_denied_without_an_approval(env, sourc
     }
     assert all(item["principal"] == "scheduled" for item in payloads)
     assert all(item["conversation_id"] == "conv_scheduled" for item in payloads)
+
+
+@pytest.mark.parametrize(
+    "name", ["write_file", "patch", "memory_add", "task_create", "schedule_create"]
+)
+async def test_uncategorized_medium_tools_are_denied_in_unattended_turns(env, name):
+    result = await env["executor"].execute(_call(name, {"path": "/tmp/x"}, source="scheduled"))
+    assert result.success is False, name
+    assert result.decision == "denied", name
+    assert "unattended" in (result.error or ""), name
+    assert result.metadata["unattended_gate"]["category"] == "side_effect", name
+    assert name not in env["executed"]
+    assert (await db.fetchone("SELECT COUNT(*) AS n FROM approvals"))["n"] == 0
+
+
+async def test_allowlisted_medium_read_still_runs_unattended(env):
+    result = await env["executor"].execute(
+        _call("read_file", {"path": "/tmp/x"}, source="scheduled")
+    )
+    assert result.success is True
+    assert "read_file" in env["executed"]
 
 
 async def test_low_risk_or_attended_calls_still_run(env):

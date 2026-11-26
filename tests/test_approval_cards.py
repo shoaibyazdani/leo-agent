@@ -452,7 +452,7 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
         )
     )
     for fragment in (
-        'Schedule "Brief" (every day at 8am, first run Wed Nov 25 08:00 UTC)',
+        'Schedule "Brief" (every day at 8am, first run Wed Nov 25 08:00 UTC,',
         "Summarize updates.",
         "(skills: maps)",
         "(after running script collect.py)",
@@ -463,8 +463,23 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
         "copied into the chat's history",
         "results go to nowhere (saved to the job's history only)",
         "failure notices go to",
+        "runs forever",
+        "default bounded catch-up after downtime",
+        "not pinned to a provider/model",
     ):
         assert fragment in body
+
+    pinned = render_schedule_body(
+        ScheduleBodySpec(
+            name="Brief", display="every day at 8am", repeat_limit=5,
+            prompt="Summarize.", catch_up=False, pinned=True,
+            pinned_provider="provider-x", pinned_model="model-y",
+        )
+    )
+    assert "5 runs" in pinned
+    assert "runs forever" not in pinned
+    assert "skip missed runs (at most one run after downtime)" in pinned
+    assert "pinned to provider-x/model-y" in pinned
 
     paused = render_schedule_body(
         ScheduleBodySpec(

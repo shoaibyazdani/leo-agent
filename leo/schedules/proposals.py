@@ -165,6 +165,11 @@ def spec_from_view(view: ScheduleView) -> ScheduleSpec:
         if isinstance(execution_raw, Mapping)
         else ExecutionSpec()
     )
+    # Legacy rows keep the operator's late-run window in their own column.
+    # Without this, a later unrelated edit would persist a missing grace and
+    # silently switch the job back to unlimited catch-up.
+    if execution.grace_minutes is None and view.grace_minutes is not None:
+        execution = execution.model_copy(update={"grace_minutes": view.grace_minutes})
     payload = view.payload if isinstance(view.payload, Mapping) else {}
     prompt = str(config.get("prompt") or payload.get("objective") or "")
     repeat = config.get("repeat_limit", view.repeat_limit)

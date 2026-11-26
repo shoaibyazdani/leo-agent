@@ -871,16 +871,27 @@ class PermissionManagerImpl:
             if not delivered:
                 raise PermissionError(f"card was not delivered on {surface!r}")
         now = self._now_iso()
-        if not row["shown_at"]:
-            await db.execute(
-                "UPDATE approvals SET shown_at=?, presented_surface=? WHERE id=?",
+        # Two presenters can race on one card. Claim shown_at with a CAS on the
+        # empty value instead of trusting the earlier read; a retry sees the
+        # winner's row and only updates the surface. This is idempotent: a card
+        # already shown keeps its original timestamp.
+        for _attempt in range(3):
+            current = await self._schedule_row(approval_id)
+            if str(current["status"]) != "pending":
+                break
+            if current["shown_at"]:
+                await db.execute(
+                    "UPDATE approvals SET presented_surface=? WHERE id=?",
+                    (str(surface), approval_id),
+                )
+                break
+            cursor = await db.execute(
+                "UPDATE approvals SET shown_at=?, presented_surface=? "
+                "WHERE id=? AND status='pending' AND (shown_at IS NULL OR shown_at='')",
                 (now, str(surface), approval_id),
             )
-        else:
-            await db.execute(
-                "UPDATE approvals SET presented_surface=? WHERE id=?",
-                (str(surface), approval_id),
-            )
+            if int(getattr(cursor, "rowcount", 0) or 0) > 0:
+                break
         card = await self.get_schedule_card(approval_id)
         if self.events and card is not None:
             await self.events.emit(
@@ -1160,9 +1171,29 @@ class PermissionManagerImpl:
             if committer is not None:
                 # Must run inside this transaction; a failure rolls the
                 # approval update, grant and audit back together.
-                commit_result = await committer(
-                    card=card, choice=canonical, resolver=str(resolver)
-                )
+                try:
+                    commit_result = await committer(
+                        card=card, choice=canonical, resolver=str(resolver)
+                    )
+                except ValueError as exc:
+                    # A CAS loss/removal discovered at commit time is the same
+                    # human-facing outcome as a card answered after its window:
+                    # an expired edit, never an exception with a pending card.
+                    if (
+                        card.kind != KIND_SCHEDULE_EDIT
+                        or getattr(exc, "code", "") not in {"stale_update", "unknown_schedule"}
+                    ):
+                        raise
+                    expired = await self._expire_schedule_card(
+                        approval_id, stale=True
+                    )
+                    return ScheduleResolution(
+                        approval_id=approval_id, kind=expired.kind,
+                        status="expired", allowed=False,
+                        reason=str(expired.outcome or "stale"),
+                        outcome=expired.outcome,
+                        decline_message=DECLINE_MESSAGES["stale_edit"],
+                    )
             committed_schedule = (
                 commit_result.get("schedule_id")
                 if isinstance(commit_result, Mapping)

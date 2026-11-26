@@ -156,6 +156,17 @@ def _send_accepts_reply_to(send: Any) -> bool:
     )
 
 
+def _send_accepts_thread_id(send: Any) -> bool:
+    """True when an adapter can actually place a message in a named thread."""
+    try:
+        params = inspect.signature(send).parameters
+    except (TypeError, ValueError):
+        return False
+    return "thread_id" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 class Gateway:
     """Unified conversation store and inbound/outbound channel router."""
 
@@ -836,15 +847,20 @@ class Gateway:
     # handler returns; a failure is cosmetic and must never break delivery.
     TYPING_INTERVAL_SECONDS = 4.0
 
+    async def typing(self, channel: str, target: str) -> None:
+        """The one public typing API: route a presence hint to its adapter."""
+        adapter = self.adapters.get(str(channel))
+        if adapter is not None:
+            await adapter.send_typing(str(target))
+
     async def _typing_heartbeat(self, payload: dict[str, Any]) -> None:
         channel = str(payload.get("channel") or "")
         target = str(payload.get("reply_target") or payload.get("subject") or "")
-        adapter = self.adapters.get(channel)
-        if not target or adapter is None:
+        if not target or channel not in self.adapters:
             return
         while True:
             try:
-                await adapter.typing(target)
+                await self.typing(channel, target)
             except Exception:
                 return
             await asyncio.sleep(self.TYPING_INTERVAL_SECONDS)
@@ -980,6 +996,7 @@ class Gateway:
         caption: str | None = None,
         reply_markup: dict[str, Any] | None = None,
         reply_to: str | None = None,
+        thread_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one outbound message through the channel's adapter.
 
@@ -996,6 +1013,16 @@ class Gateway:
         adapter = self._adapter(channel)
         subject = subject or str(target)
         target_str = str(target)
+        # A requested thread is part of the destination. If the adapter cannot
+        # honour it, fail the send: a "sent" receipt for the group root would be
+        # a false claim for a job aimed at a topic.
+        if thread_id not in (None, "") and not _send_accepts_thread_id(adapter.send):
+            return {
+                "channel": channel,
+                "target": target_str,
+                "success": False,
+                "error": f"{channel} adapter cannot address a thread",
+            }
         media_path: Path | None = None
         if media is not None and str(media).strip() != "":
             # Confine and canonicalize before authorizing: the digest must cover
@@ -1011,6 +1038,8 @@ class Gateway:
         }
         if reply_to:
             send_arguments["reply_to"] = str(reply_to)
+        if thread_id not in (None, ""):
+            send_arguments["thread_id"] = str(thread_id)
         if media_path is not None:
             # Keys are added only when media is actually attached so existing
             # text-only digests stay byte-identical (no spurious approval churn).
@@ -1057,6 +1086,8 @@ class Gateway:
                 ) else {}
                 if reply_to and _send_accepts_reply_to(adapter.send):
                     extra["reply_to"] = str(reply_to)
+                if thread_id not in (None, ""):
+                    extra["thread_id"] = str(thread_id)
                 result = await adapter.send(target, text, **extra)
             if not isinstance(result, Mapping):
                 raise MessagingError(f"{channel} adapter returned an invalid send result")
@@ -1075,6 +1106,7 @@ class Gateway:
             "provider_message_id": result.get("message_id"),
             "idempotency_key": idempotency_key,
             "reply_to": str(reply_to) if reply_to else None,
+            "thread_id": str(thread_id) if thread_id not in (None, "") else None,
         }
         if media_path is not None:
             # Name and size only: the absolute local path is not stored in the
@@ -1108,6 +1140,7 @@ class Gateway:
             target=target_str,
             provider_message_id=result.get("message_id"),
             idempotency_key=idempotency_key,
+            thread_id=metadata["thread_id"],
         )
         return response
 

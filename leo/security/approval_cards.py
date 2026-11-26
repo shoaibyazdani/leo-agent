@@ -334,6 +334,12 @@ class ScheduleBodySpec:
     context_from: Sequence[str] = ()
     enabled_toolsets: Sequence[str] | None = None
     attach_to_session: bool = False
+    catch_up: bool | None = None
+    pinned: bool = False
+    # Resolved at compile time from the operator-owned pinned target. The card
+    # names it only when a pinned job actually locks one.
+    pinned_provider: str | None = None
+    pinned_model: str | None = None
     delivery: str = "nowhere (saved to the job's history only)"
     failure_delivery: str | None = None
 
@@ -354,6 +360,26 @@ def render_schedule_body(spec: ScheduleBodySpec) -> str:
     if spec.repeat_limit is not None:
         count = int(spec.repeat_limit)
         parts.append(f"{count} run{'' if count == 1 else 's'}")
+    else:
+        parts.append("runs forever")
+    if spec.catch_up is False:
+        parts.append("skip missed runs (at most one run after downtime)")
+    elif spec.catch_up is True:
+        parts.append("catch up on missed runs")
+    else:
+        parts.append("default bounded catch-up after downtime")
+    if spec.pinned:
+        provider = str(spec.pinned_provider or "").strip()
+        model = str(spec.pinned_model or "").strip()
+        target = (
+            f"{provider}/{model}" if provider and model
+            else f"provider {provider}" if provider
+            else f"model {model}" if model
+            else "the current provider/model at creation"
+        )
+        parts.append(f"pinned to {target}")
+    else:
+        parts.append("not pinned to a provider/model")
     head = f'Schedule "{spec.name}" ({", ".join(part for part in parts if part)}): '
 
     prompt = str(spec.prompt or "").strip()

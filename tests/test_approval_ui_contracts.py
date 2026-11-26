@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "leo" / "interfaces" / "static"
 APPROVALS_JS = (STATIC / "ui" / "approvals.js").read_text(encoding="utf-8")
 TUI = (ROOT / "leo" / "interfaces" / "tui.py").read_text(encoding="utf-8")
+API = (ROOT / "leo" / "interfaces" / "api.py").read_text(encoding="utf-8")
 MAIN = (ROOT / "desktop" / "main.js").read_text(encoding="utf-8")
 PRELOAD = (ROOT / "desktop" / "preload.js").read_text(encoding="utf-8")
 
@@ -52,9 +53,23 @@ def test_web_renderer_sends_only_the_displayed_digest_and_choice() -> None:
     assert "RESOLVE_ROUTE(view.approval_id)" in resolve
     assert "acknowledge(card)" in APPROVALS_JS
     assert "ACK_ROUTE(view.approval_id)" in APPROVALS_JS
+    # A web denial has a bounded reason step; an empty prompt is recorded
+    # explicitly instead of leaving the human's reason silently dropped.
+    assert "window.prompt(" in resolve
+    assert "slice(0, 500)" in resolve
+    assert "no reason supplied" in resolve
+    assert "deny_reason: denyReason" in resolve
     # The renderer never invents a decision or bypasses the routes.
     assert "approved:" not in resolve
     assert "/resolve?" not in APPROVALS_JS
+
+
+def test_tui_and_api_keep_the_existing_bounded_deny_reason_steps() -> None:
+    resolve = block(TUI, "async def _resolve_schedule_card_tui(", "# ------------------------------------------------------------- commands")
+    assert "deny_reason=deny_reason" in resolve
+    assert "/deny <id> [reason]" in TUI
+    assert "deny_reason=req.deny_reason" in API
+    assert "deny_reason: str | None = None" in API
 
 
 def test_tui_projects_the_same_full_card_and_presents_before_deciding() -> None:

@@ -177,11 +177,24 @@
     if (!view.approval_id) return Promise.reject(new Error('card has no approval id'));
     const offered = view.choices.some((item) => item.value === choice);
     if (!offered) return Promise.reject(new Error('that choice is not offered on this card'));
+    // A web button carries no free text. Ask for a bounded reason when the
+    // human denies, and record the gap explicitly if the prompt is dismissed.
+    let denyReason = null;
+    if (choice === 'deny' && typeof window !== 'undefined' && typeof window.prompt === 'function') {
+      try {
+        const supplied = window.prompt('Reason for denying this schedule (optional, max 500 characters):');
+        const trimmed = supplied == null ? '' : String(supplied).trim().slice(0, 500);
+        denyReason = trimmed || 'no reason supplied';
+      } catch (_) {
+        denyReason = null;  // a shell without prompts still records the gap
+      }
+    }
     // Only the digest displayed by this renderer is sent back. The server
     // compares it to the durable row and refuses a stale card.
     return requestJson(RESOLVE_ROUTE(view.approval_id), {
       choice,
       confirm_proposal_digest: view.proposal_digest,
+      ...(denyReason ? { deny_reason: denyReason } : {}),
     });
   }
 

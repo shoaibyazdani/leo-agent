@@ -9,6 +9,8 @@ import pytest
 from leo.schedules.clock import FrozenClock
 from leo.schedules.compiler import ScheduleCompileError, ScheduleCompiler
 from leo.schedules.delivery import DeliveryContext, Origin
+from leo.schedules.domain import ScheduleView
+from leo.schedules.proposals import spec_from_view
 
 NOW = datetime(2026, 11, 26, 10, 0, tzinfo=timezone.utc)
 BASE = {"schedule": "every day at 9am", "prompt": "Brief", "deliver": "local"}
@@ -159,7 +161,7 @@ def test_unknown_and_operator_only_fields_are_rejected(roots) -> None:
         _error(roots, "operator_only_field", **{key: value})
 
 
-def test_operator_fields_validate_and_grace_is_cron_only(roots) -> None:
+def test_operator_fields_validate_and_grace_is_recurring_only(roots) -> None:
     result = _compiler(roots).compile_create(
         {
             **BASE,
@@ -173,11 +175,18 @@ def test_operator_fields_validate_and_grace_is_cron_only(roots) -> None:
     assert result.spec.execution.base_url == "https://example.test/v1"
     assert result.spec.execution.grace_minutes == 0
 
+    # The scheduler honours grace on intervals as well as cron, so the
+    # compiler must not reject a field the runtime will actually apply.
+    interval = _compiler(roots).compile_create(
+        {**BASE, "schedule": "every 2h", "grace_minutes": 5}, operator=True
+    )
+    assert interval.spec.execution.grace_minutes == 5
+
     with pytest.raises(ScheduleCompileError) as caught:
         _compiler(roots).compile_create(
-            {**BASE, "schedule": "every 2h", "grace_minutes": 5}, operator=True
+            {**BASE, "schedule": "in 2h", "grace_minutes": 5}, operator=True
         )
-    assert caught.value.code == "grace_requires_cron"
+    assert caught.value.code == "grace_requires_recurring"
 
     with pytest.raises(ScheduleCompileError) as caught:
         _compiler(roots).compile_create(
@@ -285,3 +294,85 @@ def test_failure_delivery_lane_is_independent(roots) -> None:
     assert result.delivery_plan.identities == (("telegram", "1", None),)
     assert result.failure_delivery_plan.local_only is True
     assert result.failure_delivery_plan.lane == "failure"
+
+
+def test_spec_from_view_preserves_grace_when_config_lacks_it() -> None:
+    """A legacy edit must not silently clear the operator's late-run window."""
+    view = ScheduleView(
+        id="sch-1", name="job", kind="cron", expression="0 9 * * *",
+        grace_minutes=7, config={}, created_at=NOW.isoformat(),
+    )
+    assert spec_from_view(view).execution.grace_minutes == 7
+
+    # An explicit compiled value still wins over the legacy column.
+    with_config = view.model_copy(
+        update={"config": {"execution": {"grace_minutes": 2}}}
+    )
+    assert spec_from_view(with_config).execution.grace_minutes == 2
+
+
+def test_preserved_one_shot_instant_applies_the_past_check(roots) -> None:
+    """An edit that keeps the old run_at must not re-arm a stale one-shot."""
+    created = _compiler(roots).compile_create(
+        {**BASE, "schedule": (NOW + timedelta(hours=1)).isoformat()},
+        operator=True,
+    )
+    stale = (NOW - timedelta(hours=3)).isoformat()
+    for operator in (False, True):
+        with pytest.raises(ScheduleCompileError) as caught:
+            _compiler(roots).compile_update(
+                created.spec, {"prompt": "revised"}, operator=operator,
+                current_next_run=stale,
+            )
+        assert caught.value.code == "one_shot_in_past"
+
+    fresh = _compiler(roots).compile_update(
+        created.spec, {"prompt": "revised"},
+        current_next_run=(NOW + timedelta(hours=1)).isoformat(),
+    )
+    assert fresh.first_run_at == created.first_run_at
+
+
+def test_corrupt_stored_timestamps_have_stable_invalid_schedule_code(roots) -> None:
+    created = _create(roots)
+    with pytest.raises(ScheduleCompileError) as caught:
+        _compiler(roots).compile_update(
+            created.spec, {"prompt": "x"}, current_next_run="not-a-date"
+        )
+    assert caught.value.code == "invalid_schedule"
+
+    one_shot = _create(roots, schedule=(NOW + timedelta(hours=1)).isoformat()).spec
+    corrupt = one_shot.model_copy(
+        update={
+            "expression": one_shot.expression.model_copy(
+                update={"run_at": "not-a-date"}
+            )
+        }
+    )
+    with pytest.raises(ScheduleCompileError) as caught:
+        _compiler(roots).compile_update(corrupt, {"prompt": "x"})
+    assert caught.value.code == "invalid_schedule"
+
+
+def test_unknown_skill_names_are_rejected_when_the_registry_is_available(roots) -> None:
+    compiler = _compiler(
+        roots, known_skills=["maps"], skill_docs={"maps": "Map documentation."}
+    )
+    known = compiler.compile_create({**BASE, "skills": ["maps"]})
+    assert known.spec.execution.skills == ["maps"]
+
+    with pytest.raises(ScheduleCompileError) as caught:
+        compiler.compile_create({**BASE, "skills": ["ghost"]})
+    assert caught.value.code == "unknown_skill"
+    assert caught.value.field == "skills"
+
+    with pytest.raises(ScheduleCompileError) as caught:
+        compiler.compile_update(
+            known.spec, {"skills": ["maps", "ghost"]}, base_revision=1
+        )
+    assert caught.value.code == "unknown_skill"
+
+
+def test_unknown_skill_is_permissive_without_a_registry(roots) -> None:
+    result = _create(roots, skills=["ghost"])
+    assert result.spec.execution.skills == ["ghost"]

@@ -539,7 +539,9 @@ async def test_every_declared_grant_has_a_real_delegated_execution(env) -> None:
         env, action="trigger_schedule", **trigger_args,
         approval_id=await approve(env, "schedule_run_now", trigger_args),
     )
-    await run(env, action="cancel_schedule", name="grant-check")
+    # Stopping a live run needs operator authority even through the specialist.
+    with turn_context(_operator_turn()):
+        await run(env, action="cancel_schedule", name="grant-check")
     delete_args = {"name": "grant-check"}
     await run(
         env, action="delete_schedule", **delete_args,

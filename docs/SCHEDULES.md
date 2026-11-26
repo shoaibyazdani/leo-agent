@@ -101,6 +101,13 @@ an operator can still resolve it later. Trusted direct operator scheduling
 (create/patch/delete over HTTP, operator CLI, dashboard) stays unasked but
 audited as `api:<authenticated-principal>` or `operator:<surface>`.
 
+The only exception to the no-card rule for model creates is a **live schedule
+create grant** covering the current principal/profile or conversation. Such a
+grant makes `schedule_create` save immediately with no card, in interactive
+turns only; it never covers edits, scheduled, unattended or delegated-agent
+turns. Prompts are reworded while a grant is live so the model does not describe
+an immediate save as pending approval.
+
 ## Delivery grammar
 
 Accepted tokens: omitted (`origin` when capturable, else `local`), `origin`,
@@ -222,6 +229,13 @@ instructions. Occurrence keys move to the schedule ID with a legacy alias and a
 backfill marker so an in-flight occurrence cannot produce two tasks. Restart
 replays terminals, live-run cancels never resurrect a task, and a finite
 schedule retires with a tombstone while a one-shot keeps its hard-delete path.
+
+Legacy approval rows with a NULL `expires_at` are backfilled with
+`created_at + 15 minutes` during initialization. This changes old behaviour:
+an approval that was pending for more than 15 minutes at upgrade time becomes
+unresolvable immediately after the migration. Resolve or let those approvals
+expire **before** upgrading, or re-request them afterwards; the backfill does
+not distinguish pending from terminal rows.
 
 Rollback after jobs have executed requires restoring the backup or running the
 documented down-migration: older code cannot read `kind=once` rows or the new

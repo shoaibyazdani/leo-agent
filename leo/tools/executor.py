@@ -52,6 +52,18 @@ _RESOURCE_KEYS = ("path", "cwd", "resource", "file", "directory", "root", "targe
 # an approval the scheduled run could never answer.
 _UNATTENDED_SOURCES = frozenset({"scheduled", "schedule", "unattended"})
 _UNATTENDED_RISKS = frozenset({RiskLevel.MEDIUM, RiskLevel.HIGH})
+# The only MEDIUM/HIGH calls an unattended turn may make: state inspection and
+# delivery back to a configured destination. Everything else that writes,
+# mutates memory, creates tasks/schedules or edits files is refused even when
+# its tool category is uncategorized. Outbound sends to other targets are still
+# refused by the category check below.
+_UNATTENDED_ALLOWED_TOOLS = frozenset(
+    {
+        "read_file", "list_files", "search_files", "schedule_list",
+        "schedule_get", "task_list", "task_status", "metrics_snapshot",
+        "webhook_verify", "channel_send", "gateway.send", "send_message",
+    }
+)
 _OUTBOUND_TOOLS = frozenset({"channel_send", "gateway.send", "send_message"})
 _OUTBOUND_CATEGORIES = frozenset(
     {"outbound", "messaging", "channel", "channels", "integrations"}
@@ -701,7 +713,13 @@ class ToolExecutorImpl:
         """Return the side-effect class for a refused unattended call."""
         if source not in _UNATTENDED_SOURCES or risk not in _UNATTENDED_RISKS:
             return None
-        return self._side_effect_category(registration)
+        category = self._side_effect_category(registration)
+        if category is not None:
+            return category
+        name = str(getattr(getattr(registration, "spec", None), "name", "") or "")
+        if name in _UNATTENDED_ALLOWED_TOOLS:
+            return None
+        return "side_effect"
 
     def _secret_preflight(
         self, call: ToolCall
@@ -758,9 +776,8 @@ class ToolExecutorImpl:
                         "thread_id": getattr(turn, "thread_id", None)
                         or getattr(call, "thread_id", None),
                         "reason": (
-                            "An unattended turn tried an outbound/browser/computer/"
-                            "plugin/shell side effect and was stopped. Approve or run "
-                            "it from an attended turn if it is intended."
+                            "An unattended turn tried a side effect and was stopped. "
+                            "Approve or run it from an attended turn if it is intended."
                         ),
                     }),
                     correlation_id=call.correlation_id,

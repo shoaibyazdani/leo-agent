@@ -89,3 +89,49 @@ def test_proactive_mode_validates_like_other_automation_settings() -> None:
     ).automation.proactive_mode == "off"
     with pytest.raises(ValidationError):
         AutomationConfig(proactive_mode="yolo")
+
+
+async def test_live_create_grant_rewords_guidance_instead_of_promising_a_card(tmp_path) -> None:
+    from leo import db
+    from leo.security.approval_cards import KIND_SCHEDULE_CREATE
+
+    db.set_db_path(tmp_path / "test.db")
+    settings = Settings()
+    app = LeoApp(settings)
+    await app.initialize()
+    try:
+        card = await app.permissions.create_schedule_card(
+            kind=KIND_SCHEDULE_CREATE,
+            body='Schedule "Water" (in 2h): Drink water.',
+            proposal_digest="grant-digest",
+            requested_by="chat:grant",
+            conversation_id="conv-guidance",
+        )
+        await app.permissions.present_schedule_card(card.approval_id, surface="web")
+        decision = await app.permissions.resolve_schedule_card(
+            card.approval_id, choice="session", resolver="operator:local",
+            confirm_proposal_digest=card.proposal_digest,
+        )
+        assert decision.grant_id
+
+        turn = TurnContext(
+            principal="chat:grant", channel="tui", surface="tui",
+            conversation_id="conv-guidance", origin="tui", source="chat",
+        )
+        assert await app._turn_has_create_grant(turn) is True
+        with turn_context(turn):
+            prompt = app._conversation_system_prompt(create_grant=True)
+        line = next(
+            part for part in prompt.split("\n\n") if part.startswith(GUIDANCE_START)
+        )
+        lowered = line.lower()
+        assert "saves immediately without showing a card" in lowered
+        assert "user-authorized" in lowered
+        assert "pending until the human answers" not in lowered
+
+        other = turn.model_copy(update={"conversation_id": "conv-other"})
+        assert await app._turn_has_create_grant(other) is False
+        scheduled = turn.model_copy(update={"source": "scheduled"})
+        assert await app._turn_has_create_grant(scheduled) is False
+    finally:
+        await app.shutdown()

@@ -27,7 +27,7 @@ class _TypingAdapter:
     def __init__(self) -> None:
         self.typed: list[str] = []
 
-    async def typing(self, target: str) -> None:
+    async def send_typing(self, target: str) -> None:
         self.typed.append(target)
 
     async def send(self, target: str, text: str) -> dict:

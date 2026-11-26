@@ -83,6 +83,12 @@ _TRUTH_MARKERS = (
     "no live run",
 )
 
+def _bounded_stored_reason(value: Any) -> str | None:
+    """Keep a durable deny reason bounded when it is projected to the model."""
+    text = str(value or "").strip()
+    return text[:500] if text else None
+
+
 _STATUS_COPY: dict[str, str] = {
     "created": "created",
     "updated": "updated",
@@ -113,6 +119,9 @@ class ScheduleOutcome:
     approval_id: str | None = None
     proposal_id: str | None = None
     message: str = ""
+    # The reason a human gave when denying the card. It is read from the
+    # approval row at resolution time, so it is never taken from model output.
+    deny_reason: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -129,6 +138,9 @@ class ScheduleOutcome:
             "proposal_id": self.proposal_id,
             "message": self.message,
         }
+        reason = _bounded_stored_reason(self.deny_reason)
+        if reason:
+            data["deny_reason"] = reason
         if self.detail:
             data["detail"] = dict(self.detail)
         return data
@@ -188,10 +200,11 @@ async def resolve_outcome_truth(outcome: ScheduleOutcome) -> ScheduleOutcome:
 
     status = outcome.status
     operation = outcome.operation
+    deny_reason = _bounded_stored_reason(outcome.deny_reason)
 
     if outcome.approval_id:
         row = await db.fetchone(
-            "SELECT status FROM approvals WHERE id=?", (outcome.approval_id,)
+            "SELECT status, deny_reason FROM approvals WHERE id=?", (outcome.approval_id,)
         )
         if row is not None:
             approval_status = str(row["status"] or "")
@@ -199,6 +212,8 @@ async def resolve_outcome_truth(outcome: ScheduleOutcome) -> ScheduleOutcome:
                 status = _success_status(operation)
             elif approval_status == "denied":
                 status = "denied"
+                # The human's reason is durable truth, not model narration.
+                deny_reason = _bounded_stored_reason(row["deny_reason"]) or deny_reason
             elif approval_status in ("expired", "stale"):
                 status = "timed_out" if approval_status == "expired" else "stale"
             elif approval_status == "pending":
@@ -222,7 +237,7 @@ async def resolve_outcome_truth(outcome: ScheduleOutcome) -> ScheduleOutcome:
             else:
                 status = "failed"
 
-    if status == outcome.status:
+    if status == outcome.status and deny_reason == outcome.deny_reason:
         return outcome
     return ScheduleOutcome(
         operation=operation,
@@ -232,6 +247,7 @@ async def resolve_outcome_truth(outcome: ScheduleOutcome) -> ScheduleOutcome:
         approval_id=outcome.approval_id,
         proposal_id=outcome.proposal_id,
         message=outcome.message,
+        deny_reason=deny_reason,
         detail=dict(outcome.detail),
     )
 
@@ -262,6 +278,10 @@ def summary_line(outcome: ScheduleOutcome) -> str:
         line += f" (approval {outcome.approval_id})"
     elif outcome.message:
         line += f" ({outcome.message})"
+    if outcome.status == "denied":
+        reason = _bounded_stored_reason(outcome.deny_reason)
+        if reason:
+            line += f" (reason: {reason})"
     return line
 
 

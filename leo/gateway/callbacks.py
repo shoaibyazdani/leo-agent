@@ -402,6 +402,11 @@ async def _resolve_schedule_tap(
             choice=choice,
             resolver=actor,
             confirm_proposal_digest=str(row["digest"] or ""),
+            # A button tap carries no free text. Record that explicitly so a
+            # denial never looks like a reason the human actually supplied.
+            deny_reason=(
+                "no reason supplied" if choice == "deny" else None
+            ),
         )
     except PermissionError as exc:
         await reply(str(exc))

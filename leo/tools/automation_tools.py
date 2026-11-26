@@ -356,6 +356,11 @@ async def _run_now(args: dict[str, Any], ctx: dict[str, Any], registered: Any) -
             request_key=request_key,
             actor=ctx.get("actor"),
             turn=_turn(ctx),
+            authorized_by=(
+                str(ctx.get("authorization"))
+                if ctx.get("authorization")
+                else None
+            ),
         )
     except (ScheduleServiceError, ValueError, KeyError) as exc:
         _fail(exc, "run_now", name=name)
@@ -372,6 +377,11 @@ async def _cancel(args: dict[str, Any], ctx: dict[str, Any], registered: Any) ->
             task_id=str(task_id) if task_id else None,
             actor=ctx.get("actor"),
             turn=_turn(ctx),
+            authorized_by=(
+                str(ctx.get("authorization"))
+                if ctx.get("authorization")
+                else None
+            ),
         )
     except (ScheduleServiceError, ValueError, KeyError) as exc:
         _fail(exc, "cancel", name=name)

@@ -31,7 +31,11 @@ from ..contracts import surface_capabilities
 # and an unbounded one keeps the worker's lease (and its typing pulse) alive.
 DELIVERY_TIMEOUT_SECONDS = 45.0
 from ..integrations.channels import default_adapters, polling_channels
-from ..integrations.messaging import AdapterCapabilities, implements_polling
+from ..integrations.messaging import (
+    TELEGRAM_MAX_CHARS,
+    AdapterCapabilities,
+    implements_polling,
+)
 from ..integrations.secrets import credential
 from ..integrations.transcription import VOICE_UNAVAILABLE_NOTE
 from ..integrations.transport_state import TransportState
@@ -216,14 +220,14 @@ def create_api(
         """
         while True:
             try:
-                await adapter.typing(subject)
+                await adapter.send_typing(subject)
             except Exception:  # cosmetic only: never fail a turn for a typing hint
                 pass
             await asyncio.sleep(interval)
 
     def _start_typing(admission_id: str, channel: str, subject: str) -> None:
         adapter = channels.get(channel)
-        if adapter is None or not hasattr(adapter, "typing"):
+        if adapter is None or not hasattr(adapter, "send_typing"):
             return
         previous = typing_tasks.pop(admission_id, None)
         if previous is not None:
@@ -532,13 +536,30 @@ def create_api(
                         "approval_id": request.approval_id}
             if not proposal_digest_matches({"digest": record["digest"]}, request.confirm_proposal_digest):
                 raise HTTPException(409, "proposal digest does not match the presented card")
+            text = str(request.text or "")
+            if (
+                str(record["channel"]) == "telegram"
+                and len(text) > TELEGRAM_MAX_CHARS
+            ):
+                # Mirror the tap path: never silently clip a frozen card body.
+                # The full terminal text remains in the durable approval row
+                # and the dashboard; this rewrite is only a short pointer.
+                lines = text.splitlines()
+                title = lines[0].strip() if lines else "⏰ Schedule approval"
+                verdict = lines[-1].strip() if len(lines) > 1 else ""
+                text = "\n".join([
+                    title or "⏰ Schedule approval",
+                    f"id: {request.approval_id}",
+                    "Full approval text is in the LEO dashboard.",
+                    verdict,
+                ]).rstrip()
             adapter = channels.get(str(record["channel"]))
             edit = getattr(adapter, "edit_message_text", None)
             if not callable(edit) or not str(record["message_id"]):
                 raise HTTPException(409, "channel cannot rewrite a presented card")
             try:
                 updated = bool(await asyncio.wait_for(
-                    edit(record["target"], record["message_id"], request.text,
+                    edit(record["target"], record["message_id"], text,
                          {"inline_keyboard": []}),
                     timeout=DELIVERY_TIMEOUT_SECONDS,
                 ))

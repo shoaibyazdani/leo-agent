@@ -93,6 +93,30 @@ def test_home_all_and_named_local_forms_use_configured_context() -> None:
     assert local.delivery_plan.targets[0].kind == "local"
 
 
+def test_home_channels_preserve_colon_bearing_matrix_room_ids() -> None:
+    settings = _settings(home_channels=["matrix:!ops:example.org", "telegram:900:7"])
+    context = _resolve(settings, adapters={
+        "matrix": SimpleNamespace(supports_rooms=True),
+        "telegram": SimpleNamespace(),
+    })
+    assert context.home_channels[0].platform == "matrix"
+    assert context.home_channels[0].chat_id == "!ops:example.org"
+    assert context.home_channels[0].thread_id is None
+    # The ordinary chat[:thread] grammar still works on other platforms.
+    assert context.home_channels[1].chat_id == "900"
+    assert context.home_channels[1].thread_id == "7"
+
+    from leo.schedules.delivery import DeliveryResolver
+
+    home = DeliveryResolver(context).resolve("home")
+    assert home.identities == (("matrix", "!ops:example.org", None),)
+    all_homes = DeliveryResolver(context).resolve("all")
+    assert all_homes.identities == (
+        ("matrix", "!ops:example.org", None),
+        ("telegram", "900", "7"),
+    )
+
+
 def test_origin_uses_trusted_turn_identity_not_a_body_field() -> None:
     settings = _settings()
     turn = SimpleNamespace(conversation_id="c-1", thread_id="44", channel="telegram")

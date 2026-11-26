@@ -18,9 +18,14 @@ from leo import db
 from leo.config import Settings
 from leo.contracts import TurnContext
 from leo.events import EventBus
-from leo.security.approval_cards import KIND_SCHEDULE_CREATE, KIND_SCHEDULE_EDIT
+from leo.security.approval_cards import (
+    DECLINE_MESSAGES,
+    KIND_SCHEDULE_CREATE,
+    KIND_SCHEDULE_EDIT,
+)
 from leo.security.permissions import PermissionManagerImpl
 from leo.schedules.clock import FrozenClock
+from leo.schedules.compiler import ScheduleCompileError
 from leo.schedules.service import ScheduleService, ScheduleServiceError
 from leo.schedules.store import ScheduleStore
 from leo.tasks import DurableTaskEngine, Scheduler
@@ -282,7 +287,7 @@ async def test_edit_card_commit_cas_and_revision_bump(env):
     assert await db.fetchall("SELECT id FROM approval_grants") == []
 
 
-async def test_stale_edit_card_commit_rolls_back_and_stays_pending(env):
+async def test_stale_edit_card_commit_expires_as_a_stale_edit(env):
     created = await _create_operator(env, name="job", schedule="1h", prompt="a")
     assert created["status"] == "created"
     pending = await env.service.update(
@@ -296,18 +301,46 @@ async def test_stale_edit_card_commit_rolls_back_and_stays_pending(env):
         name="job", arguments={"prompt": "c"},
         actor="operator:cli", turn=_operator(),
     )
-    with pytest.raises(ScheduleServiceError) as excinfo:
-        await _resolve(
-            env, card["approval_id"], choice="once",
-            digest=card["proposal_digest"],
-        )
-    assert excinfo.value.code == "stale_update"
+    resolved = await _resolve(
+        env, card["approval_id"], choice="once",
+        digest=card["proposal_digest"],
+    )
+    # A CAS loss at commit time is an expired edit, not an exception that
+    # leaves the card pending forever.
+    assert resolved.status == "expired" and resolved.allowed is False
+    assert resolved.decline_message == DECLINE_MESSAGES["stale_edit"]
     approval = await db.fetchone(
         "SELECT status, answered_at FROM approvals WHERE id=?", (card["approval_id"],)
     )
-    assert approval["status"] == "pending" and approval["answered_at"] is None
+    assert approval["status"] == "expired" and approval["answered_at"] is not None
+    proposal = await db.fetchone(
+        "SELECT status FROM schedule_proposals WHERE id=?", (card["proposal_id"],)
+    )
+    assert proposal["status"] == "expired"
     row = await db.fetchone("SELECT config_revision FROM schedules WHERE name='job'")
     assert row["config_revision"] == 2  # only the direct operator edit committed
+
+
+async def test_edit_card_for_removed_schedule_expires_as_a_stale_edit(env):
+    """unknown_schedule at commit time must not leave a pending card either."""
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    pending = await env.service.update(
+        name="job", arguments={"prompt": "b"},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    await env.service.remove(
+        name="job", actor="operator:cli", turn=_operator()
+    )
+    resolved = await _resolve(
+        env, pending["card"]["approval_id"], choice="once",
+        digest=pending["card"]["proposal_digest"],
+    )
+    assert resolved.status == "expired"
+    assert resolved.decline_message == DECLINE_MESSAGES["stale_edit"]
+    approval = await db.fetchone(
+        "SELECT status FROM approvals WHERE id=?", (pending["approval_id"],)
+    )
+    assert approval["status"] == "expired"
 
 
 async def test_noop_update_does_not_reanchor_or_reserve(env):
@@ -396,14 +429,195 @@ async def test_run_now_creates_a_manual_task_and_cancel_stops_it(env):
     created = await _create_operator(env, name="job", schedule="1h", prompt="run")
     assert created["status"] == "created"
     before = await db.fetchone("SELECT next_run_at, claimed_count FROM schedules WHERE name='job'")
-    run = await env.service.run_now(name="job", actor="chat:web", turn=_chat("tui"))
+    run = await env.service.run_now(name="job", actor="operator:cli", turn=_operator())
     assert run["status"] == "running" and run["manual_run"] is True
     task = await env.engine.get(run["task_id"])
     assert task is not None and task.metadata.get("manual_run") is True
     after = await db.fetchone("SELECT next_run_at, claimed_count FROM schedules WHERE name='job'")
     assert dict(after) == dict(before)
 
-    cancelled = await env.service.cancel(name="job", actor="chat:web", turn=_chat("tui"))
+    cancelled = await env.service.cancel(name="job", actor="operator:cli", turn=_operator())
     assert cancelled["status"] == "cancelled"
     assert (await env.engine.get(run["task_id"])).status.value == "cancelled"
     assert await db.fetchone("SELECT id FROM schedules WHERE name='job'") is not None
+
+
+@pytest.mark.parametrize("source", ["scheduled", "unattended", "agent"])
+async def test_create_grant_cannot_write_silently_in_unattended_turns(env, source):
+    """A session grant must not be inherited by a scheduled/agent run."""
+    first = await env.service.create(
+        {"name": "one", "schedule": "1h", "prompt": "a"},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    resolved = await _resolve(
+        env, first["approval_id"], choice="session",
+        digest=first["card"]["proposal_digest"],
+    )
+    assert resolved.grant_id
+
+    unattended = TurnContext(
+        principal="chat:web", channel="scheduled", conversation_id="conv-a",
+        surface="scheduled", origin="scheduled", source=source,
+    )
+    second = await env.service.create(
+        {"name": "two", "schedule": "1h", "prompt": "b"},
+        actor="chat:web", turn=unattended,
+    )
+    assert second["status"] == "approval_required"
+    assert second["card"] is None
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='two'") is None
+    assert len(await db.fetchall("SELECT id FROM approvals")) == 1
+
+
+async def test_edit_card_of_disabled_schedule_expires_instead_of_committing(env):
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    await env.service.update(
+        name="job", arguments={"paused": True, "paused_reason": "hold"},
+        actor="operator:cli", turn=_operator(),
+    )
+    pending = await env.service.update(
+        name="job", arguments={"prompt": "b"}, actor="chat:web", turn=_chat("tui")
+    )
+    resolved = await _resolve(
+        env, pending["card"]["approval_id"], choice="once",
+        digest=pending["card"]["proposal_digest"],
+    )
+    assert resolved.status == "expired"
+    assert resolved.decline_message == DECLINE_MESSAGES["stale_edit"]
+    row = await db.fetchone("SELECT payload FROM schedules WHERE name='job'")
+    assert json.loads(row["payload"])["objective"] == "a"
+
+
+async def test_model_turns_cannot_fire_or_kill_runs(env):
+    await _create_operator(env, name="job", schedule="1h", prompt="run")
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="job", prompt="unasked", actor="chat:web", turn=_chat("tui")
+        )
+    assert caught.value.code == "operator_required"
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.cancel(name="job", actor="chat:web", turn=_chat("tui"))
+    assert caught.value.code == "operator_required"
+    assert await db.fetchall("SELECT id FROM tasks") == []
+
+
+async def test_approved_edit_card_authorizes_manual_run_and_cancel(env):
+    await _create_operator(env, name="job", schedule="1h", prompt="run")
+    pending = await env.service.update(
+        name="job", arguments={"prompt": "revised"},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    card = pending["card"]
+    resolved = await _resolve(
+        env, card["approval_id"], choice="once", digest=card["proposal_digest"]
+    )
+    assert resolved.status == "approved"
+
+    run = await env.service.run_now(
+        name="job", actor="chat:web", turn=_chat("tui"),
+        authorized_by=card["approval_id"],
+    )
+    assert run["status"] == "running"
+    cancelled = await env.service.cancel(
+        name="job", actor="chat:web", turn=_chat("tui"),
+        authorized_by=card["approval_id"],
+    )
+    assert cancelled["status"] == "cancelled"
+
+    other = await env.service.create(
+        {"name": "other", "schedule": "1h", "prompt": "x"},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=other["approval_id"],
+        )
+    assert caught.value.code == "invalid_authorization"
+
+
+async def test_recurring_card_can_be_answered_after_its_first_tick(env):
+    pending = await env.service.create(
+        {"name": "water", "schedule": "every day at 7:01am", "prompt": "Drink."},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    card = pending["card"]
+    # The shown first instant has passed, but the recurring job still has
+    # future occurrences and the approval timeout has not elapsed.
+    env.clock.advance(seconds=120)
+    resolved = await _resolve(
+        env, card["approval_id"], choice="once", digest=card["proposal_digest"]
+    )
+    assert resolved.status == "approved"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='water'") is not None
+
+
+async def test_one_shot_card_still_stales_after_its_instant(env):
+    pending = await env.service.create(
+        {"name": "dentist", "schedule": "in 3m", "prompt": "Call."},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    card = pending["card"]
+    env.clock.advance(seconds=240)
+    resolved = await _resolve(
+        env, card["approval_id"], choice="once", digest=card["proposal_digest"]
+    )
+    assert resolved.status == "expired"
+    assert resolved.decline_message == DECLINE_MESSAGES["stale_create"]
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='dentist'") is None
+
+
+async def test_replayed_denial_tells_the_model_the_human_reason(env):
+    arguments = {"name": "water", "schedule": "in 2h", "prompt": "Drink water."}
+    pending = await env.service.create(
+        arguments, actor="chat:web", turn=_chat("tui"),
+        request_key="req-denied-with-reason",
+    )
+    card = pending["card"]
+    await env.permissions.resolve_schedule_card(
+        card["approval_id"], choice="deny", resolver="operator:local",
+        confirm_proposal_digest=card["proposal_digest"],
+        commit=env.service.commit, deny_reason="owner said no",
+    )
+    replay = await env.service.create(
+        arguments, actor="chat:web", turn=_chat("tui"),
+        request_key="req-denied-with-reason",
+    )
+    assert replay["status"] == "denied"
+    assert replay["deny_reason"] == "owner said no"
+
+
+async def test_create_card_discloses_catch_up_pinned_target_and_unlimited_runs(env):
+    env.service.pinned_provider = "provider-x"
+    env.service.pinned_model = "model-y"
+    out = await env.service.create(
+        {
+            "name": "brief", "schedule": "every day at 8am", "prompt": "Brief.",
+            "catch_up": False, "pinned": True,
+        },
+        actor="chat:web", turn=_chat("tui"),
+    )
+    body = out["card"]["body"]
+    assert "runs forever" in body
+    assert "skip missed runs (at most one run after downtime)" in body
+    assert "pinned to provider-x/model-y" in body
+
+
+async def test_service_rejects_a_skill_the_live_registry_does_not_know(env):
+    async def _skills():
+        return [SimpleNamespace(name="maps", documentation="Map documentation.")]
+
+    env.service.skills = SimpleNamespace(list=_skills)
+    known = await env.service.create(
+        {"name": "known", "schedule": "in 2h", "prompt": "Brief.", "skills": ["maps"]},
+        actor="chat:web", turn=_chat("tui"),
+    )
+    assert known["status"] == "approval_required"
+
+    with pytest.raises(ScheduleCompileError) as caught:
+        await env.service.create(
+            {"name": "ghost", "schedule": "in 2h", "prompt": "Brief.", "skills": ["ghost"]},
+            actor="chat:web", turn=_chat("tui"),
+        )
+    assert caught.value.code == "unknown_skill"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='ghost'") is None

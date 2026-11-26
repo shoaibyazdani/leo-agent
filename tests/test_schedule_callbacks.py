@@ -256,3 +256,9 @@ async def test_the_schedule_resolution_audit_names_the_choice(env) -> None:
     metadata = json.loads(row["metadata"])
     assert metadata["choice"] == "deny"
     assert metadata["resolver"] == f"telegram-button:{OWNER}"
+    # A button carries no free text; the gap is recorded explicitly so the
+    # model is not told a reason the human never supplied.
+    row = await db.fetchone(
+        "SELECT deny_reason FROM approvals ORDER BY created_at DESC LIMIT 1"
+    )
+    assert row is not None and row["deny_reason"] == "no reason supplied"

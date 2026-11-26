@@ -41,7 +41,7 @@ async def test_telegram_typing_posts_send_chat_action(monkeypatch):
     requests: list[httpx.Request] = []
     adapter = _telegram(requests)
 
-    await adapter.typing("100000001")
+    await adapter.send_typing("100000001")
 
     assert len(requests) == 1
     assert requests[0].url.path.endswith("/sendChatAction")
@@ -53,14 +53,41 @@ async def test_base_adapter_typing_is_a_no_op():
     class _Silent(MessagingAdapter):
         channel = "silent"
 
-    assert await _Silent().typing("anyone") is None
+    assert await _Silent().send_typing("anyone") is None
+
+
+async def test_one_typing_api_is_exposed_on_adapters_and_gateway() -> None:
+    """The old adapter.typing name must not survive a merge beside send_typing."""
+    assert hasattr(MessagingAdapter, "send_typing")
+    assert hasattr(TelegramAdapter, "send_typing")
+    assert not hasattr(MessagingAdapter, "typing")
+    assert not hasattr(TelegramAdapter, "typing")
+
+    class _Recorder(MessagingAdapter):
+        channel = "recorder"
+
+        def __init__(self) -> None:
+            self.targets: list[str] = []
+
+        async def send_typing(self, target: str) -> None:
+            self.targets.append(target)
+
+    adapter = _Recorder()
+    gateway = Gateway(
+        {"recorder": adapter},
+        events=EventBus(persist=False),
+        permissions=_AllowAll(),
+        admission=ChannelAdmission(ChannelsConfig(default_mode="open")),
+    )
+    await gateway.typing("recorder", "42")
+    assert adapter.targets == ["42"]
 
 
 async def test_typing_failure_does_not_block_the_reply():
     class _BrokenTyping(MessagingAdapter):
         channel = "broken"
 
-        async def typing(self, target: str) -> None:
+        async def send_typing(self, target: str) -> None:
             raise RuntimeError("indicator down")
 
         async def send(self, target: str, text: str) -> dict:

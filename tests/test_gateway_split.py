@@ -10,6 +10,7 @@ completed turn is terminal.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 import httpx
 import pytest
@@ -235,7 +236,7 @@ class _TypingAdapter(_FakeAdapter):
         super().__init__()
         self.pulses = 0
 
-    async def typing(self, target: str) -> dict:
+    async def send_typing(self, target: str) -> dict:
         self.pulses += 1
         return {"ok": True}
 
@@ -507,6 +508,148 @@ async def _schedule_card(permissions, body='Schedule "Water" (daily): Drink wate
     )
 
 
+def _schedule_service(permissions, settings, clock):
+    """A service wired to the same durable store the gateway reads."""
+    from leo.events import EventBus
+    from leo.schedules.clock import FrozenClock
+    from leo.schedules.service import ScheduleService
+    from leo.schedules.store import ScheduleStore
+    from leo.tasks import DurableTaskEngine, Scheduler
+
+    events = EventBus()
+    engine = DurableTaskEngine(settings, events)
+    scheduler = Scheduler(engine, settings, events, clock=clock)
+    store = ScheduleStore(clock=clock)
+    return ScheduleService(
+        store=store, scheduler=scheduler, engine=engine, permissions=permissions,
+        events=events, settings=settings, clock=clock,
+    )
+
+
+def _gateway_turn() -> object:
+    from leo.contracts import TurnContext
+
+    return TurnContext(
+        principal="chat:telegram", channel="telegram", surface="telegram",
+        conversation_id="conv-gw", source="chat",
+    )
+
+
+async def _independent_approval_row(approval_id: str):
+    """Read with a fresh connection: inside a write txn this sees no row."""
+    import aiosqlite
+
+    from leo import db
+
+    conn = await aiosqlite.connect(db.get_db_path(), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        return await (
+            await conn.execute(
+                "SELECT id, status, shown_at, digest FROM approvals WHERE id=?",
+                (approval_id,),
+            )
+        ).fetchone()
+    finally:
+        await conn.close()
+
+
+async def test_create_commits_proposal_and_card_before_split_gateway_presentation() -> None:
+    """The gateway's second SQLite connection must see the card during create."""
+    from datetime import datetime, timezone
+
+    from leo import db
+    from leo.gateway.server import GatewayStore
+    from leo.schedules.clock import FrozenClock
+    from leo.security.approval_cards import presenting_cards_via
+
+    permissions, settings = _schedule_permissions()
+    clock = FrozenClock(datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc))
+    service = _schedule_service(permissions, settings, clock)
+    store = GatewayStore()
+    adapter = _CardAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000001", payload=payload("schedule it"),
+        principal="100000001", thread_id="77",
+    )
+
+    seen: list[str] = []
+    async with _client(api) as client:
+        await store.claim("worker", lease_seconds=60)
+
+        async def present(approval_id: str, surface: str) -> bool:
+            row = await _independent_approval_row(approval_id)
+            assert row is not None, "approval not visible to a second connection"
+            assert row["status"] == "pending"
+            seen.append(str(row["digest"]))
+            response = await client.post("/v1/approval/present", json={
+                "admission_id": admission_id, "approval_id": approval_id,
+                "confirm_proposal_digest": row["digest"],
+            })
+            assert response.status_code == 200, response.text
+            return True
+
+        with presenting_cards_via(present):
+            out = await service.create(
+                {"name": "water", "schedule": "every day at 8am", "prompt": "Drink water."},
+                actor="chat:telegram", turn=_gateway_turn(),
+            )
+
+    assert out["status"] == "approval_required"
+    card = out["card"]
+    assert seen == [card["proposal_digest"]]
+    assert len(adapter.sent) == 1 and card["approval_id"] in adapter.sent[0][1]
+    row = await db.fetchone(
+        "SELECT status, shown_at FROM approvals WHERE id=?", (card["approval_id"],)
+    )
+    assert row["status"] == "pending" and row["shown_at"]
+    proposal = await db.fetchone(
+        "SELECT status FROM schedule_proposals WHERE id=?", (card["proposal_id"],)
+    )
+    assert proposal is not None and proposal["status"] == "pending"
+    # The card is resolvable from another process once the human taps it.
+    resolution = await permissions.resolve_schedule_card(
+        card["approval_id"], choice="once", resolver="telegram-button:100000001",
+        confirm_proposal_digest=card["proposal_digest"], commit=service.commit,
+    )
+    assert resolution.status == "approved"
+
+
+async def test_create_preserves_the_proposal_when_the_presenter_fails() -> None:
+    """A transport failure must not roll back the human's committed proposal."""
+    from datetime import datetime, timezone
+
+    from leo import db
+    from leo.schedules.clock import FrozenClock
+    from leo.security.approval_cards import presenting_cards_via
+
+    permissions, settings = _schedule_permissions()
+    clock = FrozenClock(datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc))
+    service = _schedule_service(permissions, settings, clock)
+    observed: list[str] = []
+
+    async def broken_presenter(approval_id: str, surface: str) -> bool:
+        row = await _independent_approval_row(approval_id)
+        assert row is not None, "approval not visible to a second connection"
+        observed.append(str(row["status"]))
+        raise RuntimeError("gateway is down")
+
+    with presenting_cards_via(broken_presenter):
+        with pytest.raises(PermissionError, match="card presentation failed"):
+            await service.create(
+                {"name": "water", "schedule": "every day at 8am", "prompt": "Drink water."},
+                actor="chat:telegram", turn=_gateway_turn(),
+            )
+
+    assert observed == ["pending"]
+    approval = await db.fetchone("SELECT status, shown_at FROM approvals")
+    proposal = await db.fetchone("SELECT status, active_name FROM schedule_proposals")
+    assert approval is not None and approval["status"] == "pending"
+    assert approval["shown_at"] is None
+    assert proposal is not None and proposal["active_name"] == "water"
+
+
 async def test_health_advertises_the_card_protocol_only_for_capable_channels() -> None:
     from leo.gateway.server import APPROVAL_RPC_PROTOCOL
     from leo.integrations.messaging import TelegramAdapter
@@ -767,3 +910,43 @@ async def test_gateway_refuses_a_card_that_exceeds_the_channel_limit() -> None:
         })
     assert response.status_code == 409
     assert adapter.sent == []
+
+
+async def test_oversized_terminal_rewrite_degrades_to_a_dashboard_pointer() -> None:
+    """A 502 is not an acceptable answer to a frozen card that cannot fit."""
+    from leo.integrations.messaging import TELEGRAM_MAX_CHARS
+
+    permissions, _ = _schedule_permissions()
+    card = await _schedule_card(permissions)
+    store = GatewayStore()
+    adapter = _CardAdapter()
+    api = _api(store, adapters={"telegram": adapter})
+    admission_id, _ = await store.admit(
+        channel="telegram", subject="100000001", payload=payload(),
+        principal="100000001", thread_id="77",
+    )
+    await store.claim("worker", lease_seconds=60)
+    async with _client(api) as client:
+        presented = await client.post("/v1/approval/present", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+        })
+        assert presented.status_code == 200
+        await client.post("/v1/approval/ack", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+        })
+        rewritten = await client.post("/v1/approval/update", json={
+            "admission_id": admission_id, "approval_id": card.approval_id,
+            "confirm_proposal_digest": "gw-card",
+            "text": "⏰ Schedule approval\n" + ("X" * (TELEGRAM_MAX_CHARS + 100))
+                    + "\n\napproved · once",
+        })
+
+    assert rewritten.status_code == 200
+    assert rewritten.json()["updated"] is True
+    assert len(adapter.edits) == 1
+    text = adapter.edits[0][2]
+    assert len(text) <= TELEGRAM_MAX_CHARS
+    assert "Full approval text is in the LEO dashboard." in text
+    assert "approved · once" in text
+    assert "X" * 100 not in text

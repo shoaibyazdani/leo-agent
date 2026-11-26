@@ -45,6 +45,11 @@ ErrorCode = Literal[
     "no_schedule_match",
 ]
 
+# Ten years is far beyond any useful cadence and stays comfortably inside
+# ``timedelta``'s ~2.7-million-year range, so an absurd model-supplied count
+# cannot overflow the interval/one-shot arithmetic downstream.
+_MAX_DURATION_MINUTES = 10 * 365 * 24 * 60
+
 _DURATION_UNITS: dict[str, int] = {
     "m": 1,
     "min": 1,
@@ -145,6 +150,10 @@ def _error(code: ErrorCode, message: str) -> ScheduleGrammarError:
     return ScheduleGrammarError(code, message)
 
 
+class _DurationTooLarge(ScheduleGrammarError):
+    """Internal marker so schedule fallback parsing keeps the duration code."""
+
+
 # ---------------------------------------------------------------------------
 # Duration and clock parsing
 # ---------------------------------------------------------------------------
@@ -169,7 +178,13 @@ def parse_duration(text: Any) -> int:
             "Use '30m', '2h', '1d', or a bare unit such as 'hour'.",
         )
     count = int(match.group("count")) if match.group("count") else 1
-    return count * _DURATION_UNITS[match.group("unit")]
+    minutes = count * _DURATION_UNITS[match.group("unit")]
+    if minutes > _MAX_DURATION_MINUTES:
+        raise _DurationTooLarge(
+            "invalid_duration",
+            "Invalid duration: the interval is too large. Use at most about 10 years.",
+        )
+    return minutes
 
 
 def parse_clock_time(text: str) -> tuple[int, int] | None:
@@ -720,7 +735,10 @@ def parse_schedule(
                 "invalid_duration",
                 f"Invalid duration {duration_text!r} after 'in '. Use 'in 30m' or 'in 2h'.",
             ) from None
-        run_at = now_utc + timedelta(minutes=minutes)
+        try:
+            run_at = now_utc + timedelta(minutes=minutes)
+        except OverflowError:
+            raise _error("invalid_duration", "Invalid duration: the instant is out of range.") from None
         return ParsedSchedule(
             kind="once",
             expression="",
@@ -731,6 +749,8 @@ def parse_schedule(
 
     try:
         minutes = parse_duration(text)
+    except _DurationTooLarge:
+        raise
     except ScheduleGrammarError:
         raise _error(
             "invalid_schedule",
@@ -834,7 +854,10 @@ def next_occurrence(parsed: ParsedSchedule, after: datetime) -> datetime:
         return parsed.run_at
     if parsed.kind == "interval":
         # Interval expressions are canonical seconds (new and legacy rows).
-        return after_utc + timedelta(seconds=float(parsed.expression))
+        try:
+            return after_utc + timedelta(seconds=float(parsed.expression))
+        except OverflowError:
+            raise _error("invalid_duration", "Invalid duration: the interval is out of range.") from None
     if parsed.cron is None:
         raise _error("invalid_schedule", "A cron schedule requires a cron expression.")
     return next_cron_instant(parsed.cron, ZoneInfo(parsed.timezone), after_utc)

@@ -138,6 +138,24 @@ def test_explicit_platform_chat_thread_and_origin_thread_adoption() -> None:
     assert no_adoption.identities == (("slack", "123", None),)
 
 
+def test_matrix_room_ids_keep_their_colons_in_explicit_and_token_targets() -> None:
+    context = _context(
+        connected_platforms=frozenset({"telegram", "slack", "matrix"}),
+        home_channels=(
+            HomeChannel("matrix", "!ops:example.org"),
+            HomeChannel("telegram", "999"),
+        ),
+    )
+    structured = _resolve(
+        {"platform": "matrix", "chat_id": "!ops:example.org"}, context=context
+    )
+    assert structured.identities == (("matrix", "!ops:example.org", None),)
+    assert structured.routes[0].resolved_from == "explicit"
+
+    token = _resolve("matrix:!ops:example.org", context=context)
+    assert token.identities == (("matrix", "!ops:example.org", None),)
+
+
 def test_bare_platform_home_and_origin_fallback() -> None:
     telegram = _resolve("telegram")
     assert telegram.identities == (("telegram", "999", None),)

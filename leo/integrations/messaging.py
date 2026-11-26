@@ -530,7 +530,7 @@ class MessagingAdapter:
     def verify_webhook(self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None) -> bool:
         raise NotImplementedError
 
-    async def typing(self, target: str) -> None:
+    async def send_typing(self, target: str) -> None:
         """Best-effort 'is typing' indicator. Channels without one do nothing."""
         return None
 
@@ -581,7 +581,7 @@ class MessagingAdapter:
         """
         raise MessagingError(f"{self.channel} does not support outbound media")
 
-    async def typing(self, target: str) -> None:
+    async def send_typing(self, target: str) -> None:
         """sendChatAction(typing). Cosmetic: failures are swallowed by the caller."""
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -783,6 +783,7 @@ class TelegramAdapter(MessagingAdapter):
     async def send(
         self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None,
         reply_to: str | None = None,
+        thread_id: str | None = None,
         silent: bool = False,
         plain_text: bool = False,
 
@@ -807,6 +808,7 @@ class TelegramAdapter(MessagingAdapter):
                 token, target, chunk, reply_markup=keyboard, silent=silent,
                 plain=plain_text,
                 reply_to=reply_to if index == 0 else None,
+                thread_id=thread_id,
             )
             if index + 1 < len(chunks):
                 _LOG.info("telegram long message split", extra={
@@ -903,12 +905,14 @@ class TelegramAdapter(MessagingAdapter):
         reply_markup: dict[str, Any] | None = None,
         silent: bool = False,
         reply_to: str | None = None,
-        *, plain: bool = False,
+        *, plain: bool = False, thread_id: str | None = None,
 
     ) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
         payload: dict[str, Any] = {"chat_id": str(target), "text": text}
+        if thread_id not in (None, ""):
+            payload["message_thread_id"] = str(thread_id)
         if not plain:
             payload["parse_mode"] = TELEGRAM_PARSE_MODE
         if reply_markup:

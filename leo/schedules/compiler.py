@@ -125,6 +125,17 @@ def _fail(code: str, message: str, *, field: str | None = None) -> ScheduleCompi
     return ScheduleCompileError(code, message, field=field)
 
 
+def _stored_moment(value: Any) -> datetime:
+    """Parse a durable timestamp without leaking a raw ValueError to callers."""
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        raise _fail(
+            "invalid_schedule", "Stored schedule has an invalid timestamp.",
+            field="schedule",
+        ) from None
+
+
 @dataclass(frozen=True)
 class CompileResult:
     """Validated output, still not persisted."""
@@ -187,6 +198,7 @@ class ScheduleCompiler:
         pinned_provider: str | None = None,
         pinned_model: str | None = None,
         skill_docs: Mapping[str, str] | None = None,
+        known_skills: Sequence[str] | None = None,
         delivery_context: DeliveryContext | None = None,
         max_prompt_chars: int = 20_000,
         max_name_chars: int = 200,
@@ -226,6 +238,13 @@ class ScheduleCompiler:
         self.skill_docs = (
             {str(key): str(value) for key, value in skill_docs.items()}
             if skill_docs is not None
+            else None
+        )
+        # A live registry gives us authority to reject invented skill names;
+        # compiler-only callers with no registry keep the legacy permissive path.
+        self.known_skills = (
+            frozenset(str(name) for name in known_skills)
+            if known_skills is not None
             else None
         )
         self.delivery_context = delivery_context or DeliveryContext()
@@ -355,6 +374,15 @@ class ScheduleCompiler:
         warnings: list[str] = []
         repeat_limit = self._merged_repeat(args, base, parsed, operation=operation)
         execution = self._merged_execution(args, base, parsed, operator=operator)
+
+        if self.known_skills is not None:
+            for skill in execution.skills:
+                if skill not in self.known_skills:
+                    raise _fail(
+                        "unknown_skill",
+                        f"Unknown skill {skill!r}; it is not in the live skill registry.",
+                        field="skills",
+                    )
 
         if execution.no_agent and not execution.script:
             raise _fail(
@@ -576,7 +604,7 @@ class ScheduleCompiler:
             run_at = expression.run_at
             if not run_at:
                 raise _fail("invalid_schedule", "Stored one-shot has no run_at.", field="schedule")
-            moment = datetime.fromisoformat(run_at)
+            moment = _stored_moment(run_at)
             if moment.tzinfo is None:
                 moment = moment.replace(tzinfo=UTC)
             parsed = ParsedSchedule(
@@ -665,13 +693,24 @@ class ScheduleCompiler:
     ) -> tuple[datetime | None, datetime | None]:
         if operation == "update" and not reanchors and current_next_run is not None:
             existing = (
-                datetime.fromisoformat(current_next_run)
+                _stored_moment(current_next_run)
                 if isinstance(current_next_run, str)
                 else current_next_run
             )
             if existing.tzinfo is None:
                 existing = existing.replace(tzinfo=UTC)
             existing = existing.astimezone(UTC)
+            if parsed.kind == "once":
+                # Keeping the old instant must not silently re-arm a stale
+                # one-shot. Operators keep the same compile-time grace as a
+                # re-anchored edit; model edits may never preserve a past time.
+                delta = (existing - now.astimezone(UTC)).total_seconds()
+                if delta < (-self.past_grace_seconds if operator else 0):
+                    raise _fail(
+                        "one_shot_in_past",
+                        "The preserved one-shot time is in the past.",
+                        field="schedule",
+                    )
             return existing, None if paused else existing
 
         try:
@@ -898,10 +937,10 @@ class ScheduleCompiler:
             )
         if "grace_minutes" in args:
             grace = self._normalize_grace_minutes(args["grace_minutes"])
-            if grace is not None and parsed.kind != "cron":
+            if grace is not None and parsed.kind not in ("cron", "interval"):
                 raise _fail(
-                    "grace_requires_cron",
-                    "grace_minutes only applies to a cron schedule.",
+                    "grace_requires_recurring",
+                    "grace_minutes only applies to a cron or interval schedule.",
                     field="grace_minutes",
                 )
             data["grace_minutes"] = grace
@@ -1491,7 +1530,7 @@ class ScheduleCompiler:
             timezone_name = expression.timezone
             run_at = expression.run_at
             if run_at:
-                moment = datetime.fromisoformat(run_at)
+                moment = _stored_moment(run_at)
                 if moment.tzinfo is None:
                     moment = moment.replace(tzinfo=UTC)
                 run_at = moment.astimezone(UTC).isoformat()

@@ -89,6 +89,37 @@ async def test_denied_approval_resolves_to_not_created() -> None:
         assert "not created" in answer and "Done" not in answer
 
 
+async def test_a_denied_outcome_exposes_the_stored_reason_to_the_model() -> None:
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db.set_db_path(Path(tmp) / "test.db")
+        await db.initialize()
+        await db.execute(
+            "INSERT INTO approvals(id,created_at,status,actor,action,resource,risk,"
+            "reason,requested_by,metadata,kind,protocol_version,proposal_id,digest,"
+            "choices,expires_at,deny_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "apr-deny-reason", NOW.isoformat(), "denied", "chat:web",
+                "schedule.create", "Water", "high", "denied", "chat:web", "{}",
+                "schedule_create", 1, "prop-reason", "digest", '["deny"]',
+                NOW.isoformat(), "the reminder is too expensive",
+            ),
+        )
+        resolved = await resolve_outcome_truth(
+            ScheduleOutcome(
+                operation="create", status="approval_required", name="Water",
+                approval_id="apr-deny-reason", proposal_id="prop-reason",
+            )
+        )
+        assert resolved.status == "denied"
+        # Both the tool-result dict and the terminal answer carry the human's
+        # words; the model may not substitute a reason of its own.
+        assert resolved.as_dict()["deny_reason"] == "the reminder is too expensive"
+        assert "reason: the reminder is too expensive" in truthful_summary([resolved])
+
+
 async def test_a_created_outcome_without_a_row_becomes_failed() -> None:
     import tempfile
     from pathlib import Path

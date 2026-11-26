@@ -723,20 +723,32 @@ class Scheduler:
             # is returned as a deferred write and committed with the task.
             cursor = scheduled_for
             skipped = 0
+            missed_one_shot = False
             plans: list[tuple[str, datetime, Any]] = []
             baseline_cache: dict[str, Any] = {}
-            occurrences = 1 if one_shot else _MAX_CATCHUP
+            # ``catch_up: false`` means one occurrence at most: the operator
+            # asked not to replay a backlog after downtime. The default keeps
+            # the bounded catch-up contract unchanged.
+            catch_up = payload.get("catch_up")
+            occurrences = (
+                1 if one_shot or catch_up is False else _MAX_CATCHUP
+            )
             for _ in range(occurrences):
                 if cursor > moment:
                     break
                 if (
                     grace_seconds is not None
-                    and not one_shot
                     and (moment - cursor).total_seconds() > grace_seconds
                 ):
                     # Operator late-run policy: an occurrence older than grace
-                    # is skipped (not replayed) and the cursor advances.
+                    # is skipped (not replayed) and the cursor advances. A
+                    # one-shot has no recurrence: it is retired as missed
+                    # below instead of being dispatched arbitrarily late.
                     plans.append(("skip", cursor, grace_seconds / 60.0))
+                    if one_shot:
+                        missed_one_shot = True
+                        cursor = None  # type: ignore[assignment]
+                        break
                     cursor = next_run(row["kind"], row["expression"], cursor)
                     continue
 
@@ -847,12 +859,22 @@ class Scheduler:
                 if one_shot:
                     # A one-shot schedule exists to fire once. Leaving it
                     # enabled made a delivered reminder repeat on the next due
-                    # slot. A suppressed occurrence is still consumed/retired.
+                    # slot. A suppressed or stale occurrence is still consumed.
                     reason = (
                         "one-shot occurrence created"
                         if claimed_any
+                        else "stale one-shot missed"
+                        if missed_one_shot
                         else "one-shot occurrence suppressed"
                     )
+                    if missed_one_shot:
+                        await self.events.emit(
+                            "schedule.missed",
+                            name=row["name"],
+                            schedule_id=row["id"],
+                            scheduled_for=scheduled_for.isoformat(),
+                            reason="outside grace window",
+                        )
                     await self._retire(row, reason=reason)
                     continue
                 if cursor is not None and cursor <= moment:

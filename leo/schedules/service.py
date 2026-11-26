@@ -64,6 +64,14 @@ from .proposals import (
 from .store import ScheduleStore
 
 _OPERATOR_PREFIX = "operator"
+# A turn with nobody watching cannot accept a silent, grant-backed schedule
+# write. This deny policy is consulted before any grant lookup.
+_UNATTENDED_TURN_SOURCES = frozenset(
+    {"scheduled", "schedule", "unattended", "agent"}
+)
+# The automation specialist's durable, exact-action mutation approval. It is
+# re-verified by the trusted specialist before it reaches this service.
+_SPECIALIST_APPROVAL_ACTION = "automation:mutate"
 _CREATE = "create"
 _UPDATE = "update"
 _REMOVE = "remove"
@@ -210,7 +218,10 @@ class ScheduleService:
         extra: dict[str, Any] = {}
         async with db.transaction():
             stored = await self._create_proposal(proposal)
-            if is_operator or await self._has_create_grant(principal, turn, actor=actor):
+            grant_authorized = not self._unattended_turn(turn) and await self._has_create_grant(
+                principal, turn, actor=actor
+            )
+            if is_operator or grant_authorized:
                 await self._commit_create(stored, actor=actor)
                 await self.store.update_proposal(
                     stored.id, status="committed", schedule_id=stored.schedule_id
@@ -224,15 +235,22 @@ class ScheduleService:
                 )
                 outcome = self._outcome(stored, "created", result.spec.name, result)
             elif self._can_answer(turn):
-                card = await self._present_create_card(stored, result, turn, actor)
+                # The proposal and its approval card commit here. Presentation
+                # follows outside this transaction: a split gateway reads the
+                # card on its own SQLite connection and cannot see an uncommitted
+                # row, so no gateway RPC may run inside a write transaction.
+                card = await self._create_create_card(stored, result, actor)
                 outcome = self._outcome(
                     stored, "approval_required", result.spec.name, result
                 )
-                extra["card"] = card.model_dump(mode="json")
             else:
                 outcome = self._outcome(
                     stored, "approval_required", result.spec.name, result
                 )
+        if card is not None:
+            # A transport failure leaves the committed proposal/card pending for
+            # another surface instead of rolling back the human's request.
+            extra["card"] = (await self._present_card(card, turn)).model_dump(mode="json")
         # Recording happens only after the transaction committed, so a failed
         # write can never be remembered as a successful schedule outcome.
         return self._finish(outcome, **extra)
@@ -315,6 +333,7 @@ class ScheduleService:
         changes = changes_between(base_spec, result.spec)
         outcome: ScheduleOutcome
         extra: dict[str, Any] = {"changes": changes}
+        card = None
 
         async with db.transaction():
             stored = await self._create_proposal(proposal)
@@ -332,17 +351,18 @@ class ScheduleService:
                 )
                 outcome = self._outcome(stored, "updated", result.spec.name, result)
             elif self._can_answer(turn):
-                card = await self._present_edit_card(
-                    stored, result, turn, actor, changes, schedule_id=view.id
+                card = await self._create_edit_card(
+                    stored, result, actor, changes, schedule_id=view.id
                 )
                 outcome = self._outcome(
                     stored, "approval_required", result.spec.name, result
                 )
-                extra["card"] = card.model_dump(mode="json")
             else:
                 outcome = self._outcome(
                     stored, "approval_required", result.spec.name, result
                 )
+        if card is not None:
+            extra["card"] = (await self._present_card(card, turn)).model_dump(mode="json")
         return self._finish(outcome, **extra)
 
     # ------------------------------------------------------------------
@@ -410,6 +430,7 @@ class ScheduleService:
         changes = ["remove this schedule"]
         outcome: ScheduleOutcome
         extra: dict[str, Any] = {"changes": changes}
+        card = None
 
         async with db.transaction():
             stored = await self._create_proposal(proposal)
@@ -430,18 +451,19 @@ class ScheduleService:
                 )
                 outcome = self._outcome(stored, "removed", view.name, None)
             elif self._can_answer(turn):
-                card = await self._present_edit_card(
-                    stored, None, turn, actor, changes,
+                card = await self._create_edit_card(
+                    stored, None, actor, changes,
                     schedule_id=view.id, config_revision=view.config_revision,
                 )
                 outcome = self._outcome(
                     stored, "approval_required", view.name, None
                 )
-                extra["card"] = card.model_dump(mode="json")
             else:
                 outcome = self._outcome(
                     stored, "approval_required", view.name, None
                 )
+        if card is not None:
+            extra["card"] = (await self._present_card(card, turn)).model_dump(mode="json")
         return self._finish(outcome, **extra)
 
     # ------------------------------------------------------------------
@@ -457,10 +479,15 @@ class ScheduleService:
         request_key: str | None = None,
         actor: str | None = None,
         turn: TurnContext | None = None,
+        authorized_by: str | None = None,
     ) -> dict[str, Any]:
         turn = turn or current_turn_context()
         actor = self._actor(actor, turn)
         view = await self._resolve_view(schedule_id=schedule_id, name=name)
+        await self._require_live_run_authorization(
+            view, actor=actor, turn=turn, authorized_by=authorized_by,
+            operation="fire",
+        )
         if not view.enabled or view.status != "active":
             raise _fail(
                 "schedule_disabled",
@@ -529,10 +556,15 @@ class ScheduleService:
         task_id: str | None = None,
         actor: str | None = None,
         turn: TurnContext | None = None,
+        authorized_by: str | None = None,
     ) -> dict[str, Any]:
         turn = turn or current_turn_context()
         actor = self._actor(actor, turn)
         view = await self._resolve_view(schedule_id=schedule_id, name=name)
+        await self._require_live_run_authorization(
+            view, actor=actor, turn=turn, authorized_by=authorized_by,
+            operation="stop",
+        )
         if task_id:
             rows = await db.fetchall(
                 "SELECT id,status,metadata FROM tasks WHERE id=?", (str(task_id),)
@@ -813,6 +845,17 @@ class ScheduleService:
         revision = int(meta.get("config_revision", expected + 1) or expected + 1)
         config = strip_commit_meta(spec.config)
         now = self._now_iso()
+        # A row disabled/retired after the card was shown cannot silently be
+        # re-enabled by an unrelated edit. A genuine resume edit (paused row,
+        # target unpaused) keeps working.
+        if current.status not in ("active", "paused") or (
+            not current.enabled and spec.paused
+        ):
+            raise _fail(
+                "stale_update",
+                "The schedule is no longer active; this edit cannot be applied.",
+                field="config_revision",
+            )
         # A paused row is not claimable because ``enabled=0``. Keeping its
         # stored instant lets an approved resume continue the same cadence
         # instead of silently re-anchoring to the resume time.
@@ -908,13 +951,13 @@ class ScheduleService:
     # ------------------------------------------------------------------
     # Cards
     # ------------------------------------------------------------------
-    async def _present_create_card(
+    async def _create_create_card(
         self,
         proposal: ScheduleProposal,
         result: CompileResult,
-        turn: TurnContext,
         actor: str,
     ) -> Any:
+        """Persist the create card inside the caller's proposal transaction."""
         spec = result.spec
         body = render_schedule_body(
             ScheduleBodySpec(
@@ -932,6 +975,10 @@ class ScheduleService:
                 context_from=spec.execution.context_from,
                 enabled_toolsets=spec.execution.enabled_toolsets,
                 attach_to_session=spec.execution.attach_to_session,
+                catch_up=spec.catch_up,
+                pinned=spec.execution.pinned,
+                pinned_provider=spec.execution.provider,
+                pinned_model=spec.execution.model,
                 delivery=delivery_description(result.delivery_plan.describe()),
                 failure_delivery=delivery_description(
                     result.failure_delivery_plan.describe()
@@ -950,27 +997,31 @@ class ScheduleService:
             run_id=proposal.run_id,
             tool_call_id=proposal.tool_call_id,
             origin=proposal.origin,
+            # First-run staleness binds one-shot consent to its one instant.
+            # A recurring job can be approved after its first tick: it has
+            # future occurrences, and the normal approval timeout still bounds
+            # the wait. Treating the first tick as a deadline declined live
+            # recurring jobs for no good reason.
             shown_first_run=(
-                result.first_run_at.isoformat() if result.first_run_at else None
+                result.first_run_at.isoformat()
+                if result.first_run_at is not None
+                and spec.expression.kind == "once"
+                else None
             ),
         )
-        return await self.permissions.present_schedule_card(
-            card.approval_id,
-            surface=str(turn.surface or turn.channel or "chat"),
-            capabilities=turn.capabilities,
-        )
+        return card
 
-    async def _present_edit_card(
+    async def _create_edit_card(
         self,
         proposal: ScheduleProposal,
         result: CompileResult | None,
-        turn: TurnContext,
         actor: str,
         changes: list[str],
         *,
         schedule_id: str,
         config_revision: int | None = None,
     ) -> Any:
+        """Persist the edit/remove card inside the caller's transaction."""
         spec = proposal.spec
         first_run = getattr(result, "first_run_at", None) if result is not None else None
         new_revision = (
@@ -996,6 +1047,10 @@ class ScheduleService:
                 else None
             ),
         )
+        return card
+
+    async def _present_card(self, card: Any, turn: TurnContext) -> Any:
+        """Present a committed card; transport calls never hold a write lock."""
         return await self.permissions.present_schedule_card(
             card.approval_id,
             surface=str(turn.surface or turn.channel or "chat"),
@@ -1061,6 +1116,17 @@ class ScheduleService:
             "expired": "timed_out",
             "failed": "failed",
         }.get(existing.status, "failed")
+        # A replayed denial must tell the model why the human said no. The
+        # reason lives on the approval row, never on the model-authored request.
+        deny_reason = None
+        if status == "denied":
+            card_row = await db.fetchone(
+                "SELECT deny_reason FROM approvals WHERE proposal_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (existing.id,),
+            )
+            if card_row is not None:
+                deny_reason = str(card_row["deny_reason"] or "").strip()[:500] or None
         outcome = ScheduleOutcome(
             operation=operation,
             status=status,
@@ -1068,6 +1134,7 @@ class ScheduleService:
             schedule_id=existing.schedule_id,
             proposal_id=existing.id,
             message=existing.error or f"proposal is {existing.status}",
+            deny_reason=deny_reason,
         )
         return self._finish(outcome, replayed=True)
 
@@ -1117,8 +1184,9 @@ class ScheduleService:
     # Authority helpers
     # ------------------------------------------------------------------
     async def _compiler(self) -> ScheduleCompiler:
+        docs, known_skills = await self._skill_snapshot_data()
         views = await self.store.list()
-        known = [view.id for view in views]
+        schedule_ids = [view.id for view in views]
         references: dict[str, Sequence[str]] = {}
         for view in views:
             spec = spec_from_view(view)
@@ -1131,35 +1199,47 @@ class ScheduleService:
             scripts_root=self.scripts_root,
             allowed_workdir_roots=self.allowed_workdir_roots,
             available_toolsets=self.available_toolsets,
-            known_schedule_ids=known,
+            known_schedule_ids=schedule_ids,
             reference_schedules=references,
             pinned_provider=self.pinned_provider,
             pinned_model=self.pinned_model,
-            skill_docs=await self._skill_docs(),
+            skill_docs=docs,
+            known_skills=known_skills,
             delivery_context=self._delivery_context(None),
         )
 
-    async def _skill_docs(self) -> dict[str, str]:
-        """Current skill documentation for the creation-time snapshot."""
+    async def _skill_snapshot_data(self) -> tuple[dict[str, str], frozenset[str] | None]:
+        """Skill docs plus the names the live registry says really exist.
+
+        ``None`` means no registry (or a failed lookup), so compilation keeps
+        its permissive legacy path: a registry outage must not block scheduling.
+        """
         if self.skills is None:
-            return {}
+            return {}, None
         lister = getattr(self.skills, "list", None)
         if not callable(lister):
-            return {}
+            return {}, None
         try:
             records = await lister()
         except Exception:  # noqa: BLE001 - a snapshot must not block scheduling
-            return {}
+            return {}, None
         docs: dict[str, str] = {}
+        names: set[str] = set()
         for record in records or []:
             name = str(getattr(record, "name", "") or "")
             if not name:
                 continue
+            names.add(name)
             documentation = str(getattr(record, "documentation", "") or "")
             description = str(getattr(record, "description", "") or "")
             text = documentation.strip() or description.strip()
             if text:
                 docs[name] = text
+        return docs, frozenset(names)
+
+    async def _skill_docs(self) -> dict[str, str]:
+        """Current skill documentation for the creation-time snapshot."""
+        docs, _ = await self._skill_snapshot_data()
         return docs
 
     def _delivery_context(self, turn: TurnContext | None) -> DeliveryContext:
@@ -1212,6 +1292,72 @@ class ScheduleService:
         return text == _OPERATOR_PREFIX or text.startswith(f"{_OPERATOR_PREFIX}:")
 
     @staticmethod
+    def _unattended_turn(turn: TurnContext | None) -> bool:
+        """Proactive/schedule deny policy for turns with no human at the gate.
+
+        Scheduled, unattended and delegated agent turns inherit the originating
+        conversation from their parent, so a session or always grant must never
+        be allowed to silently write a schedule inside them.
+        """
+        if turn is None:
+            return False
+        return str(turn.source or "").strip().lower() in _UNATTENDED_TURN_SOURCES
+
+    async def _require_live_run_authorization(
+        self,
+        view: Any,
+        *,
+        actor: str,
+        turn: TurnContext | None,
+        authorized_by: str | None,
+        operation: str,
+    ) -> None:
+        """Only an operator or a human-approved card may fire/kill runs.
+
+        A model turn may ask for a definition change, but it must not start a
+        live run with an appended prompt or cancel work unasked. Accepted cards
+        are either a schedule edit for this job or the specialist's exact-action
+        mutation approval; both are trusted plumbing, never a tool field.
+        """
+        if self._is_operator(turn, actor):
+            return
+        card_id = str(authorized_by or "").strip()
+        if not card_id:
+            raise _fail(
+                "operator_required",
+                f"A schedule {operation} requires an operator or an approved "
+                "schedule edit card.",
+                field="authorization",
+            )
+        card = await db.fetchone(
+            "SELECT id,status,kind,action,resource,proposal_id,"
+            "json_extract(metadata,'$.schedule_id') AS schedule_id "
+            "FROM approvals WHERE id=?",
+            (card_id,),
+        )
+        if card is None or str(card["status"]) != "approved":
+            raise _fail(
+                "invalid_authorization",
+                "The supplied approval is not approved.",
+                field="authorization",
+            )
+        edit_card = (
+            str(card["kind"]) == KIND_SCHEDULE_EDIT
+            and str(card["schedule_id"] or "") == view.id
+        )
+        tool = "schedule_run_now" if operation == "fire" else "schedule_cancel"
+        exact_action = (
+            str(card["action"]) == _SPECIALIST_APPROVAL_ACTION
+            and str(card["resource"] or "") == f"{tool}:{str(view.name)[:160]}"
+        )
+        if not (edit_card or exact_action):
+            raise _fail(
+                "invalid_authorization",
+                "The supplied approval does not authorize this schedule run.",
+                field="authorization",
+            )
+
+    @staticmethod
     def _can_answer(turn: TurnContext | None) -> bool:
         if turn is None:
             return False
@@ -1221,6 +1367,17 @@ class ScheduleService:
             and capabilities.can_wait_for_decision
             and capabilities.full_text
         )
+
+    async def has_live_create_grant(self, turn: TurnContext | None) -> bool:
+        """Public read-only grant check for prompt copy and other planning.
+
+        It mirrors the create path's authorization check, including the
+        unattended-turn deny policy, but never commits anything.
+        """
+        if self._unattended_turn(turn):
+            return False
+        principal = str(turn.principal or "chat") if turn is not None else "chat"
+        return await self._has_create_grant(principal, turn)
 
     async def _has_create_grant(
         self, principal: str, turn: TurnContext | None, *, actor: str | None = None

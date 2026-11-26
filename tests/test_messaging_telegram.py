@@ -58,6 +58,26 @@ async def test_plain_send_has_no_parse_mode(monkeypatch) -> None:
     assert "".join(item["text"] for item in seen) == body
 
 
+async def test_send_places_the_message_in_the_requested_topic(monkeypatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 9}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = TelegramAdapter(client=client, require_verification=False)
+        result = await adapter.send("555", "topic brief", thread_id="7")
+
+    assert result["message_id"] == "9"
+    assert len(seen) == 1
+    assert seen[0]["chat_id"] == "555"
+    assert seen[0]["message_thread_id"] == "7"
+
+
 async def test_webhook_callback_dispatch_keeps_thread_and_immutable_sender() -> None:
     seen: list[dict] = []
 

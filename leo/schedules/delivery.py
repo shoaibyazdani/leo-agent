@@ -56,6 +56,11 @@ _KNOWN_PLATFORMS: frozenset[str] = frozenset(
     }
 )
 
+# On these platforms a colon belongs to the chat/room id itself (Matrix room
+# ids look like ``!ops:example.org``); there is no separate thread component to
+# split off. Everything else keeps the historical ``chat[:thread]`` grammar.
+_COLON_CHAT_PLATFORMS: frozenset[str] = frozenset({"matrix"})
+
 _ROOM_RE = re.compile(
     r"^(?P<room>[A-Za-z0-9][A-Za-z0-9._:-]*)(?:@(?P<profile>[A-Za-z0-9_-]+))?$"
 )
@@ -92,6 +97,29 @@ class DeliveryResolutionError(ValueError):
 
 def _fail(code: str, message: str, token: str = "") -> DeliveryResolutionError:
     return DeliveryResolutionError(code, message, token=token)
+
+
+def _split_target(platform: str, rest: str) -> tuple[str, str | None]:
+    """Split ``chat[:thread]`` using per-platform id rules, not every colon."""
+    if platform.strip().lower() in _COLON_CHAT_PLATFORMS:
+        return rest.strip(), None
+    if ":" in rest:
+        chat_id, thread_id = rest.split(":", 1)
+        thread = thread_id.strip()
+        return chat_id.strip(), thread or None
+    return rest.strip(), None
+
+
+def _parse_home_channel(text: str) -> HomeChannel | None:
+    """Parse one configured home channel without truncating colon bearing ids."""
+    platform, separator, rest = text.partition(":")
+    platform = platform.strip().lower()
+    if not separator or not platform or not rest.strip():
+        return None
+    chat_id, thread_id = _split_target(platform, rest)
+    if not chat_id:
+        return None
+    return HomeChannel(platform=platform, chat_id=chat_id, thread_id=thread_id)
 
 
 @dataclass(frozen=True)
@@ -719,9 +747,8 @@ class DeliveryResolver:
             resolved_from="local_conversation",
         )
 
-    def _resolve_explicit(self, token: str) -> DeliveryRoute | None:
-        platform_text, rest = token.split(":", 1)
-        platform = platform_text.strip().lower()
+    def _validated_platform(self, platform_text: Any, token: str) -> str:
+        platform = str(platform_text).strip().lower()
         if not platform or subplatform_invalid(platform):
             raise _fail("invalid_target", "Delivery target has an empty or invalid platform.", token)
         if platform not in self._known:
@@ -732,42 +759,59 @@ class DeliveryResolver:
                 f"The {platform!r} adapter is not connected; delivery cannot be verified.",
                 token,
             )
-        rest = rest.strip()
-        if not rest:
+        return platform
+
+    def _build_external_route(
+        self, platform: str, chat_id: Any, thread_id: Any, token: str
+    ) -> DeliveryRoute:
+        address = str(chat_id).strip()
+        thread = str(thread_id).strip() if thread_id not in (None, "") else None
+        if not address:
             raise _fail("invalid_target", "Delivery target requires a chat id.", token)
-        if ":" in rest:
-            chat_id, thread_id = rest.split(":", 1)
-            chat_id, thread_id = chat_id.strip(), thread_id.strip()
-            if not thread_id:
-                thread_id = None
-        else:
-            chat_id, thread_id = rest, None
-        if not chat_id:
-            raise _fail("invalid_target", "Delivery target requires a chat id.", token)
-        _reject_controls(chat_id)
-        if thread_id:
-            _reject_controls(thread_id)
+        _reject_controls(address)
+        if thread:
+            _reject_controls(thread)
         origin = self.context.origin
         # Chat-only explicit target on the origin chat adopts the origin thread
         # only where a thread is a durable place (Telegram/Slack), as final head
         # does.
         if (
-            thread_id is None
+            thread is None
             and platform in ("telegram", "slack")
             and origin is not None
             and origin.platform.strip().lower() == platform
-            and str(origin.chat_id) == chat_id
+            and str(origin.chat_id) == address
             and origin.thread_id
         ):
-            thread_id = str(origin.thread_id)
+            thread = str(origin.thread_id)
         target = DeliveryTarget(
             kind="external",
             platform=platform,
-            chat_id=chat_id,
-            thread_id=thread_id,
+            chat_id=address,
+            thread_id=thread,
         )
-        audience = f"{platform} chat {chat_id}" + (f" thread {thread_id}" if thread_id else "")
+        audience = f"{platform} chat {address}" + (f" thread {thread}" if thread else "")
         return DeliveryRoute(target=target, token=token, audience=audience, resolved_from="explicit")
+
+    def _resolve_explicit(self, token: str) -> DeliveryRoute | None:
+        platform_text, rest = token.split(":", 1)
+        platform = self._validated_platform(platform_text, token)
+        rest = rest.strip()
+        if not rest:
+            raise _fail("invalid_target", "Delivery target requires a chat id.", token)
+        chat_id, thread_id = _split_target(platform, rest)
+        return self._build_external_route(platform, chat_id, thread_id, token)
+
+    def _resolve_external_object(self, data: Mapping[str, Any], token: str) -> DeliveryRoute:
+        """Resolve a structured target directly: no lossy token re-parse."""
+        platform = self._validated_platform(data.get("platform"), token)
+        chat_id = data.get("chat") or data.get("chat_id")
+        if chat_id in (None, ""):
+            raise _fail("invalid_target", "Delivery target requires a chat id.", token)
+        thread_id = data.get("thread") or data.get("thread_id")
+        return self._build_external_route(
+            platform, str(chat_id), thread_id, token
+        )
 
     def _resolve_bare_platform(self, token: str) -> DeliveryRoute | None:
         platform = token.strip().lower()
@@ -801,7 +845,17 @@ class DeliveryResolver:
     def _resolve_object(self, token: str, data: Mapping[str, Any]) -> list[DeliveryRoute]:
         lowered = token.lower()
         routes: list[DeliveryRoute] = []
-        if token == "origin":
+        if (
+            "token" not in data
+            and data.get("platform")
+            and (data.get("chat") or data.get("chat_id")) not in (None, "")
+            and str(data.get("kind") or "external").strip().lower()
+            in ("", "external", "chat")
+        ):
+            # Structured targets never go through colon-delimited tokens: a
+            # Matrix room id such as !ops:example.org stays one chat id.
+            routes.append(self._resolve_external_object(data, token))
+        elif token == "origin":
             route = self._resolve_origin(token)
             if route is None:
                 raise _fail("nowhere", "No captured origin and no configured home channel.", token)
@@ -875,17 +929,9 @@ def delivery_context_from_settings(
     automation = getattr(settings, "automation", None)
     homes: list[HomeChannel] = []
     for raw in list(getattr(automation, "home_channels", None) or []):
-        text = str(raw).strip()
-        parts = text.split(":")
-        if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
-            continue
-        homes.append(
-            HomeChannel(
-                platform=parts[0].strip().lower(),
-                chat_id=parts[1].strip(),
-                thread_id=parts[2].strip() if len(parts) > 2 and parts[2].strip() else None,
-            )
-        )
+        home = _parse_home_channel(str(raw).strip())
+        if home is not None:
+            homes.append(home)
     room_capable = False
     for adapter in (adapters or {}).values():
         if bool(getattr(adapter, "supports_rooms", False)):

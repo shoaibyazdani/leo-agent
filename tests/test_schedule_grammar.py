@@ -88,6 +88,34 @@ def test_duration_units_and_optional_count() -> None:
         parse_duration("30s")
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["1000000000d", "in 1000000000d", "99999999999999999999m"],
+)
+def test_absurd_durations_are_stable_invalid_duration(text: str) -> None:
+    """A huge model-supplied count must never leak OverflowError."""
+    with pytest.raises(ScheduleGrammarError) as caught:
+        _parse(text)
+    assert caught.value.code == "invalid_duration"
+
+    with pytest.raises(ScheduleGrammarError) as caught:
+        parse_duration(text.removeprefix("in ").strip())
+    assert caught.value.code == "invalid_duration"
+
+
+def test_interval_next_occurrence_wraps_overflow() -> None:
+    """A corrupt/stored huge interval still rejects with a stable code."""
+    parsed = ParsedSchedule(
+        kind="interval",
+        expression="99999999999999999999",
+        timezone="UTC",
+        display="every absurd",
+    )
+    with pytest.raises(ScheduleGrammarError) as caught:
+        next_occurrence(parsed, NOW)
+    assert caught.value.code == "invalid_duration"
+
+
 def test_clock_forms_match_final_head() -> None:
     assert parse_clock_time("9am") == (9, 0)
     assert parse_clock_time("9:30am") == (9, 30)

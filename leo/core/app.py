@@ -102,6 +102,14 @@ _PROACTIVE_SCHEDULE_GUIDANCE = (
     "moment. A job is shown for approval before it is saved: describe it as "
     "pending until the human answers, and never retry after a decline."
 )
+# A live create grant changes the truth the model must narrate: there is no
+# card to wait for. It never widens what may be scheduled.
+_GRANTED_SCHEDULE_GUIDANCE = (
+    "SCHEDULING: This conversation has a live allowance for new schedules, so "
+    "schedule_create saves immediately without showing a card. Call "
+    "schedule_list first to see what already exists, create only a concrete "
+    "user-authorized moment, and say plainly that the job was saved."
+)
 _STALL_NUDGE = (
     "You announced a next action but did not perform it. Continue now: either "
     "call the needed tool(s) or deliver the complete final answer. Do not "
@@ -1360,6 +1368,7 @@ class LeoApp:
                 },
             )
             return f"local:note:{conversation_id}"
+        send_channel = str(channel)
         if kind == "room" or channel == "room":
             room_channel = str(
                 getattr(getattr(self.settings, "automation", None), "default_room_channel", "")
@@ -1372,12 +1381,15 @@ class LeoApp:
 
             if not AdapterCapabilities.for_adapter(adapter).room_capable:
                 raise ValueError(f"{room_channel} is not room-capable")
+            send_channel = room_channel
         if address in ("", "None", "null"):
-            raise ValueError(f"no delivery address for {channel}; refusing to send")
+            raise ValueError(f"no delivery address for {send_channel}; refusing to send")
         text = context.get("delivery_text_override") or self._delivery_text(task, status, context)
+        thread_id = str(info.get("thread_id") or "") or None
         response = await self.gateway.send(
-            str(channel), address, text,
+            send_channel, address, text,
             subject=f"task:{getattr(task, 'id', '')}",
+            thread_id=thread_id,
         )
         if isinstance(response, dict) and response.get("success") is False:
             # The adapter swallows its own errors into this dict; surfacing it
@@ -1386,7 +1398,7 @@ class LeoApp:
         message_id = response.get("message_id") if isinstance(response, dict) else None
         # Return proof, not a dict: the engine persists a scalar detail on the
         # receipt, so "sent" always carries the provider's message id.
-        return f"{channel}:{message_id}" if message_id is not None else f"{channel}:sent"
+        return f"{send_channel}:{message_id}" if message_id is not None else f"{send_channel}:sent"
 
     @staticmethod
     def _local_conversation_id(task: Any, info: dict[str, Any]) -> str:
@@ -3137,7 +3149,22 @@ class LeoApp:
             blocks.append(f"{label} ({name}):\n{text}")
         return "\n\n".join(blocks)
 
-    def _conversation_system_prompt(self) -> str:
+    async def _turn_has_create_grant(self, turn: TurnContext | None) -> bool:
+        """True when a live create grant covers this interactive turn."""
+        if turn is None or str(turn.source or "").strip().lower() in (
+            "scheduled", "unattended", "agent"
+        ):
+            return False
+        service = getattr(self, "schedule_service", None)
+        checker = getattr(service, "has_live_create_grant", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(await checker(turn))
+        except Exception:  # noqa: BLE001 - a prompt hint must never fail a turn
+            return False
+
+    def _conversation_system_prompt(self, *, create_grant: bool = False) -> str:
         """Production system prompt for the conversation tool loop.
 
         The model receives every registered tool spec; the prompt makes tool
@@ -3196,7 +3223,10 @@ class LeoApp:
             and capabilities.full_text
             and capabilities.can_rewrite
         ):
-            parts.append(_PROACTIVE_SCHEDULE_GUIDANCE)
+            parts.append(
+                _GRANTED_SCHEDULE_GUIDANCE if create_grant
+                else _PROACTIVE_SCHEDULE_GUIDANCE
+            )
         return "\n\n".join(parts)
 
     async def _persist_stall_interim(
@@ -3657,7 +3687,9 @@ class LeoApp:
         budget = self._context_budget()
         # Memories are injected exactly once by ContextOptimizer, which applies
         # relevance selection and a dedicated token budget.
-        system = self._conversation_system_prompt()
+        system = self._conversation_system_prompt(
+            create_grant=await self._turn_has_create_grant(turn)
+        )
         tool_specs = [spec.model_dump(mode="json") for spec in self.registry.list_specs()]
         user_message = ChatMessage(role="user", content=turn_text, images=images)
         # One effective selection per turn: session override > global default >
@@ -4147,7 +4179,9 @@ class LeoApp:
             prompt, images = await self._images_for_turn(prompt, images)
 
             memories = await self.search.search(prompt, limit=5) if self.search else []
-            system = self._conversation_system_prompt()
+            system = self._conversation_system_prompt(
+                create_grant=await self._turn_has_create_grant(turn)
+            )
             tool_specs = [spec.model_dump(mode="json") for spec in self.registry.list_specs()]
             user_message = ChatMessage(role="user", content=prompt, images=images)
             selection = await self.reasoning_selection(conversation_id)

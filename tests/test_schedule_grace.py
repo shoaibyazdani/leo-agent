@@ -71,6 +71,56 @@ async def test_occurrence_inside_grace_runs(env) -> None:
     assert await env.events.history("schedule.skipped", limit=10) == []
 
 
+async def test_catch_up_false_creates_only_one_occurrence(env) -> None:
+    """A false catch_up flag must stop the stale backlog, not just be stored."""
+    await env.scheduler.register_interval(
+        "job", 60, "do work", {"catch_up": False}
+    )
+    stale = NOW - timedelta(hours=25)
+    await db.execute(
+        "UPDATE schedules SET next_run_at=? WHERE name='job'", (stale.isoformat(),)
+    )
+    created = await env.scheduler.tick(now=NOW)
+    assert len(created) == 1
+    # The occurrence is still anchored to when it was due, not to the tick.
+    assert created[0].metadata["scheduled_for"] == stale.isoformat()
+    # The rest of the backlog is truncated, not silently replayed.
+    assert await env.events.history("schedule.catchup_truncated", limit=10)
+
+
+async def test_stale_one_shot_is_retired_as_missed_without_dispatch(env) -> None:
+    """Grace applies to one-shots: a 3h-old 09:00 job must not run at 12:00."""
+    await env.scheduler.register_interval(
+        "late", 3600, "remind", {"one_shot": True}
+    )
+    await db.execute(
+        "UPDATE schedules SET kind='once', expression='', next_run_at=?, "
+        "grace_minutes=5 WHERE name='late'",
+        ((NOW - timedelta(hours=3)).isoformat(),),
+    )
+    assert await env.scheduler.tick(now=NOW) == []
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='late'") is None
+    tombstone = await db.fetchone(
+        "SELECT reason FROM schedule_tombstones WHERE name='late'"
+    )
+    assert "missed" in tombstone["reason"]
+    missed = await env.events.history("schedule.missed", limit=10)
+    assert len(missed) == 1
+    assert missed[0].payload["reason"] == "outside grace window"
+
+
+async def test_one_shot_inside_grace_still_runs(env) -> None:
+    await env.scheduler.register_interval("fresh", 3600, "remind", {"one_shot": True})
+    await db.execute(
+        "UPDATE schedules SET kind='once', expression='', next_run_at=?, "
+        "grace_minutes=5 WHERE name='fresh'",
+        ((NOW - timedelta(minutes=2)).isoformat(),),
+    )
+    created = await env.scheduler.tick(now=NOW)
+    assert len(created) == 1
+    assert (await env.events.history("schedule.missed", limit=10)) == []
+
+
 async def test_no_grace_column_keeps_existing_catchup_behavior(env) -> None:
     await env.scheduler.register_interval("job", 60, "do work", {})
     await db.execute(
