@@ -413,6 +413,14 @@ def test_system_prompt_points_to_task_store_not_binary_database() -> None:
     assert "SQLite" in prompt and "do not grep" in prompt.lower()
 
 
+def test_system_prompt_requires_real_issue_numbers_and_parked_tasks() -> None:
+    prompt = LeoApp.__new__(LeoApp)._conversation_system_prompt()
+    assert "`number` field" in prompt
+    assert "list position" in prompt
+    assert "An offer is not permission" in prompt
+    assert "Never run tools for a parked task" in prompt
+
+
 def test_system_prompt_asks_for_a_readable_answer() -> None:
     """The operator reads on a phone: the answer first, the audit never.
 

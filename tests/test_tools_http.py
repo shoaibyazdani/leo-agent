@@ -99,6 +99,11 @@ class _ServerState:
                 b'{"rates": {"PKR": 999.0}}',
             ),
             "/html": (200, "text/html", b'{"rates": {"PKR": 999.0}}'),
+            "/issues": (
+                200,
+                "application/json",
+                json.dumps({"issues": [{"number": 76, "title": "approvals"}]}).encode(),
+            ),
             "/scalar": (200, "application/json", b"42"),
             "/cjk": (200, "application/json", json.dumps({"text": "值" * 40}).encode()),
             "/cjkbig": (200, "application/json", json.dumps({"text": "值" * 1400}).encode()),
@@ -310,6 +315,38 @@ async def test_register_typed_specs_and_validation(env):
 
 
 # --------------------------------------------------------------------------- live extraction
+
+
+def test_api_identifier_never_uses_a_list_position():
+    """An identifier is copied from the object's `number` field, not its index."""
+    issues = [{"number": 76, "title": "approvals"}]
+    assert http_tools.api_identifier(issues[0]) == "#76"
+    assert http_tools.api_identifier({"number": "76"}) == "#76"
+    # A title, a list position and a non-numeric number are not identifiers.
+    assert http_tools.api_identifier({"title": "approvals"}) is None
+    assert http_tools.api_identifier(issues) is None
+    assert http_tools.api_identifier({"number": True}) is None
+    assert http_tools.api_identifier({"number": "not-a-number"}) is None
+    assert "number" in env_spec_description()  # tool tells the model where to look
+
+
+def env_spec_description() -> str:
+    spec = next(s for s in http_tools._SPECS if s[0].name == "http_json")[0]
+    return spec.description
+
+
+async def test_http_json_quotes_an_issue_number_from_the_fetched_object(env):
+    result = await _run(env, "http_json", {"url": _url(env, "/issues"), "path": "issues.0"})
+    assert result.success, result.error
+    assert result.output["value"] == {"number": 76, "title": "approvals"}
+    assert result.output["identifier"] == "#76"
+
+    title = await _run(
+        env, "http_json", {"url": _url(env, "/issues"), "path": "issues.0.title"}
+    )
+    assert title.success, title.error
+    assert title.output["value"] == "approvals"
+    assert "identifier" not in title.output
 
 
 async def test_http_json_extracts_exact_value_from_live_response(env):

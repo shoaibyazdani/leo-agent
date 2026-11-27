@@ -30,3 +30,32 @@ def test_promoted_reasoning_tail_can_trigger() -> None:
     assert looks_like_stall(
         "Done.", "stop", [], reasoning_tail="Let me now check the parser."
     )
+
+
+def test_a_direct_answer_is_not_a_stall_even_with_planning_reasoning() -> None:
+    """A visible answer ends the turn; private reasoning is not a reply."""
+    reaction = (
+        "Cute — fluffy gray cat in a purple hedgehog cave bed, going for the pom-pom."
+    )
+    assert not looks_like_stall(
+        reaction, "stop", [],
+        reasoning_tail="Let me now check the open PRs and report back.",
+    )
+    assert not looks_like_stall(
+        "Cute cat.", "stop", [], reasoning_tail="Next: I will run a GitHub check"
+    )
+    assert not looks_like_stall("The fix is live and verified.", "stop", [])
+
+
+def test_short_acknowledgements_can_still_be_stalls() -> None:
+    assert looks_like_stall("Done.", "stop", [], reasoning_tail="I'll now run tests")
+    assert looks_like_stall("OK", "stop", [], reasoning_tail="First, I'll check git")
+    assert not looks_like_stall("Done.", "stop", [])
+
+
+def test_announced_work_is_still_a_stall_with_distracting_reasoning() -> None:
+    assert looks_like_stall(
+        "I'll now run the tests.", "stop", [], reasoning_tail="nothing to add"
+    )
+    assert looks_like_stall("Still working on it…", "stop", [])
+    assert looks_like_stall("Still checking the PR list", "stop", [])
