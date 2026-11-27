@@ -144,7 +144,7 @@ def test_cli_exposes_chat_and_tui_commands() -> None:
     assert {"chat", "tui"} <= set(commands)
     # Click builds the real help path from the command's parameter objects.
     # Rich elides long option names when it detects a narrow console (CI has
-    # no TTY), so inspect the declaration and pin the render width explicitly.
+    # no TTY), so inspect the declaration rather than rendered help text.
     root = get_command(cli_mod.cli)
     runner = CliRunner()
     for name in ("chat", "tui"):
