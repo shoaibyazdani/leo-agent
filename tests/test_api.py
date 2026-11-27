@@ -1215,6 +1215,7 @@ async def test_export_rate_limit_is_durable_and_shared_across_workers(
     # result. Retry the whole worker on timeout/lock so the assertion still
     # pins the real durable denial without accepting a slow hang as success.
     result = None
+    last_outcome: str | None = None
     for attempt in range(3):
         try:
             candidate = subprocess.run(
@@ -1222,8 +1223,11 @@ async def test_export_rate_limit_is_durable_and_shared_across_workers(
                 cwd=str(repo), env={**os.environ, "PYTHONPATH": str(repo)},
                 capture_output=True, text=True, timeout=20,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             candidate = None
+            last_outcome = f"timeout after {exc.timeout}s"
+        else:
+            last_outcome = f"exit={candidate.returncode}: {candidate.stderr[-200:]}"
         if candidate is not None and "rate limit" in candidate.stderr:
             result = candidate
             break
@@ -1231,7 +1235,7 @@ async def test_export_rate_limit_is_durable_and_shared_across_workers(
             result = candidate  # real failure: let the assertion report it
             break
         await asyncio.sleep(0.2 * (attempt + 1))
-    assert result is not None
+    assert result is not None, f"export worker never completed: last={last_outcome!r}"
     assert result.returncode != 0 and "rate limit" in result.stderr
 
     # Buckets are per principal, and expired kv counters are pruned.
