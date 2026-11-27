@@ -21,6 +21,7 @@ from leo.watchers import (
     is_quiet,
     load_preferences,
     load_state,
+    mentions_topic,
     register_watcher_schedule,
 )
 
@@ -206,22 +207,51 @@ async def test_gathers_task_outcomes_dead_letters_conversations_and_github(env):
     state = WatcherState()
 
     async def fetch(repo):
-        return [{"number": 7, "title": "Fix build", "comments": 0, "state": "open"}]
+        items = [{"number": 7, "title": "Fix build", "comments": 0, "state": "open"}]
+        if fetch.calls:
+            items.append({"number": 8, "title": "Fresh issue", "comments": 0, "state": "open"})
+        fetch.calls.append(None)
+        return items
+    fetch.calls = []
 
     signals = await gather_signals(
         state=state, now=NOW, config=config(github_repos=["owner/repo"]), github_fetcher=fetch
     )
     kinds = {item.kind for item in signals}
-    assert {"task_outcome", "dead_letter", "delivery_failure", "waiting_conversation", "github_open"} <= kinds
+    assert {"task_outcome", "dead_letter", "delivery_failure", "waiting_conversation"} <= kinds
+    assert "github_open" not in kinds  # the first sight of a repo seeds silently
     assert not any(item.id == "task:routine:completed" for item in signals)
     assert all(item.urgent for item in signals if item.kind in ("dead_letter", "delivery_failure"))
     assert state.github["owner/repo#7"]["comments"] == 0
 
-    # The same signals are not gathered twice from durable history.
+    # Only genuinely new items, not the seeded ones, are reported afterward.
     again = await gather_signals(
         state=state, now=NOW, config=config(github_repos=["owner/repo"]), github_fetcher=fetch
     )
-    assert not any(item.kind == "github_open" for item in again)
+    assert [item.id for item in again if item.kind == "github_open"] == ["github:owner/repo#8:opened"]
+
+
+async def test_first_github_fetch_and_lost_state_seed_silently(env):
+    async def fetch(repo):
+        return [
+            {"number": number, "title": f"Old issue {number}", "comments": 2, "state": "open"}
+            for number in range(1, 21)
+        ]
+
+    state = WatcherState()
+    signals = await gather_signals(
+        state=state, now=NOW, config=config(github_repos=["owner/repo"]), github_fetcher=fetch
+    )
+    assert not any(item.source == "github" for item in signals)
+    assert len(state.github) == 20
+
+    # A repository added later is seeded the same way, even if other repos
+    # already have entries in the snapshot.
+    state.github["other/repo#1"] = {"comments": 0, "state": "open", "due": ""}
+    signals = await gather_signals(
+        state=state, now=NOW, config=config(github_repos=["new/repo"]), github_fetcher=fetch
+    )
+    assert not any(item.source == "github" for item in signals)
 
 
 # --- preferences, filtering and judgment -------------------------------------
@@ -287,6 +317,27 @@ async def test_no_worthy_signals_sends_nothing(env):
     assert result.sent == [] and send.calls == []
 
 
+def test_never_topics_match_whole_terms():
+    assert mentions_topic("Health check failed", ("health",))
+    assert mentions_topic("health-check failed", ("health",))
+    assert not mentions_topic("healthy build", ("health",))
+    assert not mentions_topic("healthcare update", ("health",))
+    assert mentions_topic("C++ build finished", ("C++",))
+    assert not mentions_topic("C# build finished", ("C++",))
+    assert not mentions_topic("nothing to report", ("",))
+
+
+async def test_excluded_topic_does_not_hide_other_whole_term_updates(env):
+    await add_task("healthy", result="Healthy update published")
+    model = FakeModel(json_decisions(("task:healthy:completed", True, "Healthy update published")))
+    send = Recorder()
+    result = await watcher(
+        env, model, send, preferences="# never mention\n- health\n"
+    ).run()
+    assert result.sent == ["task:healthy:completed"]
+    assert send.calls == ["Healthy update published"]
+
+
 # --- pacing, urgent bypass, delivery -----------------------------------------
 
 async def test_daily_cap_limits_ordinary_items_but_not_urgent(env):
@@ -334,9 +385,48 @@ async def test_failed_delivery_is_reported_on_next_successful_contact(env):
     second_model = FakeModel(json_decisions(("task:two:completed", True, "Second update")))
     second = await watcher(env, second_model, second_send).run()
     assert second.sent == ["task:two:completed"]
+    assert second.pending_flushed is True
+    assert len(second_send.calls) == 2
     assert "Earlier updates could not be delivered" in second_send.calls[0]
-    assert "First update" in second_send.calls[0] and "Second update" in second_send.calls[0]
+    assert "First update" in second_send.calls[0] and "Second update" not in second_send.calls[0]
+    assert "Second update" in second_send.calls[1] and "First update" not in second_send.calls[1]
     assert (await load_state()).pending == []
+
+
+async def test_pending_delivery_is_flushed_even_without_new_signals(env):
+    await add_task("one", result="First update")
+    model = FakeModel(json_decisions(("task:one:completed", True, "First update")))
+    first = await watcher(env, model, Recorder(fail_always=True)).run()
+    assert first.sent == [] and first.pending == 1
+
+    # No new signals at all: the carried item still goes out on its own.
+    second_send = Recorder()
+    second = await watcher(env, FakeModel(), second_send).run()
+    assert second.sent == [] and second.pending_flushed is True
+    assert len(second_send.calls) == 1
+    assert "Earlier updates could not be delivered" in second_send.calls[0]
+    assert "First update" in second_send.calls[0]
+    assert (await load_state()).pending == []
+
+    # Genuine silence stays silent once the backlog is clear.
+    third_send = Recorder()
+    third = await watcher(env, FakeModel(), third_send).run()
+    assert third.sent == [] and third.pending_flushed is False
+    assert third_send.calls == []
+
+
+async def test_pending_delivery_is_flushed_when_new_signal_is_unworthy(env):
+    await add_task("one", result="First update")
+    first_model = FakeModel(json_decisions(("task:one:completed", True, "First update")))
+    await watcher(env, first_model, Recorder(fail_always=True)).run()
+
+    await add_task("noise", result="Routine heartbeat")
+    unworthy = FakeModel(json_decisions(("task:noise:completed", False, "")))
+    send = Recorder()
+    result = await watcher(env, unworthy, send).run()
+    assert result.sent == [] and result.worthy == []
+    assert result.pending_flushed is True
+    assert len(send.calls) == 1 and "First update" in send.calls[0]
 
 
 async def test_dead_letter_reaches_user_in_one_run_without_a_model(env):

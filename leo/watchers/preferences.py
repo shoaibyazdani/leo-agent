@@ -147,9 +147,22 @@ def load_preferences(
 
 
 def mentions_topic(text: str, topics: tuple[str, ...] | list[str]) -> bool:
-    """True when any configured topic appears in the text (case-insensitive)."""
+    """True when any configured topic appears as a whole term in the text.
+
+    Matching is case-insensitive and respects term boundaries, so "health"
+    excludes a health update but not an unrelated "healthy" status. Topics that
+    start or end with punctuation (e.g. "C++") do not require a boundary there.
+    """
     haystack = str(text or "").casefold()
-    return any(str(topic).strip().casefold() in haystack for topic in topics if str(topic).strip())
+    for topic in topics:
+        term = str(topic).strip().casefold()
+        if not term:
+            continue
+        before = r"(?<!\w)" if term[0].isalnum() or term[0] == "_" else ""
+        after = r"(?!\w)" if term[-1].isalnum() or term[-1] == "_" else ""
+        if re.search(before + re.escape(term) + after, haystack):
+            return True
+    return False
 
 
 def clock_in_range(value: time, start: str, end: str) -> bool:

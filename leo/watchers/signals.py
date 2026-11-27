@@ -245,6 +245,10 @@ async def _github_signals(
         except Exception as exc:  # noqa: BLE001 - one broken source must not stop the run
             _LOG.warning("github signal source failed", extra={"repo": repo, "error": str(exc)[:200]})
             continue
+        # The first successful sight of a repository seeds the snapshot
+        # silently: a cold start (or a lost state row) must not report years of
+        # pre-existing issues as new. Changes are reported from then on.
+        cold = not any(key.startswith(f"{repo}#") for key in snapshot)
         for item in items[:20]:
             number = str(item.get("number") or "")
             key = f"{repo}#{number}"
@@ -260,6 +264,9 @@ async def _github_signals(
             previous = snapshot.get(key)
             title = _clip(item.get("title") or "untitled", 140)
             base = f"{repo} {'PR' if item.get('pull_request') else 'issue'} #{number}: {title}"
+            if previous is None and cold:
+                snapshot[key] = state_value
+                continue
             if previous is None:
                 signals.append(
                     Signal(

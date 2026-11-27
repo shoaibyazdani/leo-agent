@@ -35,6 +35,7 @@ class WatcherRunResult:
     sent: list[str] = field(default_factory=list)
     pending: int = 0
     ordinary_sent: int = 0
+    pending_flushed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +46,7 @@ class WatcherRunResult:
             "sent": self.sent,
             "pending": self.pending,
             "ordinary_sent": self.ordinary_sent,
+            "pending_flushed": self.pending_flushed,
         }
 
 
@@ -135,6 +137,10 @@ class JudgmentWatcher:
             config=self.config,
             github_fetcher=self.github_fetcher,
         )
+        # A carried failed delivery is news in its own right: flush it on the
+        # next run even when nothing new survived judgment.
+        tracker = DeliveryTracker(self.send, state)
+        flushed = await tracker.flush()
         day = _local_day(now, self.config, preferences.timezone)
         if state.day != day:
             state.day = day
@@ -145,7 +151,12 @@ class JudgmentWatcher:
 
         if not fresh:
             await save_state(state)
-            return WatcherRunResult(signals_seen=len(signals), reason="no new signals")
+            return WatcherRunResult(
+                signals_seen=len(signals),
+                reason="no new signals",
+                pending=len(state.pending),
+                pending_flushed=flushed,
+            )
 
         decisions = await judge_signals(
             fresh,
@@ -162,7 +173,6 @@ class JudgmentWatcher:
             item.signal_id
             for item in ordinary[: max(0, preferences.max_ordinary_per_day - state.ordinary_sent)]
         }
-        tracker = DeliveryTracker(self.send, state)
         sent: list[str] = []
         for decision in urgent + ordinary:
             if decision.signal_id not in urgent_ids and decision.signal_id not in allowed_ids:
@@ -178,6 +188,7 @@ class JudgmentWatcher:
             sent=sent,
             pending=len(state.pending),
             ordinary_sent=state.ordinary_sent,
+            pending_flushed=flushed,
         )
 
     def _preferences(self) -> Preferences:

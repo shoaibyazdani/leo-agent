@@ -23,11 +23,30 @@ class DeliveryTracker:
         self.send = send
         self.state = state
 
+    def _carried(self) -> str:
+        carried = "\n".join(
+            f"- {str(item.get('text') or '')[:300]}" for item in self.state.pending
+        )
+        return f"Earlier updates could not be delivered:\n{carried}"
+
     def _compose(self, text: str) -> str:
         if not self.state.pending:
             return text
-        carried = "\n".join(f"- {str(item.get('text') or '')[:300]}" for item in self.state.pending)
-        return f"Earlier updates could not be delivered:\n{carried}\n\n{text}"
+        return f"{self._carried()}\n\n{text}"
+
+    async def _attempt_send(self, message: str) -> bool:
+        if self.send is None:
+            return False
+        for attempt in range(2):
+            try:
+                await self.send(message)
+                return True
+            except Exception as exc:  # noqa: BLE001 - deferred, never silent
+                _LOG.warning(
+                    "watcher delivery attempt failed",
+                    extra={"attempt": attempt + 1, "error": str(exc)[:200]},
+                )
+        return False
 
     async def deliver(self, text: str, *, urgent: bool = False) -> bool:
         """Deliver ``text``, retry once, then carry it forward on failure."""
@@ -36,16 +55,21 @@ class DeliveryTracker:
                 {"text": text, "at": datetime.now(UTC).isoformat(), "urgent": urgent}
             )
             return False
-        message = self._compose(text)
-        for attempt in range(2):
-            try:
-                await self.send(message)
-                self.state.pending.clear()
-                return True
-            except Exception as exc:  # noqa: BLE001 - deferred, never silent
-                _LOG.warning(
-                    "watcher delivery attempt failed",
-                    extra={"attempt": attempt + 1, "error": str(exc)[:200]},
-                )
+        if await self._attempt_send(self._compose(text)):
+            self.state.pending.clear()
+            return True
         self.state.pending.append({"text": text, "at": datetime.now(UTC).isoformat(), "urgent": urgent})
+        return False
+
+    async def flush(self) -> bool:
+        """Send carried items on this run as their own message, not as a footer.
+
+        A failed flush leaves the items pending; they stay durable and can be
+        retried by a later run instead of being dropped or duplicated.
+        """
+        if not self.state.pending:
+            return False
+        if await self._attempt_send(self._carried()):
+            self.state.pending.clear()
+            return True
         return False
