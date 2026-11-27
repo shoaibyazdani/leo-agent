@@ -75,9 +75,10 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 # Explicit reviewed allowlist. Keys are "path:line", "path:start-end", or
 # an open-ended range written as "start-". Each entry MUST carry a reason.
-# A reason prefixed "only=<label>:" restricts the exception to that single
-# pattern family; whole-file ranges are used ONLY for hash-only manifests and
-# research notes documenting upstream SHAs, never for provider-key prefixes.
+# A reason prefixed "only=<label>[|<label>]:" restricts the exception to those
+# pattern families (a synthetic fixture can match more than one family);
+# whole-file ranges are used ONLY for hash-only manifests and research notes
+# documenting upstream SHAs, never for provider-key prefixes.
 REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "uv.lock": {"1-": "only=long hex: lockfile integrity hashes, not credentials"},
     "tests/test_harden_config.py": {
@@ -98,7 +99,8 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "tests/channels/test_teams.py": {"32": "test fixture"},
     "tests/test_agents_automation_operator.py": {
         "40": "test fixture",
-        "41": "synthetic fixture at its current line",
+        "42": "only=assigned secret: synthetic fixture at its current line",
+        "41": "only=assigned secret: synthetic fixture in an earlier revision",
         "33": "only=assigned secret: synthetic fixture in an earlier revision",
     },
     "tests/test_agents_reviewer.py": {"143": "test fixture"},
@@ -108,29 +110,38 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "498": "synthetic secret fixture in an earlier revision",
         "499": "synthetic secret fixture in an earlier revision",
     },
+    # Every entry is restricted to the exact pattern families its fixture
+    # matches, at both current and historical line numbers; a future real
+    # credential on one of these lines is still reported by the gate.
     "tests/test_tools_http.py": {
-        "108": "synthetic fixture", "123": "synthetic fixture",
-        "643": "synthetic fixture", "660": "synthetic fixture",
-        "710": "redaction assertion", "788": "synthetic fixture",
-        "805": "redaction assertion", "866": "synthetic fixture",
-        "937": "synthetic fixture", "980": "synthetic fixture",
-        "990": "synthetic fixture", "1021": "synthetic fixture",
-        "1260": "synthetic fixture", "1347": "synthetic fixture",
+        "108": "only=openai key: synthetic fixture",
+        "123": "only=openai key: synthetic fixture",
+        "643": "only=assigned secret: synthetic fixture",
+        "660": "only=openai key|assigned secret: synthetic fixture",
+        "710": "only=openai key: redaction assertion",
+        "788": "only=openai key|assigned secret: synthetic fixture",
+        "805": "only=openai key: redaction assertion",
+        "866": "only=openai key|assigned secret: synthetic fixture",
+        "937": "only=openai key|assigned secret: synthetic fixture",
+        "980": "only=openai key|assigned secret: synthetic fixture",
+        "990": "only=openai key|assigned secret: synthetic fixture",
+        "1021": "only=openai key|assigned secret: synthetic fixture",
+        "1260": "only=openai key|assigned secret: synthetic fixture",
+        "1347": "only=openai key|assigned secret: synthetic fixture",
         # The same fixtures after later test insertions; the older line
-        # numbers stay for historical blobs. Each synthetic fixture can match
-        # more than one pattern family, so these are per-line, not restricted.
-        "669": "synthetic fixture at its current line",
-        "686": "synthetic fixture at its current line",
-        "736": "redaction assertion at its current line",
-        "814": "synthetic fixture at its current line",
-        "831": "redaction assertion at its current line",
-        "892": "synthetic fixture at its current line",
-        "963": "synthetic fixture at its current line",
-        "1006": "synthetic fixture at its current line",
-        "1016": "redaction assertion at its current line",
-        "1047": "synthetic fixture at its current line",
-        "1286": "synthetic fixture at its current line",
-        "1373": "synthetic fixture at its current line",
+        # numbers stay for historical blobs.
+        "669": "only=assigned secret: synthetic fixture at its current line",
+        "686": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "736": "only=openai key: redaction assertion at its current line",
+        "814": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "831": "only=openai key: redaction assertion at its current line",
+        "892": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "963": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1006": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1016": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1047": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1286": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1373": "only=openai key|assigned secret: synthetic fixture at its current line",
     },
     "tests/test_tools_webhook.py": {"33": "test fixture"},
     "tests/channels/test_a2a.py": {"42": "test fixture"},
@@ -190,7 +201,9 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "71-139": "synthetic secret and control-character fixtures exercising the scanner and redactor",
     },
     "tests/test_schedule_security.py": {
-        "28": "synthetic unsafe-prompt fixture", "110": "assertion that the synthetic token is absent",
+        "28": "synthetic unsafe-prompt fixture",
+        "110": "assertion that the synthetic token is absent in an earlier revision",
+        "204": "only=openai key: assertion that the synthetic token is absent",
     },
     "tests/test_secret_sinks.py": {
         "290": "synthetic PEM fixture used to verify redaction",
@@ -380,8 +393,11 @@ def is_reviewed(path_key: str, line: int, label: str) -> bool:
     )
     for key in keys:
         for spec, reason in REVIEWED_ALLOWLIST.get(key, {}).items():
-            only = reason.split(":", 1)[0] if reason.startswith("only=") else None
-            if only is not None and only != f"only={label}":
+            only = (
+                set(reason.split(":", 1)[0][len("only="):].split("|"))
+                if reason.startswith("only=") else None
+            )
+            if only is not None and label not in only:
                 continue
             if spec == "*":
                 return True

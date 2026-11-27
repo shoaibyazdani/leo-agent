@@ -771,16 +771,28 @@ class TelegramAdapter(MessagingAdapter):
     supports_threaded_media = True
 
     async def send_typing(self, target: str) -> None:
-        """sendChatAction(typing) on one chat. Callers treat failures as cosmetic."""
-        token = credential("TELEGRAM_BOT_TOKEN")
-        if not token:
-            return None
-        url = f"{self.API_BASE}/bot{token}/sendChatAction"
-        response = await self._http().post(
-            url, json={"chat_id": str(target), "action": "typing"}, timeout=self.timeout
-        )
-        if response.status_code >= 400:
-            raise MessagingError(f"telegram typing failed: HTTP {response.status_code}")
+        """Best-effort sendChatAction(typing); never raises to the caller.
+
+        A failed hint is cosmetic and must not reach the reply path, so the
+        adapter swallows transport and API errors just like ``Gateway.typing``.
+        The token is in the URL: log only the status or the error class.
+        """
+        try:
+            token = credential("TELEGRAM_BOT_TOKEN")
+            if not token:
+                return None
+            url = f"{self.API_BASE}/bot{token}/sendChatAction"
+            response = await self._http().post(
+                url, json={"chat_id": str(target), "action": "typing"}, timeout=self.timeout
+            )
+            if response.status_code >= 400:
+                _LOG.warning("telegram typing failed", extra={
+                    "channel": self.channel, "status": response.status_code,
+                })
+        except Exception as exc:  # noqa: BLE001 - a failed hint is never fatal
+            _LOG.warning("telegram typing failed", extra={
+                "channel": self.channel, "error": type(exc).__name__,
+            })
         return None
 
     def verify_webhook(self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None) -> bool:

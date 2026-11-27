@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ... import db
-from ...contracts import RiskLevel, TaskStatus, ToolCall
+from ...contracts import LIVE_AUTH_CLAIM_TTL_SECONDS, RiskLevel, TaskStatus, ToolCall
 from ...security.permissions import arguments_digest
 from ..verification import digest as evidence_digest
 
@@ -552,6 +552,37 @@ async def _verify_approval(
     if row["status"] != "approved":
         return deny(f"approval {approval_id} is {row['status']}, not approved")
 
+    metadata: Mapping[str, Any] = {}
+    try:
+        decoded = json.loads(row["metadata"] or "{}")
+    except (TypeError, ValueError):
+        decoded = {}
+    if isinstance(decoded, Mapping):
+        metadata = decoded
+    # The schedule service settles a live run/cancel lease on this same row.
+    # Refuse a card that is already consumed or currently leased, so a second
+    # specialist call cannot authorize another mutation with the same approval.
+    if metadata.get("live_authorization_used_at"):
+        return deny(f"approval {approval_id} was already used for a live action")
+    lease = metadata.get("live_authorization_claim")
+    if isinstance(lease, Mapping) and lease.get("token"):
+        # A lease left by a crashed worker is reclaimable after the shared
+        # bound; an active or unreadable lease stays fail-closed.
+        leased_at: datetime | None = None
+        try:
+            leased_at = datetime.fromisoformat(str(lease.get("at") or ""))
+            if leased_at.tzinfo is None:
+                leased_at = leased_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            leased_at = None
+        stale = (
+            leased_at is not None
+            and (datetime.now(timezone.utc) - leased_at).total_seconds()
+            >= LIVE_AUTH_CLAIM_TTL_SECONDS
+        )
+        if not stale:
+            return deny(f"approval {approval_id} is already in use for a live action")
+
     for field in ("action", "resource", "risk", "actor"):
         expected = {
             "action": target["action"],
@@ -562,13 +593,6 @@ async def _verify_approval(
         if str(row[field]) != str(expected):
             return deny(f"approval binding mismatch on {field}")
 
-    metadata: Mapping[str, Any] = {}
-    try:
-        decoded = json.loads(row["metadata"] or "{}")
-    except (TypeError, ValueError):
-        decoded = {}
-    if isinstance(decoded, Mapping):
-        metadata = decoded
     expected_digest = metadata.get("arguments_digest")
     if expected_digest and not hmac.compare_digest(
         str(expected_digest), str(target["arguments_digest"])
@@ -585,11 +609,18 @@ async def _verify_approval(
         timeout = int(getattr(security, "approval_timeout_seconds", 900))
     except (TypeError, ValueError):
         timeout = 900
+    now = datetime.now(timezone.utc)
     try:
         created = datetime.fromisoformat(str(row["created_at"]))
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        expired = (datetime.now(timezone.utc) - created).total_seconds() > timeout
+        expired = (now - created).total_seconds() > timeout
+        # A card's own deadline can be shorter than the configured age limit.
+        if "expires_at" in row.keys() and str(row["expires_at"] or "").strip():
+            deadline = datetime.fromisoformat(str(row["expires_at"]))
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            expired = expired or now >= deadline
     except (TypeError, ValueError):
         expired = True
     if expired:

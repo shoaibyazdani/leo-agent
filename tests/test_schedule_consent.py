@@ -7,6 +7,7 @@ never covers an edit, a lifecycle action, a tool call or workspace trust.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -241,3 +242,29 @@ async def test_a_schedule_grant_does_not_authorize_tools_or_workspace_trust() ->
 def test_grant_bounds_are_sane() -> None:
     assert SCHEDULE_SESSION_GRANT_SECONDS == 8 * 60 * 60
     assert 1 <= SCHEDULE_ALWAYS_GRANT_DAYS <= 365
+
+
+async def test_fallback_deny_reason_is_audited_but_normalized_to_the_model() -> None:
+    """N1: a web/API denial with no free text must not invent a human reason."""
+    from leo.schedules.outcome import ScheduleOutcome, resolve_outcome_truth
+
+    permissions = _manager()
+    card = await _card(permissions)
+    decision = await _resolve(permissions, card, choice="deny")
+    assert decision.status == "denied"
+
+    stored = await db.fetchone(
+        "SELECT deny_reason FROM approvals WHERE id=?", (card.approval_id,)
+    )
+    assert stored["deny_reason"] == "denied by operator"
+
+    resolved = await resolve_outcome_truth(
+        ScheduleOutcome(
+            operation="create", status="approval_required", name="Water",
+            approval_id=card.approval_id,
+        )
+    )
+    projected = resolved.as_dict()
+    assert projected["status"] == "denied"
+    assert projected["deny_reason"] == "no reason given"
+    assert "denied by operator" not in json.dumps(projected).lower()

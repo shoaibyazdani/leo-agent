@@ -116,9 +116,29 @@ def test_oversized_digit_strings_are_stable_invalid_duration() -> None:
         with pytest.raises(ScheduleGrammarError) as caught:
             _parse(text)
         assert caught.value.code == "invalid_duration"
+        assert "too large" in str(caught.value)
 
     # Bounded leading zeros are still a normal duration.
     assert parse_duration(f"{'0' * 100}7m") == 7
+
+
+def test_in_duration_keeps_too_large_wording() -> None:
+    """An oversized 'in …' count is too large, not an out-of-range instant."""
+    huge = "9" * 4301
+    for text in ("in 1000000000d", "in 99999999999999999999m", f"in {huge}m"):
+        with pytest.raises(ScheduleGrammarError) as caught:
+            _parse(text)
+        assert isinstance(caught.value, ScheduleGrammarError)
+        assert caught.value.code == "invalid_duration"
+        assert str(caught.value) == (
+            "Invalid duration: the interval is too large. Use at most about 10 years."
+        )
+
+    # Ordinary bad durations still get the 'in …'-specific guidance.
+    with pytest.raises(ScheduleGrammarError) as caught:
+        _parse("in 30s")
+    assert caught.value.code == "invalid_duration"
+    assert "after 'in '" in str(caught.value)
 
 
 def test_legacy_every_is_capped_for_readers() -> None:

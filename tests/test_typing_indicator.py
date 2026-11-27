@@ -137,6 +137,41 @@ async def test_gateway_typing_swallows_and_logs_adapter_failures(caplog):
     assert any("indicator down" in getattr(record, "error", "") for record in caplog.records)
 
 
+async def test_telegram_typing_http_error_is_cosmetic(monkeypatch, caplog):
+    """HTTP >=400 must not surface through the adapter to the reply path."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "typing-token")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"ok": False})
+
+    adapter = TelegramAdapter(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with caplog.at_level("WARNING", logger="leo.integrations.messaging"):
+        assert await adapter.send_typing("42") is None
+
+    assert len(requests) == 1                     # the best-effort signal was sent
+    assert "telegram typing failed" in caplog.text
+    assert any(getattr(record, "status", None) == 503 for record in caplog.records)
+    assert "typing-token" not in caplog.text     # the token lives in the URL
+
+
+async def test_telegram_typing_transport_error_is_cosmetic(monkeypatch, caplog):
+    """A dead transport is swallowed too; no caller-visible failure."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "typing-token")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    adapter = TelegramAdapter(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with caplog.at_level("WARNING", logger="leo.integrations.messaging"):
+        assert await adapter.send_typing("42") is None
+
+    assert "telegram typing failed" in caplog.text
+    assert any(getattr(record, "error", "") == "ConnectError" for record in caplog.records)
+    assert "typing-token" not in caplog.text
+
+
 async def _confirm(gateway: Gateway, payload: dict) -> dict:
     return await gateway.send(
         payload["channel"],

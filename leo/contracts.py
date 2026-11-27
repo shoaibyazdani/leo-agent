@@ -26,6 +26,12 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Shared lease bound for a one-shot live schedule run/cancel authorization.
+# The schedule service and the automation specialist must agree on when an
+# unfinished claim becomes stale and can be reclaimed.
+LIVE_AUTH_CLAIM_TTL_SECONDS = 300
+
+
 class RiskLevel(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
@@ -106,6 +112,11 @@ class ToolCall(BaseRecord):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     correlation_id: str | None = None
+    # Trusted per-turn identity, copied from TurnContext.tool_fields() at the
+    # entry point. Unlike correlation_id (a routing value often shared by every
+    # call in one conversation), this is unique to one turn. Never derive it
+    # from tool arguments: handlers and model output cannot widen provenance.
+    turn_id: str | None = None
     actor: str = "assistant"
     dry_run: bool = False
     # Trusted provenance, populated at trusted construction sites (chat, API,
@@ -240,6 +251,10 @@ class TurnContext(BaseModel):
 
     principal: str = "chat"
     channel: str = "cli"
+    # Fresh, trusted identity for this turn. It is minted when the context is
+    # built at the entry point and copied onto every ToolCall via tool_fields(),
+    # so dedupe can be per turn rather than per conversation/time window.
+    turn_id: str = Field(default_factory=lambda: new_id("turn"))
     conversation_id: str | None = None
     thread_id: str | None = None
     target: str | None = None
@@ -266,6 +281,7 @@ class TurnContext(BaseModel):
             "source": self.source,
             "origin": self.origin or self.channel or None,
             "principal": self.principal,
+            "turn_id": self.turn_id,
             "conversation_id": self.conversation_id,
             "thread_id": self.thread_id,
             "capabilities": self.capabilities.model_dump(mode="json"),

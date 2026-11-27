@@ -14,7 +14,7 @@ import pytest
 
 from leo import db
 from leo.config import ModelConfig, ModelProviderConfig, Settings
-from leo.contracts import RiskLevel, ToolCall, ToolSpec
+from leo.contracts import RiskLevel, ToolCall, ToolSpec, TurnContext
 from leo.core import LeoApp
 from leo.events import EventBus
 from leo.interfaces import api as api_module
@@ -54,6 +54,25 @@ async def executor_env(tmp_path):
         ),
         send_handler,
     )
+
+    async def low_send_handler(args: dict, ctx: dict):  # type: ignore[no-untyped-def]
+        executed.append("gateway.send")
+        return {"sent": True}
+
+    # An outbound reply registered LOW and named in the allowlist: the
+    # category-first gate must still refuse it (N11 invariant).
+    registry.register(
+        ToolSpec(
+            name="gateway.send", description="low-tier outbound fixture",
+            category="messaging", risk=RiskLevel.LOW, resource_field="",
+            input_schema={
+                "type": "object",
+                "properties": {"target": {"type": "string"}, "text": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        ),
+        low_send_handler,
+    )
     executor = ToolExecutorImpl(
         registry, PermissionManagerImpl(settings, events), events, settings
     )
@@ -86,6 +105,81 @@ async def test_medium_outbound_is_denied_with_one_notice_and_zero_approvals(exec
     assert payload["category"] == "outbound"
     assert payload["principal"] == "scheduled"
     assert payload["conversation_id"] == "conv-scheduled"
+
+
+async def test_low_tier_allowlisted_outbound_stays_denied(executor_env):
+    """N11: category classification wins over both risk tier and the name list."""
+    call = ToolCall(
+        name="gateway.send",
+        arguments={"target": "chat:origin", "text": "scheduled reply"},
+        actor="scheduled-worker", source="scheduled", origin="scheduled",
+        principal="scheduled", conversation_id="conv-scheduled",
+    )
+    result = await executor_env.executor.execute(call)
+
+    assert result.success is False
+    assert result.decision == "denied"
+    assert result.metadata["unattended_gate"]["category"] == "outbound"
+    assert executor_env.executed == []
+
+
+async def test_needs_you_dedupe_key_is_truly_per_turn(executor_env):
+    """N4: correlation id and elapsed time are not turn boundaries."""
+    def call_for(turn: TurnContext) -> ToolCall:
+        return ToolCall(
+            name="channel_send",
+            arguments={"target": "chat:someone-else", "text": "routine update"},
+            actor="scheduled-worker",
+            correlation_id="conv-scheduled",  # deliberately shared by both turns
+            **turn.tool_fields(),
+        )
+
+    first_turn = TurnContext(
+        principal="scheduled", conversation_id="conv-scheduled",
+        surface="cli", source="scheduled",
+    )
+    second_turn = TurnContext(
+        principal="scheduled", conversation_id="conv-scheduled",
+        surface="cli", source="scheduled",
+    )
+    assert first_turn.turn_id != second_turn.turn_id
+
+    first, second = call_for(first_turn), call_for(second_turn)
+    assert (await executor_env.executor.execute(first)).success is False
+    assert (await executor_env.executor.execute(second)).success is False
+    notices = await db.fetchall(
+        "SELECT payload FROM events WHERE topic='automation.needs_you'"
+    )
+    assert len(notices) == 2
+
+    # A repeated call in the same turn dedupes no matter how much wall-clock
+    # time has passed: the trusted turn id, not a 60s window, is the key.
+    key = executor_env.executor._turn_key(first)
+    assert key[0] == "turn"
+    executor_env.executor._notice_history[key] = 0.0
+    assert (await executor_env.executor.execute(first)).success is False
+    notices = await db.fetchall(
+        "SELECT payload FROM events WHERE topic='automation.needs_you'"
+    )
+    assert len(notices) == 2
+
+
+async def test_needs_you_legacy_calls_keep_windowed_dedupe(executor_env):
+    """Callers without a trusted turn id still get the bounded fallback."""
+    call = ToolCall(
+        name="channel_send",
+        arguments={"target": "chat:someone-else", "text": "routine update"},
+        actor="scheduled-worker", source="scheduled", origin="scheduled",
+        principal="scheduled", conversation_id="conv-scheduled",
+        correlation_id="conv-scheduled",
+    )
+    assert executor_env.executor._turn_key(call)[0] == "legacy"
+    for _ in range(2):
+        assert (await executor_env.executor.execute(call)).success is False
+    notices = await db.fetchall(
+        "SELECT payload FROM events WHERE topic='automation.needs_you'"
+    )
+    assert len(notices) == 1
 
 
 async def test_prompt_is_re_scanned_at_execution_and_fails_closed(tmp_path):

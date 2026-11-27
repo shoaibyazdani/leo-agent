@@ -6,6 +6,7 @@ approval-required schedule must have that claim replaced by durable store truth.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -19,6 +20,7 @@ from leo.schedules.outcome import (
     ScheduleOutcomeRegistry,
     enforce_truthful_answer,
     resolve_outcome_truth,
+    summary_line,
     truthful_summary,
 )
 
@@ -130,13 +132,39 @@ def test_placeholder_deny_reason_is_normalized_for_the_model_but_audited() -> No
     )
     projected = outcome.as_dict()
     assert projected["deny_reason"] == "no reason given"
-    assert projected["detail"]["deny_reason_placeholder"] == "no reason supplied"
+    # Audit marker only: no raw sentinel may be replayed to the model in detail.
+    assert projected["detail"]["deny_reason_placeholder"] is True
+    assert "no reason supplied" not in json.dumps(projected)
     # The durable record itself is untouched.
     assert outcome.deny_reason == "no reason supplied"
 
     summary = truthful_summary([outcome])
     assert "reason: no reason given" in summary
     assert "no reason supplied" not in summary
+
+
+def test_operator_fallback_deny_reason_is_also_normalized() -> None:
+    """N1: the PermissionManager fallback is not a human-authored reason."""
+    for sentinel in ("denied by operator", "Denied By Operator"):
+        outcome = ScheduleOutcome(
+            operation="update", status="denied", name="Water",
+            deny_reason=sentinel,
+        )
+        projected = outcome.as_dict()
+        assert projected["deny_reason"] == "no reason given"
+        assert projected["detail"]["deny_reason_placeholder"] is True
+        assert "denied by operator" not in json.dumps(projected).lower()
+        assert "reason: no reason given" in summary_line(outcome)
+        assert outcome.deny_reason == sentinel
+
+    # A real human reason stays verbatim and gets no placeholder marker.
+    human = ScheduleOutcome(
+        operation="create", status="denied", name="Water",
+        deny_reason="too expensive",
+    )
+    projected = human.as_dict()
+    assert projected["deny_reason"] == "too expensive"
+    assert "deny_reason_placeholder" not in projected.get("detail", {})
 
 
 async def test_resolved_placeholder_deny_reason_reaches_the_model_normalized() -> None:

@@ -747,6 +747,10 @@ def parse_schedule(
         duration_text = text[3:].strip()
         try:
             minutes = parse_duration(duration_text)
+        except _DurationTooLarge:
+            # Keep the stable "too large" wording from parse_duration: the
+            # duration is unbounded by design, not an out-of-range instant.
+            raise
         except ScheduleGrammarError:
             raise _error(
                 "invalid_duration",

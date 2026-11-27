@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -546,6 +546,35 @@ async def _approved_edit_card(env, name: str = "job") -> dict:
     return card
 
 
+async def _approved_specialist_card(env, tool_name: str, arguments: dict) -> str:
+    """Create and resolve one exact-action automation:mutate approval."""
+    from leo.agents.specs.automation_operator import approval_target
+    from leo.contracts import RiskLevel
+
+    target = approval_target(tool_name, arguments)
+    decision = await env.permissions.authorize(
+        "automation-operator", target["action"], target["resource"],
+        RiskLevel.HIGH, arguments_digest=target["arguments_digest"],
+        tool=tool_name,
+    )
+    assert decision.requires_approval and decision.approval_id
+    resolved = await env.permissions.resolve_approval(
+        decision.approval_id, True, "operator:local"
+    )
+    assert resolved.allowed
+    return str(decision.approval_id)
+
+
+async def _live_authorization_markers(approval_id: str) -> dict:
+    row = await db.fetchone(
+        "SELECT json_extract(metadata,'$.live_authorization_used_at') AS used_at,"
+        "json_extract(metadata,'$.live_authorization_claim') AS claim "
+        "FROM approvals WHERE id=?", (approval_id,),
+    )
+    assert row is not None
+    return {"used_at": row["used_at"], "claim": json.loads(row["claim"] or "null")}
+
+
 async def test_approved_edit_card_authorizes_one_manual_run_and_one_cancel(env):
     await _create_operator(env, name="job", schedule="1h", prompt="run")
     run_card = await _approved_edit_card(env)
@@ -625,6 +654,131 @@ async def test_approved_edit_card_live_authorization_has_one_concurrent_winner(e
     failures = [item for item in results if isinstance(item, ScheduleServiceError)]
     assert len(successes) == 1 and len(failures) == 1
     assert failures[0].code == "authorization_consumed"
+
+
+async def test_specialist_run_card_is_single_use_and_time_bounded(env):
+    """N2: one automation:mutate approval may authorize exactly one live run."""
+    await _create_operator(env, name="job", schedule="1h", prompt="run")
+    approval_id = await _approved_specialist_card(
+        env, "schedule_run_now", {"name": "job"}
+    )
+    first = await env.service.run_now(
+        name="job", actor="automation-operator", authorized_by=approval_id,
+    )
+    assert first["status"] == "running"
+    markers = await _live_authorization_markers(approval_id)
+    assert markers["used_at"] and markers["claim"] is None
+
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="job", actor="automation-operator", authorized_by=approval_id,
+        )
+    assert caught.value.code == "authorization_consumed"
+    assert dict(await db.fetchone(
+        "SELECT COUNT(*) AS n FROM tasks WHERE metadata LIKE '%manual_run%'"
+    ))["n"] == 1
+
+    # A fresh specialist approval outside its durable window is refused before
+    # any task is created.
+    stale = await _approved_specialist_card(
+        env, "schedule_run_now", {"name": "job"}
+    )
+    env.clock.advance(seconds=16 * 60)
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="job", actor="automation-operator", authorized_by=stale,
+        )
+    assert caught.value.code == "invalid_authorization"
+    assert dict(await db.fetchone(
+        "SELECT COUNT(*) AS n FROM tasks WHERE metadata LIKE '%manual_run%'"
+    ))["n"] == 1
+
+
+async def test_stale_live_authorization_lease_can_be_reclaimed(env):
+    """N3(a): the claim itself is time bounded, not a permanent lock."""
+    await _create_operator(env, name="job", schedule="1h", prompt="run")
+    card = await _approved_edit_card(env)
+    approval_id = card["approval_id"]
+    stale_at = (NOW - timedelta(seconds=301)).isoformat()
+    await db.execute(
+        "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+        "'$.live_authorization_claim', json_object('token',?,'at',?)) WHERE id=?",
+        ("old-lease", stale_at, approval_id),
+    )
+    run = await env.service.run_now(
+        name="job", actor="chat:web", turn=_chat("tui"),
+        authorized_by=approval_id,
+    )
+    assert run["status"] == "running"
+    markers = await _live_authorization_markers(approval_id)
+    assert markers["used_at"] and markers["claim"] is None
+
+
+async def test_failed_run_and_noop_cancel_do_not_burn_single_use_cards(env):
+    """N3(b): consume only after a durable effect, never on a no-op."""
+    await _create_operator(env, name="job", schedule="1h", prompt="run")
+    run_card = await _approved_edit_card(env)
+    approval_id = run_card["approval_id"]
+
+    await db.execute(
+        "UPDATE schedules SET enabled=0, status='retired' WHERE name='job'"
+    )
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=approval_id,
+        )
+    assert caught.value.code == "schedule_disabled"
+    markers = await _live_authorization_markers(approval_id)
+    assert markers["used_at"] is None and markers["claim"] is None
+
+    await db.execute(
+        "UPDATE schedules SET enabled=1, status='active' WHERE name='job'"
+    )
+    run = await env.service.run_now(
+        name="job", actor="chat:web", turn=_chat("tui"),
+        authorized_by=approval_id,
+    )
+    assert run["status"] == "running"
+    assert (await _live_authorization_markers(approval_id))["used_at"]
+
+    # A cancel with no live task reports the no-op and leaves its card intact.
+    await _create_operator(env, name="job2", schedule="1h", prompt="run")
+    cancel_card = await _approved_edit_card(env, name="job2")
+    cancel_id = cancel_card["approval_id"]
+    noop = await env.service.cancel(
+        name="job2", actor="chat:web", turn=_chat("tui"),
+        authorized_by=cancel_id,
+    )
+    assert noop["status"] == "no_live_run"
+    markers = await _live_authorization_markers(cancel_id)
+    assert markers["used_at"] is None and markers["claim"] is None
+
+    await env.service.run_now(name="job2", actor="operator:cli", turn=_operator())
+    cancelled = await env.service.cancel(
+        name="job2", actor="chat:web", turn=_chat("tui"),
+        authorized_by=cancel_id,
+    )
+    assert cancelled["status"] == "cancelled"
+    assert (await _live_authorization_markers(cancel_id))["used_at"]
+
+
+async def test_disabled_row_guard_names_retired_state_not_paused(env):
+    """N7: a retired/disabled row is not described as a paused row."""
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    pending = await env.service.update(
+        name="job", arguments={"prompt": "b"}, actor="chat:web", turn=_chat("tui")
+    )
+    await db.execute(
+        "UPDATE schedules SET enabled=0, status='retired' WHERE name='job'"
+    )
+    resolved = await _resolve(
+        env, pending["card"]["approval_id"], choice="once",
+        digest=pending["card"]["proposal_digest"],
+    )
+    assert resolved.status == "expired" and resolved.allowed is False
+    assert "disabled or retired" in resolved.reason
+    assert "paused or disabled" not in resolved.reason
 
 
 async def test_recurring_card_can_be_answered_after_its_first_tick(env):

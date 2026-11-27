@@ -52,6 +52,15 @@ _RESOURCE_KEYS = ("path", "cwd", "resource", "file", "directory", "root", "targe
 # an approval the scheduled run could never answer.
 _UNATTENDED_SOURCES = frozenset({"scheduled", "schedule", "unattended"})
 _UNATTENDED_RISKS = frozenset({RiskLevel.MEDIUM, RiskLevel.HIGH})
+# INVARIANT: the unattended gate classifies side effects by CATEGORY first and
+# consults this allowlist only afterwards (see _unattended_denial). The name
+# list is not a blanket permission: it only exempts read-only inspection and
+# research fetches from the MEDIUM/HIGH rule. A LOW-tier outbound send is still
+# a side effect and must stay denied. Never reorder the check to "allowlist
+# first, category later" or add an outbound/browser/computer/plugin/shell tool
+# here: that is exactly the reply-to-origin bypass this gate was written to
+# close. Every new allowlist entry needs a test proving an unattended side
+# effect is still refused regardless of its risk tier.
 # The MEDIUM/HIGH calls an unattended turn may make: state inspection and
 # read-only research fetches. Everything else that writes, mutates memory,
 # creates tasks/schedules or edits files is refused even when its tool category
@@ -83,10 +92,11 @@ _HINT_HISTORY_TTL_SECONDS = 300.0
 _HINT_HISTORY_MAX_KEYS = 128
 # An idle gap on the same conversation key means a new user turn began.
 _TURN_IDLE_SECONDS = 60.0
-# Operator notices are deduplicated per turn. The claim map is bounded in both
-# size and age: a long-lived worker must not grow it forever, and a new turn on
-# the same key always gets its own notice. Denials themselves are never dropped
-# from tool_calls/audit_log.
+# Operator notices are deduplicated per trusted turn id. The map is bounded in
+# size; legacy callers without a turn id still get the idle time window. A new
+# trusted turn always gets its own notice even when it shares a correlation id
+# or arrives milliseconds after the previous one. Denials themselves are never
+# dropped from tool_calls/audit_log.
 _NOTICE_HISTORY_MAX_KEYS = 128
 _NOTICE_WINDOW_SECONDS = _TURN_IDLE_SECONDS
 _ERROR_FIELD_RE = re.compile(r"field '([^']+)'")
@@ -630,14 +640,29 @@ class ToolExecutorImpl:
 
     @staticmethod
     def _turn_key(call: ToolCall) -> tuple[str, str]:
-        """Scope retry counters to one actor/turn without trusting the handler."""
-        turn = (
-            getattr(call, "turn_id", None)
-            or getattr(call, "task_id", None)
+        """Scope retry counters to one actor and one trusted turn.
+
+        ``turn_id`` is minted on TurnContext at the trusted entry point and
+        copied onto calls by ``tool_fields()``; it is never taken from tool
+        arguments. The first tuple item marks a trusted turn so notice dedupe
+        can skip the idle time window: two calls in the same turn dedupe forever
+        and two different turns never dedupe, even with the same correlation id.
+        Legacy callers with no turn id keep the bounded time-window fallback.
+        """
+        actor = str(getattr(call, "actor", None) or "anonymous")
+        trusted = str(getattr(call, "turn_id", "") or "").strip()
+        if not trusted:
+            turn = current_turn_context()
+            if turn is not None:
+                trusted = str(getattr(turn, "turn_id", "") or "").strip()
+        if trusted:
+            return ("turn", f"{actor}:{trusted}")
+        legacy = (
+            getattr(call, "task_id", None)
             or call.correlation_id
             or "default"
         )
-        return (str(getattr(call, "actor", None) or "anonymous"), str(turn))
+        return ("legacy", f"{actor}:{legacy}")
 
     def _policy_hint(
         self, call: ToolCall, decision: str, error: str
@@ -792,7 +817,10 @@ class ToolExecutorImpl:
                     oldest = min(history, key=lambda k: history[k])
                     history.pop(oldest, None)
             seen = history.get(key)
-            if seen is not None and now - seen <= _NOTICE_WINDOW_SECONDS:
+            trusted_turn = key[0] == "turn"
+            if seen is not None and (
+                trusted_turn or now - seen <= _NOTICE_WINDOW_SECONDS
+            ):
                 return
             history[key] = now
         try:

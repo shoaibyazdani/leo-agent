@@ -397,6 +397,77 @@ async def test_undeclared_media_thread_capability_is_not_inferred(outbox: Path):
     assert adapter.media_calls == []
 
 
+async def test_thread_gate_runs_before_media_resolution(monkeypatch, outbox: Path):
+    """An undeclared thread is refused uniformly; no attachment work is done."""
+    class _NoThreads(MediaAdapter):
+        supports_threaded_text = False
+        supports_threaded_media = False
+
+    adapter, permission = _NoThreads(), RecordingPermission()
+    gateway = build_gateway(adapter, permission, outbox)
+    resolutions: list[str] = []
+    real_resolve = resolve_outbound_media
+
+    def spy(media, root):
+        resolutions.append(str(media))
+        return real_resolve(media, root)
+
+    monkeypatch.setattr("leo.integrations.gateway.resolve_outbound_media", spy)
+    path = make_file(outbox, "topic.png")
+
+    text = await gateway.send("telegram", "chat-1", "hello", thread_id="7")
+    media = await gateway.send(
+        "telegram", "chat-1", "brief", media=str(path), thread_id="7"
+    )
+
+    # Both combinations refuse with an honest receipt, never an exception from
+    # path resolution, and the thread gate never touches the file.
+    assert text["success"] is False and media["success"] is False
+    assert text["error"] == "telegram adapter cannot address a thread"
+    assert media["error"] == "telegram adapter cannot address a thread with media"
+    assert resolutions == []
+    assert adapter.text_calls == [] and adapter.media_calls == []
+    assert permission.calls == []
+
+
+async def test_declared_thread_capability_is_checked_against_the_sender(
+    monkeypatch, outbox: Path,
+):
+    """A declaration alone cannot claim a thread the sender cannot address."""
+    class _DeclaredButCannotThread(MediaAdapter):
+        supports_threaded_text = True
+        supports_threaded_media = True
+
+        async def send(self, target, text) -> dict:       # no thread_id keyword
+            return {"channel": self.channel, "success": True, "message_id": "text"}
+
+        async def send_media(self, target, media, *, caption="", root=None) -> dict:
+            return {"channel": self.channel, "success": True, "message_id": "media"}
+
+    adapter, permission = _DeclaredButCannotThread(), RecordingPermission()
+    gateway = build_gateway(adapter, permission, outbox)
+    resolutions: list[str] = []
+    real_resolve = resolve_outbound_media
+
+    def spy(media, root):
+        resolutions.append(str(media))
+        return real_resolve(media, root)
+
+    monkeypatch.setattr("leo.integrations.gateway.resolve_outbound_media", spy)
+    path = make_file(outbox, "topic.png")
+
+    text = await gateway.send("telegram", "chat-1", "hello", thread_id="7")
+    media = await gateway.send(
+        "telegram", "chat-1", "brief", media=str(path), thread_id="7"
+    )
+
+    assert text["success"] is False and media["success"] is False
+    assert "thread with media" in media["error"]
+    assert resolutions == []
+    assert adapter.text_calls == [] and adapter.media_calls == []
+    assert permission.calls == []
+
+
 async def test_telegram_send_media_carries_the_message_thread_id(
     monkeypatch, outbox: Path,
 ):

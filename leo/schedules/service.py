@@ -22,12 +22,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .. import db
-from ..contracts import Decision, RiskLevel, TurnContext, current_turn_context
+from ..contracts import (
+    LIVE_AUTH_CLAIM_TTL_SECONDS,
+    Decision,
+    RiskLevel,
+    TurnContext,
+    current_turn_context,
+    new_id,
+)
 from ..security.approval_cards import (
     KIND_SCHEDULE_CREATE,
     KIND_SCHEDULE_EDIT,
@@ -72,6 +79,10 @@ _UNATTENDED_TURN_SOURCES = frozenset(
 # The automation specialist's durable, exact-action mutation approval. It is
 # re-verified by the trusted specialist before it reaches this service.
 _SPECIALIST_APPROVAL_ACTION = "automation:mutate"
+# A live run/cancel capability is claimed atomically before dispatch and
+# consumed only after a durable effect. LIVE_AUTH_CLAIM_TTL_SECONDS (contracts)
+# makes an unfinished claim stale and reclaimable after a crashed worker, while
+# outlasting the default tool timeout so a slow call does not lose its lease.
 _CREATE = "create"
 _UPDATE = "update"
 _REMOVE = "remove"
@@ -484,69 +495,77 @@ class ScheduleService:
         turn = turn or current_turn_context()
         actor = self._actor(actor, turn)
         view = await self._resolve_view(schedule_id=schedule_id, name=name)
-        await self._require_live_run_authorization(
+        claim = await self._claim_live_run_authorization(
             view, actor=actor, turn=turn, authorized_by=authorized_by,
             operation="fire",
         )
-        if not view.enabled or view.status != "active":
-            raise _fail(
-                "schedule_disabled",
-                f"Schedule {view.name!r} is not active.",
-                field="name",
-            )
-        spec = spec_from_view(view)
-        objective = schedule_payload(spec)["objective"]
-        transient = str(prompt or "").strip()
-        if transient:
-            objective = f"{objective}\n\nOne-off context: {transient}"
+        effected = False
+        try:
+            if not view.enabled or view.status != "active":
+                raise _fail(
+                    "schedule_disabled",
+                    f"Schedule {view.name!r} is not active.",
+                    field="name",
+                )
+            spec = spec_from_view(view)
+            objective = schedule_payload(spec)["objective"]
+            transient = str(prompt or "").strip()
+            if transient:
+                objective = f"{objective}\n\nOne-off context: {transient}"
 
-        moment = self._parse_run_at(run_at)
-        key = request_key or moment.isoformat()
-        metadata = {
-            "schedule": view.name,
-            "schedule_id": view.id,
-            "scheduled_for": moment.isoformat(),
-            "manual_run": True,
-            "schedule_payload": schedule_payload(spec),
-        }
-        task = await self.engine.create(
-            objective,
-            metadata=metadata,
-            idempotency_key=f"schedule:{view.id}:manual:{key}",
-        )
-        status = getattr(task.status, "value", task.status)
-        await self._audit(
-            actor, "schedule.run", view.id, "manual background run",
-            {"schedule_id": view.id, "task_id": task.id, "manual_run": True},
-        )
-        if self.events is not None:
-            await self.events.emit(
-                "schedule.triggered",
+            moment = self._parse_run_at(run_at)
+            key = request_key or moment.isoformat()
+            metadata = {
+                "schedule": view.name,
+                "schedule_id": view.id,
+                "scheduled_for": moment.isoformat(),
+                "manual_run": True,
+                "schedule_payload": schedule_payload(spec),
+            }
+            task = await self.engine.create(
+                objective,
+                metadata=metadata,
+                idempotency_key=f"schedule:{view.id}:manual:{key}",
+            )
+            effected = True
+            status = getattr(task.status, "value", task.status)
+            await self._audit(
+                actor, "schedule.run", view.id, "manual background run",
+                {"schedule_id": view.id, "task_id": task.id, "manual_run": True},
+            )
+            if self.events is not None:
+                await self.events.emit(
+                    "schedule.triggered",
+                    name=view.name,
+                    schedule_id=view.id,
+                    task_id=task.id,
+                    task_count=1,
+                    manual_run=True,
+                    scheduled_for=moment.isoformat(),
+                )
+            outcome = ScheduleOutcome(
+                operation=_RUN,
+                status="running",
                 name=view.name,
                 schedule_id=view.id,
+                message="background task created; no repeat or cadence was consumed",
+                detail={"task_id": task.id, "task_status": str(status), "manual_run": True},
+            )
+            result = self._finish(
+                outcome,
                 task_id=task.id,
+                task_status=str(status),
+                triggered=True,
                 task_count=1,
                 manual_run=True,
-                scheduled_for=moment.isoformat(),
+                executed=False,
+                run_at=moment.isoformat(),
             )
-        outcome = ScheduleOutcome(
-            operation=_RUN,
-            status="running",
-            name=view.name,
-            schedule_id=view.id,
-            message="background task created; no repeat or cadence was consumed",
-            detail={"task_id": task.id, "task_status": str(status), "manual_run": True},
-        )
-        return self._finish(
-            outcome,
-            task_id=task.id,
-            task_status=str(status),
-            triggered=True,
-            task_count=1,
-            manual_run=True,
-            executed=False,
-            run_at=moment.isoformat(),
-        )
+        except BaseException:
+            await self._settle_live_run_authorization(claim, consumed=effected)
+            raise
+        await self._settle_live_run_authorization(claim, consumed=effected)
+        return result
 
     async def cancel(
         self,
@@ -561,70 +580,78 @@ class ScheduleService:
         turn = turn or current_turn_context()
         actor = self._actor(actor, turn)
         view = await self._resolve_view(schedule_id=schedule_id, name=name)
-        await self._require_live_run_authorization(
+        claim = await self._claim_live_run_authorization(
             view, actor=actor, turn=turn, authorized_by=authorized_by,
             operation="stop",
         )
-        if task_id:
-            rows = await db.fetchall(
-                "SELECT id,status,metadata FROM tasks WHERE id=?", (str(task_id),)
-            )
-        else:
-            rows = await db.fetchall(
-                "SELECT id,status,metadata FROM tasks "
-                "WHERE status NOT IN ('completed','failed','cancelled') "
-                "AND (json_extract(metadata,'$.schedule_id')=? "
-                "OR json_extract(metadata,'$.schedule')=?)",
-                (view.id, view.name),
-            )
-        cancelled: list[dict[str, Any]] = []
-        for row in rows or []:
-            metadata = self._load_json(row["metadata"])
+        effected = False
+        try:
             if task_id:
-                if str(metadata.get("schedule_id") or "") != view.id and str(
-                    metadata.get("schedule") or ""
-                ) != view.name:
-                    raise _fail(
-                        "task_not_for_schedule",
-                        "The task does not belong to this schedule.",
-                        field="task_id",
-                    )
-            if str(row["status"]) in ("completed", "failed", "cancelled"):
-                continue
-            try:
-                await self.engine.cancel(str(row["id"]))
-            except ValueError:
-                continue
-            cancelled.append({"task_id": str(row["id"]), "status": "cancelled"})
-        await self._audit(
-            actor, "schedule.cancel", view.id, "stop live run only",
-            {
-                "schedule_id": view.id,
-                "tasks": [item["task_id"] for item in cancelled],
-            },
-        )
-        if self.events is not None:
-            await self.events.emit(
-                "schedule.cancelled",
+                rows = await db.fetchall(
+                    "SELECT id,status,metadata FROM tasks WHERE id=?", (str(task_id),)
+                )
+            else:
+                rows = await db.fetchall(
+                    "SELECT id,status,metadata FROM tasks "
+                    "WHERE status NOT IN ('completed','failed','cancelled') "
+                    "AND (json_extract(metadata,'$.schedule_id')=? "
+                    "OR json_extract(metadata,'$.schedule')=?)",
+                    (view.id, view.name),
+                )
+            cancelled: list[dict[str, Any]] = []
+            for row in rows or []:
+                metadata = self._load_json(row["metadata"])
+                if task_id:
+                    if str(metadata.get("schedule_id") or "") != view.id and str(
+                        metadata.get("schedule") or ""
+                    ) != view.name:
+                        raise _fail(
+                            "task_not_for_schedule",
+                            "The task does not belong to this schedule.",
+                            field="task_id",
+                        )
+                if str(row["status"]) in ("completed", "failed", "cancelled"):
+                    continue
+                try:
+                    await self.engine.cancel(str(row["id"]))
+                except ValueError:
+                    continue
+                effected = True
+                cancelled.append({"task_id": str(row["id"]), "status": "cancelled"})
+            await self._audit(
+                actor, "schedule.cancel", view.id, "stop live run only",
+                {
+                    "schedule_id": view.id,
+                    "tasks": [item["task_id"] for item in cancelled],
+                },
+            )
+            if self.events is not None:
+                await self.events.emit(
+                    "schedule.cancelled",
+                    name=view.name,
+                    schedule_id=view.id,
+                    tasks=[item["task_id"] for item in cancelled],
+                )
+            status = "cancelled" if cancelled else "no_live_run"
+            outcome = ScheduleOutcome(
+                operation=_CANCEL,
+                status=status,
                 name=view.name,
                 schedule_id=view.id,
-                tasks=[item["task_id"] for item in cancelled],
+                message="live tasks stopped; the schedule itself was not deleted",
+                detail={"tasks": cancelled},
             )
-        status = "cancelled" if cancelled else "no_live_run"
-        outcome = ScheduleOutcome(
-            operation=_CANCEL,
-            status=status,
-            name=view.name,
-            schedule_id=view.id,
-            message="live tasks stopped; the schedule itself was not deleted",
-            detail={"tasks": cancelled},
-        )
-        return self._finish(
-            outcome,
-            cancelled=bool(cancelled),
-            tasks=cancelled,
-            schedule_deleted=False,
-        )
+            result = self._finish(
+                outcome,
+                cancelled=bool(cancelled),
+                tasks=cancelled,
+                schedule_deleted=False,
+            )
+        except BaseException:
+            await self._settle_live_run_authorization(claim, consumed=effected)
+            raise
+        await self._settle_live_run_authorization(claim, consumed=effected)
+        return result
 
     async def withdraw_turn(
         self,
@@ -852,7 +879,7 @@ class ScheduleService:
         if current.status not in ("active", "paused"):
             raise _fail(
                 "disabled_update",
-                "This schedule is paused or disabled; an edit cannot re-enable it.",
+                "This schedule is disabled or retired; an edit cannot re-enable it.",
                 field="config_revision",
             )
         # A paused row is not claimable because ``enabled=0``. Keeping its
@@ -1302,7 +1329,38 @@ class ScheduleService:
             return False
         return str(turn.source or "").strip().lower() in _UNATTENDED_TURN_SOURCES
 
-    async def _require_live_run_authorization(
+    @staticmethod
+    def _parse_approval_instant(value: Any) -> datetime | None:
+        """Parse a durable approval timestamp; malformed values fail closed."""
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            moment = datetime.fromisoformat(text)
+        except (TypeError, ValueError):
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc)
+
+    def _approval_within_window(self, card: Any, now: datetime) -> bool:
+        """Both the card's own deadline and the configured approval age apply."""
+        expiry = self._parse_approval_instant(
+            card["expires_at"] if "expires_at" in card.keys() else None
+        )
+        if expiry is not None and now >= expiry:
+            return False
+        created = self._parse_approval_instant(card["created_at"])
+        if created is None:
+            return False
+        security = getattr(self.settings, "security", None)
+        try:
+            timeout = int(getattr(security, "approval_timeout_seconds", 900))
+        except (TypeError, ValueError):
+            timeout = 900
+        return 0 <= (now - created).total_seconds() <= max(timeout, 0)
+
+    async def _claim_live_run_authorization(
         self,
         view: Any,
         *,
@@ -1310,16 +1368,18 @@ class ScheduleService:
         turn: TurnContext | None,
         authorized_by: str | None,
         operation: str,
-    ) -> None:
-        """Only an operator or a human-approved card may fire/kill runs.
+    ) -> tuple[str, str] | None:
+        """Atomically lease a one-shot capability to fire/kill one live run.
 
-        A model turn may ask for a definition change, but it must not start a
-        live run with an appended prompt or cancel work unasked. Accepted cards
-        are either a schedule edit for this job or the specialist's exact-action
-        mutation approval; both are trusted plumbing, never a tool field.
+        Only an operator or a fresh, human-approved card may proceed. Both
+        accepted card kinds (a schedule edit for this job and the specialist's
+        exact-action ``automation:mutate`` approval) get the same lease: the
+        conditional metadata write means exactly one concurrent caller can win,
+        and settlement consumes the card only after a durable effect. A failed
+        or no-op action releases the lease instead of burning the card.
         """
         if self._is_operator(turn, actor):
-            return
+            return None
         card_id = str(authorized_by or "").strip()
         if not card_id:
             raise _fail(
@@ -1328,26 +1388,36 @@ class ScheduleService:
                 "schedule edit card.",
                 field="authorization",
             )
-        card = await db.fetchone(
-            "SELECT id,status,kind,action,resource,proposal_id,"
-            "json_extract(metadata,'$.schedule_id') AS schedule_id "
-            "FROM approvals WHERE id=?",
-            (card_id,),
-        )
+        card = await db.fetchone("SELECT * FROM approvals WHERE id=?", (card_id,))
         if card is None or str(card["status"]) != "approved":
             raise _fail(
                 "invalid_authorization",
                 "The supplied approval is not approved.",
                 field="authorization",
             )
+        now = self._now()
+        if not self._approval_within_window(card, now):
+            raise _fail(
+                "invalid_authorization",
+                "The supplied approval has expired.",
+                field="authorization",
+            )
+        metadata = self._load_json(card["metadata"])
+        if metadata.get("live_authorization_used_at"):
+            raise _fail(
+                "authorization_consumed",
+                "This approval was already used to authorize a run or cancel.",
+                field="authorization",
+            )
         edit_card = (
             str(card["kind"]) == KIND_SCHEDULE_EDIT
-            and str(card["schedule_id"] or "") == view.id
+            and str(metadata.get("schedule_id") or "") == view.id
         )
         tool = "schedule_run_now" if operation == "fire" else "schedule_cancel"
+        resource = f"{tool}:{str(view.name)[:160]}"
         exact_action = (
             str(card["action"]) == _SPECIALIST_APPROVAL_ACTION
-            and str(card["resource"] or "") == f"{tool}:{str(view.name)[:160]}"
+            and str(card["resource"] or "") == resource
         )
         if not (edit_card or exact_action):
             raise _fail(
@@ -1355,24 +1425,65 @@ class ScheduleService:
                 "The supplied approval does not authorize this schedule run.",
                 field="authorization",
             )
-        if edit_card:
-            # An approved edit is a one-shot capability for live work, not a
-            # permanent grant. The conditional metadata write is the atomic
-            # marker: of two concurrent users of the same card exactly one
-            # wins, and every later reuse fails closed.
-            claimed = await db.execute(
-                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
-                "'$.live_authorization_used_at',?) "
-                "WHERE id=? AND status='approved' AND kind=? "
-                "AND COALESCE(json_extract(metadata,'$.live_authorization_used_at'),'')=''",
-                (self._now_iso(), card_id, KIND_SCHEDULE_EDIT),
-            )
-            if int(getattr(claimed, "rowcount", 0) or 0) < 1:
+        existing = metadata.get("live_authorization_claim")
+        if isinstance(existing, Mapping):
+            claimed_at = self._parse_approval_instant(existing.get("at"))
+            if claimed_at is not None and 0 <= (now - claimed_at).total_seconds() \
+                    < LIVE_AUTH_CLAIM_TTL_SECONDS:
                 raise _fail(
                     "authorization_consumed",
-                    "This approved edit was already used to authorize a run or cancel.",
+                    "This approval is already authorizing another live action.",
                     field="authorization",
                 )
+        token = new_id("authz")
+        cutoff = (now - timedelta(seconds=LIVE_AUTH_CLAIM_TTL_SECONDS)).isoformat()
+        claimed = await db.execute(
+            "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+            "'$.live_authorization_claim', json_object('token',?,'at',?)) "
+            "WHERE id=? AND status='approved' "
+            "AND ((kind=? AND json_extract(metadata,'$.schedule_id')=?) "
+            "OR (action=? AND resource=?)) "
+            "AND COALESCE(json_extract(metadata,'$.live_authorization_used_at'),'')='' "
+            "AND (json_extract(metadata,'$.live_authorization_claim.token') IS NULL "
+            "OR COALESCE(json_extract(metadata,'$.live_authorization_claim.at'),'') < ?)",
+            (
+                token, now.isoformat(), card_id,
+                KIND_SCHEDULE_EDIT, view.id,
+                _SPECIALIST_APPROVAL_ACTION, resource,
+                cutoff,
+            ),
+        )
+        if int(getattr(claimed, "rowcount", 0) or 0) < 1:
+            raise _fail(
+                "authorization_consumed",
+                "This approval was already used to authorize a run or cancel.",
+                field="authorization",
+            )
+        return card_id, token
+
+    async def _settle_live_run_authorization(
+        self, claim: tuple[str, str] | None, *, consumed: bool
+    ) -> None:
+        """Consume a successful lease, or release it when nothing took effect."""
+        if claim is None:
+            return
+        card_id, token = claim
+        if consumed:
+            await db.execute(
+                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+                "'$.live_authorization_used_at',?,"
+                "'$.live_authorization_claim', json('null')) "
+                "WHERE id=? AND json_extract(metadata,'$.live_authorization_claim.token')=? "
+                "AND COALESCE(json_extract(metadata,'$.live_authorization_used_at'),'')=''",
+                (self._now_iso(), card_id, token),
+            )
+        else:
+            await db.execute(
+                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+                "'$.live_authorization_claim', json('null')) "
+                "WHERE id=? AND json_extract(metadata,'$.live_authorization_claim.token')=?",
+                (card_id, token),
+            )
 
     @staticmethod
     def _can_answer(turn: TurnContext | None) -> bool:

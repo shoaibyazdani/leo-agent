@@ -156,15 +156,41 @@ def _send_accepts_reply_to(send: Any) -> bool:
     )
 
 
-def _adapter_accepts_thread(adapter: MessagingAdapter, *, media: bool) -> bool:
-    """Explicit adapter declaration, not a signature guess.
+def _accepts_thread_keyword(sender: Any) -> bool:
+    """True when the concrete sender can be handed a ``thread_id`` keyword.
 
-    A ``**kwargs`` sender may ignore an unknown keyword and post to the group
-    root. Only a declared capability entitles the gateway to claim a threaded
+    A declaration alone is not enough: a sender with no such parameter would
+    raise on the call, so the send must be refused before any work is done.
+    A ``**kwargs`` sink can take the keyword; the declaration is what promises
+    it will honour it rather than silently posting to the group root.
+    Signature failures fail closed.
+    """
+    try:
+        params = inspect.signature(sender).parameters
+    except (TypeError, ValueError):
+        return False
+    param = params.get("thread_id")
+    if param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    ):
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _adapter_accepts_thread(adapter: MessagingAdapter, *, media: bool) -> bool:
+    """Declaration validated against the sender that will actually be used.
+
+    Text and media take different code paths, so the media declaration says
+    nothing about ``send`` and vice versa. Both the flag and a concrete
+    ``thread_id`` keyword are required before the gateway may claim a threaded
     delivery in the receipt.
     """
     attribute = "supports_threaded_media" if media else "supports_threaded_text"
-    return bool(getattr(adapter, attribute, False))
+    if not bool(getattr(adapter, attribute, False)):
+        return False
+    sender = getattr(adapter, "send_media" if media else "send", None)
+    return callable(sender) and _accepts_thread_keyword(sender)
 
 
 class Gateway:
@@ -851,7 +877,8 @@ class Gateway:
         """Best-effort presence hint; never raises to the reply path.
 
         Typing is cosmetic: a transport failure must not fail or delay delivery.
-        The adapter may raise, so the boundary logs and swallows here.
+        Built-in adapters swallow their own errors; a custom adapter may still
+        raise, so this boundary logs and swallows defensively.
         """
         adapter = self.adapters.get(str(channel))
         if adapter is None:
@@ -1025,28 +1052,30 @@ class Gateway:
         subject = subject or str(target)
         target_str = str(target)
         thread = str(thread_id) if thread_id not in (None, "") else None
-        media_path: Path | None = None
-        if media is not None and str(media).strip() != "":
-            # Confine and canonicalize before authorizing: the digest must cover
-            # the file that will actually be read, not the string that was typed.
-            media_path = resolve_outbound_media(media, self.outbound_media_root)
-            if not callable(getattr(adapter, "send_media", None)):
-                raise MessagingError(f"{channel} does not support outbound media")
-        # A requested thread is part of the destination. Gate on the sender that
-        # will actually be used: media takes a different path from text, so a
-        # text-only thread capability says nothing about an attachment. Fail the
-        # send rather than recording a "sent" receipt for the group root.
-        if thread and not _adapter_accepts_thread(adapter, media=media_path is not None):
+        media_requested = media is not None and str(media).strip() != ""
+        # A requested thread is part of the destination. Check the capability
+        # BEFORE resolving the attachment: an undeclared/unhonourable thread
+        # destination is refused the same way for text and media, with no file
+        # work and no exception tumbling out of path resolution. Fail closed
+        # rather than recording a "sent" receipt for the group root.
+        if thread and not _adapter_accepts_thread(adapter, media=media_requested):
             return {
                 "channel": channel,
                 "target": target_str,
                 "success": False,
                 "error": (
                     f"{channel} adapter cannot address a thread"
-                    if media_path is None else
+                    if not media_requested else
                     f"{channel} adapter cannot address a thread with media"
                 ),
             }
+        media_path: Path | None = None
+        if media_requested:
+            # Confine and canonicalize before authorizing: the digest must cover
+            # the file that will actually be read, not the string that was typed.
+            media_path = resolve_outbound_media(media, self.outbound_media_root)
+            if not callable(getattr(adapter, "send_media", None)):
+                raise MessagingError(f"{channel} does not support outbound media")
         # The resource is the immutable destination, never a caller-chosen
         # subject: changing only the subject must not forge a new resource.
         resource = f"{channel}:{target_str}"

@@ -9,6 +9,7 @@ cancel and task enqueue keep the specialist's exact durable
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -422,6 +423,68 @@ async def test_trigger_keeps_the_exact_gate_and_reports_queued(env) -> None:
     assert json.loads(row["metadata"])["manual_run"] is True
     assert await env.events.history("task.completed") == []
     assert_verifiable_evidence(result)
+
+
+async def test_specialist_live_approval_is_single_use(env) -> None:
+    """N2: one exact-action card cannot authorize unlimited run/cancel calls."""
+    await _service_create(env, name="once-only")
+    args = {"name": "once-only"}
+    approval_id = await approve(env, "schedule_run_now", args)
+
+    first = await run(env, action="trigger_schedule", **args, approval_id=approval_id)
+    assert first.success, first.error
+    assert first.output["status"] == "queued"
+
+    second = await run(env, action="trigger_schedule", **args, approval_id=approval_id)
+    assert second.success is False
+    assert second.output["status"] == "blocked_approval_required"
+    assert "already used" in second.output["approval"]["reason"]
+    tasks = await db.fetchall(
+        "SELECT id FROM tasks WHERE json_extract(metadata,'$.manual_run')=1"
+    )
+    assert len(tasks) == 1
+
+
+async def test_stale_live_lease_is_reclaimable_by_the_specialist(env) -> None:
+    """N3(a): a crashed worker's expired lease cannot lock a card forever."""
+    await _service_create(env, name="stale-lease")
+    args = {"name": "stale-lease"}
+    approval_id = await approve(env, "schedule_run_now", args)
+    stale_at = (datetime.now(timezone.utc) - timedelta(seconds=301)).isoformat()
+    await db.execute(
+        "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+        "'$.live_authorization_claim', json_object('token',?,'at',?)) WHERE id=?",
+        ("stale-lease-token", stale_at, approval_id),
+    )
+
+    result = await run(env, action="trigger_schedule", **args, approval_id=approval_id)
+    assert result.success, result.error
+    assert result.output["status"] == "queued"
+    stored = await db.fetchone(
+        "SELECT json_extract(metadata,'$.live_authorization_used_at') AS used_at "
+        "FROM approvals WHERE id=?", (approval_id,),
+    )
+    assert stored["used_at"]
+
+
+async def test_specialist_noop_cancel_does_not_burn_its_approval(env) -> None:
+    """N3: a no-op cancel releases the lease instead of consuming the card."""
+    await _service_create(env, name="cancel-now")
+    args = {"name": "cancel-now"}
+    approval_id = await approve(env, "schedule_cancel", args)
+
+    noop = await run(env, action="cancel_schedule", **args, approval_id=approval_id)
+    assert noop.success, noop.error
+    assert noop.output["status"] == "no_live_run"
+
+    await env.service.run_now(name="cancel-now", actor="operator:cli", turn=_operator_turn())
+    cancelled = await run(env, action="cancel_schedule", **args, approval_id=approval_id)
+    assert cancelled.success, cancelled.error
+    assert cancelled.output["status"] == "cancelled"
+
+    again = await run(env, action="cancel_schedule", **args, approval_id=approval_id)
+    assert again.success is False
+    assert again.output["status"] == "blocked_approval_required"
 
 
 async def test_cancel_declares_and_enforces_the_same_exact_gate(env) -> None:

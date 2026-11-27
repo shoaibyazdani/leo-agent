@@ -63,3 +63,28 @@ def test_dead_line_exceptions_are_removed_and_current_ones_are_explicit() -> Non
         assert scanner.is_reviewed(path, line, label)
     # A synthetic fixture line is not a blanket exception for the file.
     assert not scanner.is_reviewed("tests/test_tools_http.py", 99999, "openai key")
+
+
+def test_http_tool_fixture_exceptions_are_pattern_restricted() -> None:
+    """HTTP tool fixtures get only the pattern families they actually match."""
+    scanner = _scanner()
+    entries = scanner.REVIEWED_ALLOWLIST["tests/test_tools_http.py"]
+    known = {label for label, _ in scanner.PATTERNS}
+    for line_spec, reason in entries.items():
+        assert reason.startswith("only="), (line_spec, reason)
+        labels = set(reason.split(":", 1)[0][len("only="):].split("|"))
+        assert labels and labels <= known, (line_spec, labels)
+
+    # Current and historical fixtures that match one family only.
+    for line in (108, 669, 710, 736):
+        allowed = "openai key" if line in {108, 710, 736} else "assigned secret"
+        assert scanner.is_reviewed("tests/test_tools_http.py", line, allowed)
+        other = "assigned secret" if allowed == "openai key" else "openai key"
+        assert not scanner.is_reviewed("tests/test_tools_http.py", line, other)
+
+    # Fixtures that match both families need both labels, and still nothing else.
+    for line in (660, 686, 1373):
+        assert scanner.is_reviewed("tests/test_tools_http.py", line, "openai key")
+        assert scanner.is_reviewed("tests/test_tools_http.py", line, "assigned secret")
+        assert not scanner.is_reviewed("tests/test_tools_http.py", line, "private key")
+        assert not scanner.is_reviewed("tests/test_tools_http.py", line, "long hex")

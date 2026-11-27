@@ -90,9 +90,14 @@ def _bounded_stored_reason(value: Any) -> str | None:
 
 
 # Surfaces that cannot capture free text store an explicit sentinel instead of
-# pretending the human gave a reason. Keep that record for audit, but do not
-# present the sentinel to the model as if it were a human-authored reason.
-_PLACEHOLDER_DENY_REASONS = frozenset({"no reason supplied"})
+# pretending the human gave a reason. Gateway taps use "no reason supplied";
+# PermissionManager uses "denied by operator" when web/TUI/API denials carry no
+# free text. Both are system fallbacks, never human-authored reasons: keep the
+# durable record for audit, but normalize both to "no reason given" for the
+# model. Adding a new fallback at a denial source requires adding it here.
+_PLACEHOLDER_DENY_REASONS = frozenset(
+    {"no reason supplied", "denied by operator"}
+)
 
 
 def _is_placeholder_deny_reason(reason: str | None) -> bool:
@@ -161,9 +166,10 @@ class ScheduleOutcome:
         if reason:
             data["deny_reason"] = _model_deny_reason(reason)
             if _is_placeholder_deny_reason(reason):
-                # The gap stays explicit in the auditable tool result even
-                # though the model-facing field is normalized.
-                detail.setdefault("deny_reason_placeholder", reason)
+                # Audit-only marker: the raw sentinel stays in the durable
+                # approval row, but must not be replayed to the model in this
+                # tool result detail.
+                detail.setdefault("deny_reason_placeholder", True)
         if detail:
             data["detail"] = detail
         return data

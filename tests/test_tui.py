@@ -138,16 +138,46 @@ async def test_unknown_command_returns_false_and_approve_needs_an_id() -> None:
 def test_cli_exposes_chat_and_tui_commands() -> None:
     import inspect
 
+    from typer.main import get_command
+
     commands = {command.name: command for command in cli_mod.cli.registered_commands}
     assert {"chat", "tui"} <= set(commands)
-    # Both commands accept --conversation so a session can be resumed.
+    # Click builds the real help path from the command's parameter objects.
+    # Rich elides long option names when it detects a narrow console (CI has
+    # no TTY), so inspect the declaration and pin the render width explicitly.
+    root = get_command(cli_mod.cli)
+    runner = CliRunner()
     for name in ("chat", "tui"):
         signature = inspect.signature(commands[name].callback)
         assert "conversation" in signature.parameters
+        options = [
+            param for param in root.commands[name].params
+            if getattr(param, "name", None) == "conversation"
+        ]
+        assert len(options) == 1
+        assert "--conversation" in options[0].opts
+        assert "-c" in options[0].opts
+        help_result = runner.invoke(
+            cli_mod.cli, [name, "--help"], env={"COLUMNS": "120"}
+        )
+        assert help_result.exit_code == 0
+        assert "--conversation" in help_result.stdout
+
+
+def test_cli_conversation_option_is_not_tty_width_dependent() -> None:
+    """A narrow, non-TTY console may elide the text but not the CLI option."""
+    from typer.main import get_command
+
     runner = CliRunner()
-    help_result = runner.invoke(cli_mod.cli, ["chat", "--help"])
-    assert help_result.exit_code == 0
-    assert "--conversation" in help_result.stdout
+    narrow = runner.invoke(cli_mod.cli, ["chat", "--help"], env={"COLUMNS": "30"})
+    wide = runner.invoke(cli_mod.cli, ["chat", "--help"], env={"COLUMNS": "120"})
+    assert narrow.exit_code == 0
+    assert wide.exit_code == 0
+    assert "--conversation" in wide.stdout
+    command = get_command(cli_mod.cli).commands["chat"]
+    assert any(
+        "--conversation" in getattr(param, "opts", ()) for param in command.params
+    )
 
 
 @pytest.mark.asyncio
