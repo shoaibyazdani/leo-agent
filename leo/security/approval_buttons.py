@@ -211,16 +211,17 @@ def build_keyboard(
     arguments_digest: Any = None,
     trust_days: float | None = None,
     allow_workspace_trust: bool = True,
+    allow_command_grant: bool = True,
     include_session: bool = True,
 ) -> dict[str, Any]:
     """Approve / this-command / trust-workspace / Reject for one approval.
 
     ``This command`` covers the exact shell command (or the exact resource for
     path tools). ``Trust workspace`` covers ordinary shell/terminal work in the
-    checkout for its lifetime; destructive, credential, privilege,
-    arbitrary-code and self-modifying commands still ask. Both are scoped,
-    expiring grants, never a blanket allow, and are only offered where the
-    approval names that scope.
+    checkout for its lifetime. Both are scoped, expiring grants, never a blanket
+    allow, and are only offered where the approval names that scope and the
+    classifier marked the reason delegable. A hardline command cannot be covered
+    by either grant, so neither button is offered for one.
     """
     kind = approval_kind_for_action(action)
     scoped = session_grant_scopable(action, resource, arguments_digest)
@@ -230,7 +231,7 @@ def build_keyboard(
     ]
     rows = [first_row]
     second: list[dict[str, str]] = []
-    if include_session and scoped:
+    if include_session and allow_command_grant and scoped:
         label = (
             f"🔁 This command ({SESSION_GRANT_SECONDS // 3600}h)"
             if str(action or "") in ALWAYS_ARG_SCOPED_ACTIONS
@@ -242,6 +243,7 @@ def build_keyboard(
         })
     if (
         include_session
+        and allow_command_grant
         and allow_workspace_trust
         and str(action or "") in ALWAYS_ARG_SCOPED_ACTIONS
     ):

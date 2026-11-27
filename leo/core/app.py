@@ -29,6 +29,7 @@ from ..models import compaction
 from ..models.provider import ModelEmptyOutputError, ModelError
 from ..models.router import FINAL_ANSWER_ONLY_INSTRUCTION
 from ..security import ApprovalRequired, PermissionManagerImpl
+from ..security.permissions import arguments_digest, reason_is_trustable
 from ..security.notifier import ApprovalNotifier
 from ..security.risk_policy import assess_call
 from ..integrations.progress import ProgressReporter
@@ -817,17 +818,13 @@ class LeoApp:
         await self.task_reporting.start()
         # Only now is the adapter registry populated with enrolled channels.
         self.approval_notifier.start()
-        # A pending approval that outlived its timeout is a decision nobody can
-        # make any more. Nothing swept them, so they accumulated and any push
-        # would re-announce dead ones; expire them once per start.
+        # Timers are loop-local, so a restart re-evaluates every pending card
+        # from its stored deadline: stale ones get the explicit expiry notice,
+        # live ones get a fresh timer. The notifier is already listening here.
         try:
-            stale_hours = max(
-                0.05,
-                float(getattr(self.settings.security, "approval_timeout_seconds", 900)) / 3600.0,
-            )
-            await self.permissions.cleanup_approvals(older_than_hours=stale_hours, apply=True)
+            await self.permissions.recover_pending_expiries()
         except Exception as exc:  # noqa: BLE001 - housekeeping must never block startup
-            self.log.warning("approval sweep failed", extra={"error": type(exc).__name__})
+            self.log.warning("approval expiry recovery failed", extra={"error": type(exc).__name__})
         await self.gateway.recover_stale_outbox()
 
         # Channel matrix → dashboard: statuses are honest (blocked until the
@@ -2921,39 +2918,106 @@ class LeoApp:
             canonical = str(arguments)
         return (name.strip(), canonical)
 
-    def _safe_calls_before_wait(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Run a batch's safe steps before the ones that may wait for a human.
+    @staticmethod
+    def _call_parts(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Normalize a provider call into (name, arguments) for policy checks."""
+        name = str(raw.get("name") or raw.get("function", {}).get("name") or "")
+        arguments = raw.get("arguments")
+        if arguments is None:
+            arguments = raw.get("function", {}).get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (TypeError, ValueError):
+                arguments = {}
+        return name, arguments if isinstance(arguments, dict) else {}
 
-        Only applies when the turn holds for approvals. Ordering is stable, and
-        the provider still receives one result per announced call id, so a card
-        that is waiting cannot hold up unrelated read/write steps in the same
-        batch. A classifier failure ranks as "may wait" rather than moving an
-        unknown call ahead of known-safe work.
+    async def _call_will_wait(self, raw: dict[str, Any]) -> bool:
+        """Whether this call will actually hold for a human approval.
+
+        A HIGH classification alone is only a prediction: a live grant, a smart
+        reviewer or disabled gating can all let the call run without a card.
+        Mirror those gates before deciding to change the model's batch order.
+        """
+        security = self.settings.security
+        name, arguments = self._call_parts(raw)
+        registration = self.registry.get(name)
+        default = getattr(getattr(registration, "spec", None), "risk", RiskLevel.LOW)
+        try:
+            risk, reason = assess_call(name, arguments, default, self.settings)
+        except Exception:  # noqa: BLE001 - an unknown tool stays in its slot
+            return False
+        if risk is not RiskLevel.HIGH:
+            return False
+        if not getattr(security, "high_risk_requires_approval", True):
+            return False
+        if getattr(security, "approval_mode", "smart") == "off":
+            return False
+        action = "tool:" + name
+        # A hardline reason is refused by both grants and the reviewer even when
+        # a grant exists, so it is the one case we can know will wait.
+        if not reason_is_trustable(reason):
+            return True
+        command = str(arguments.get("command") or "") if action in {
+            "tool:shell", "tool:terminal"
+        } else ""
+        try:
+            if await self.permissions._has_live_grant(  # noqa: SLF001 - same package
+                action,
+                self._policy_resource(registration, arguments),
+                arguments_digest(arguments),
+                reason,
+                command=command,
+            ):
+                return False
+        except Exception:  # noqa: BLE001 - a lookup failure must not reorder
+            return False
+        # A trusted reason in smart mode goes to the reviewer before a human;
+        # ordering for an approval that may never happen changes the batch for
+        # no reason and can break a later call that consumes this call's output.
+        if (
+            getattr(security, "approval_mode", "smart") == "smart"
+            and getattr(security, "reviewer_enabled", False)
+            and self.permissions._reviewer is not None  # noqa: SLF001
+            and command.strip()
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _policy_resource(registration: Any, arguments: dict[str, Any]) -> str | None:
+        """Best-effort resource for the grant lookup, scoped like the executor."""
+        field = getattr(getattr(registration, "spec", None), "resource_field", None)
+        if field == "":
+            return None
+        keys = ([field] if isinstance(field, str) else []) + [
+            "path", "destination", "source", "target", "resource",
+        ]
+        for key in keys:
+            value = arguments.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (str, Path)):
+                try:
+                    return str(Path(value).expanduser().resolve())
+                except (OSError, RuntimeError, ValueError):
+                    return str(value)
+            return str(value)
+        return None
+
+    async def _safe_calls_before_wait(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Run safe steps before calls that will actually wait for a human.
+
+        Stable partition, and only when at least one call in the batch really
+        needs a card. With no approval wait, the model's order is preserved.
         """
         if not getattr(self.settings.security, "wait_for_approval", False) or len(calls) < 2:
             return list(calls)
-
-        def rank(raw: dict[str, Any]) -> int:
-            name = str(raw.get("name") or raw.get("function", {}).get("name") or "")
-            arguments = raw.get("arguments")
-            if arguments is None:
-                arguments = raw.get("function", {}).get("arguments", {})
-            if isinstance(arguments, str):
-                try:
-                    arguments = json.loads(arguments)
-                except (TypeError, ValueError):
-                    arguments = {}
-            if not isinstance(arguments, dict):
-                arguments = {}
-            registration = self.registry.get(name)
-            default = getattr(getattr(registration, "spec", None), "risk", RiskLevel.LOW)
-            try:
-                risk, _reason = assess_call(name, arguments, default, self.settings)
-            except Exception:  # noqa: BLE001 - an unknown tool stays in its slot
-                return 1
-            return 1 if risk is RiskLevel.HIGH else 0
-
-        return sorted(calls, key=rank)
+        waits = [await self._call_will_wait(raw) for raw in calls]
+        if not any(waits):
+            return list(calls)
+        return ([raw for raw, wait in zip(calls, waits) if not wait]
+                + [raw for raw, wait in zip(calls, waits) if wait])
 
     @staticmethod
     def _append_final_answer_instruction(request: Any) -> None:
@@ -3954,7 +4018,7 @@ class LeoApp:
                 )
                 new_executions = 0
                 round_duplicates = 0
-                for raw_call in self._safe_calls_before_wait(calls):
+                for raw_call in await self._safe_calls_before_wait(calls):
                     name = str(raw_call.get("name") or raw_call.get("function", {}).get("name", ""))
                     arguments = raw_call.get("arguments") or raw_call.get("function", {}).get("arguments", {})
                     if isinstance(arguments, str):
@@ -4603,7 +4667,7 @@ class LeoApp:
                 yield ev(type="status", status="tool", count=len(calls))
                 new_executions = 0
                 round_duplicates = 0
-                for raw_call in self._safe_calls_before_wait(calls):
+                for raw_call in await self._safe_calls_before_wait(calls):
                     if run_id in self._cancelled_runs or run_id in self._stop_runs:
                         # The assistant(tool_calls) row is already durable.
                         # Close every call that never ran with an explicit

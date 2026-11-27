@@ -53,7 +53,7 @@ from .notices import (
     REVIEW_FAILED_PREFIX,
     REVIEW_STAGED_PREFIX,
 )
-from .permissions import reason_is_trustable
+from .permissions import delegation_allowed
 
 _LOG = get_logger("security.notifier")
 
@@ -468,10 +468,14 @@ class ApprovalNotifier:
                     trust_days=float(
                         getattr(self.settings.security, "workspace_trust_days", 30) or 30
                     ),
-                    # A destructive/credential/arbitrary-code call is not covered
-                    # by a workspace trust, so do not offer a button that would lie.
-                    allow_workspace_trust=reason_is_trustable(
-                        payload.get("risk_reason")
+                    # A HIGH classifier reason cannot be covered by any grant,
+                    # including the exact-command one. Do not offer buttons that
+                    # would be refused on tap.
+                    allow_command_grant=delegation_allowed(
+                        action, payload.get("risk_trustable")
+                    ),
+                    allow_workspace_trust=delegation_allowed(
+                        action, payload.get("risk_trustable")
                     ),
                     # manual mode ignores grants, so offering trust buttons there
                     # would promise something the resolver will not honor.

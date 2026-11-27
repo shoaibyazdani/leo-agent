@@ -34,7 +34,7 @@ from ..security.approval_cards import (
     normalize_choice,
     schedule_terminal_text,
 )
-from ..security.permissions import reason_is_trustable
+from ..security.permissions import metadata_trustable
 
 _LOG = get_logger("gateway.callbacks")
 
@@ -288,10 +288,7 @@ async def handle_tap(
             if action_name not in ALWAYS_ARG_SCOPED_ACTIONS:
                 await reply("Workspace trust is only available for shell commands")
                 return {"ok": False, "reason": "workspace trust unavailable"}
-            if not reason_is_trustable(
-                str(metadata.get("risk_reason") or "")
-                if isinstance(metadata, Mapping) else ""
-            ):
+            if not metadata_trustable(action_name, metadata):
                 await reply(
                     "Workspace trust does not cover this command — approve it once"
                 )
@@ -317,6 +314,11 @@ async def handle_tap(
                     "channel": channel, "approval_id": approval_id,
                     "action": action_name})
                 return {"ok": False, "reason": "unscoped approval"}
+            if not metadata_trustable(action_name, metadata):
+                await reply(
+                    "This command grant does not cover a high-risk command — approve it once"
+                )
+                return {"ok": False, "reason": "hardline approval"}
             granted = await permissions.grant_session(
                 action_name, row["resource"], SESSION_GRANT_SECONDS, actor,
                 arguments_digest=digest or None,

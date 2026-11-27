@@ -15,7 +15,7 @@ import pytest
 
 from leo import db
 from leo.config import ChannelsConfig, Settings
-from leo.contracts import RiskLevel
+from leo.contracts import RiskLevel, RiskReason
 from leo.gateway.callbacks import handle_tap, install
 from leo.security.approval_buttons import build_callback_data
 from leo.security.permissions import PermissionManagerImpl
@@ -164,6 +164,7 @@ async def test_always_is_scoped_to_the_shell_command_digest(env) -> None:
     decision = await env.permissions.authorize(
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-one",
+        risk_reason=RiskReason("ordinary command", trustable=True),
     )
     assert decision.approval_id
 
@@ -181,12 +182,14 @@ async def test_always_is_scoped_to_the_shell_command_digest(env) -> None:
     same = await env.permissions.authorize(
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-one",
+        risk_reason=RiskReason("ordinary command", trustable=True),
     )
     assert same.allowed is True and same.reason == "approval grant"
 
     other = await env.permissions.authorize(
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-two",
+        risk_reason=RiskReason("ordinary command", trustable=True),
     )
     assert other.allowed is False and other.requires_approval is True
 
@@ -195,7 +198,7 @@ async def test_trust_workspace_tap_creates_a_workspace_grant(env) -> None:
     workspace = str(env.tmp_path.resolve())
     decision = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (rsvg-convert)",
+        risk_reason=RiskReason("unclassified command (rsvg-convert)", trustable=True),
     )
 
     result = await handle_tap(
@@ -211,7 +214,7 @@ async def test_trust_workspace_tap_creates_a_workspace_grant(env) -> None:
 
     normal = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (rsvg-convert)",
+        risk_reason=RiskReason("unclassified command (rsvg-convert)", trustable=True),
     )
     assert normal.allowed is True and normal.reason == "approval grant"
 
@@ -236,6 +239,24 @@ async def test_workspace_trust_is_refused_for_a_destructive_approval(env) -> Non
 
     assert result["ok"] is False and result["reason"] == "workspace trust unavailable"
     assert await db.fetchall("SELECT id FROM approval_grants") == []
+
+
+async def test_command_grant_is_refused_for_a_hardline_approval(env) -> None:
+    """Even a forged "This command" tap cannot make a grant cover hardline work."""
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", None, RiskLevel.HIGH,
+        risk_reason="rm is destructive", arguments_digest="digest-hardline",
+    )
+
+    result = await handle_tap(
+        "telegram", _tap(decision.approval_id, decision="session"),
+        settings=env.settings, permissions=env.permissions, adapters=env.adapters,
+    )
+
+    assert result["ok"] is False and result["reason"] == "hardline approval"
+    assert await db.fetchall("SELECT id FROM approval_grants") == []
+    row = await db.fetchone("SELECT status FROM approvals WHERE id=?", (decision.approval_id,))
+    assert row["status"] == "pending"
 
 
 async def test_a_foreign_payload_is_refused(env) -> None:

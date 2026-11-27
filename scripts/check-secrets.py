@@ -172,6 +172,9 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "1326": "only=openai key|assigned secret: synthetic fixture at its current line",
         "1413": "only=openai key|assigned secret: synthetic fixture at its current line",
     },
+    "leo/tools/shell_policy.py": {
+        "671": "only=assigned secret: local variable naming a classifier helper result",
+    },
     "tests/test_tools_webhook.py": {"33": "test fixture"},
     "tests/channels/test_a2a.py": {"42": "test fixture"},
     "tests/channels/test_wechat_crypto.py": {"61": "only=long hex: synthetic hex fixture"},
@@ -189,8 +192,8 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "146": "only=assigned secret: synthetic secret-refusal fixture",
         "169": "only=assigned secret: synthetic secret-refusal fixture",
     },
-    "leo/tools/shell_policy.py": {
-        "671": "only=assigned secret: local variable naming a classifier helper result",
+    "junit.xml": {
+        "1": "only=anthropic key|stripe live key: generated pytest evidence containing synthetic fixture names",
     },
     "tests/test_api.py": {
         "241": "test fixture", "345": "synthetic failure-message fixture",

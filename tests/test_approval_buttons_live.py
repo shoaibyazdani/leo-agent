@@ -20,13 +20,14 @@ import pytest
 
 from leo import db
 from leo.config import ChannelsConfig, Settings
-from leo.contracts import RiskLevel
+from leo.contracts import RiskLevel, RiskReason
 from leo.security.approval_buttons import (
     build_callback_data,
     build_keyboard,
     parse_callback_data,
 )
-from leo.security.permissions import PermissionManagerImpl
+from leo.security.permissions import PermissionManagerImpl, reason_is_trustable
+from leo.tools.shell_policy import assess_command
 
 OWNER = "100000001"
 STRANGER = "999999999"
@@ -272,6 +273,7 @@ async def test_a_shell_grant_is_scoped_to_the_exact_arguments_digest(env) -> Non
     first = await env.permissions.authorize(
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-one",
+        risk_reason=RiskReason("ordinary command", trustable=True),
     )
     assert first.requires_approval is True
 
@@ -282,12 +284,14 @@ async def test_a_shell_grant_is_scoped_to_the_exact_arguments_digest(env) -> Non
     same = await env.permissions.authorize(
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-one",
+        risk_reason=RiskReason("ordinary command", trustable=True),
     )
     assert same.allowed is True and same.reason == "approval grant"
 
     other = await env.permissions.authorize(
         "operator", "tool:shell", None, RiskLevel.HIGH,
         arguments_digest="digest-two",
+        risk_reason=RiskReason("ordinary command", trustable=True),
     )
     assert other.allowed is False and other.requires_approval is True
 
@@ -297,7 +301,7 @@ async def test_a_workspace_trust_covers_normal_shell_only(env) -> None:
     workspace = str(env.tmp_path.resolve())
     first = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (rsvg-convert)",
+        risk_reason=RiskReason("unclassified command (rsvg-convert)", trustable=True),
     )
     assert first.requires_approval is True
 
@@ -305,7 +309,7 @@ async def test_a_workspace_trust_covers_normal_shell_only(env) -> None:
 
     normal = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (rsvg-convert)",
+        risk_reason=RiskReason("unclassified command (rsvg-convert)", trustable=True),
     )
     assert normal.allowed is True and normal.reason == "approval grant"
 
@@ -342,7 +346,7 @@ async def test_workspace_grants_can_be_listed_and_revoked(env) -> None:
 
     decision = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command",
+        risk_reason=RiskReason("unclassified command", trustable=True),
     )
     assert decision.allowed is False and decision.requires_approval is True
 
@@ -354,7 +358,7 @@ async def test_manual_mode_ignores_grants(env) -> None:
 
     decision = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command",
+        risk_reason=RiskReason("unclassified command", trustable=True),
     )
     assert decision.allowed is False and decision.requires_approval is True
 
@@ -378,19 +382,22 @@ async def test_a_legacy_unscoped_grant_never_authorizes(env) -> None:
 # ------------------------------------------------------------------ trust, patterns, memory
 
 
-async def test_a_normal_interpreter_reason_gets_the_trust_button(env) -> None:
+async def test_only_a_delegable_reason_gets_the_trust_button(env) -> None:
     from leo.security.permissions import reason_is_trustable
 
-    assert reason_is_trustable("python runs arbitrary code") is True
+    ordinary = RiskReason("ordinary command", trustable=True)
+    assert reason_is_trustable(ordinary) is True
+    # A HIGH classifier reason, including an interpreter one, is never delegable.
+    assert reason_is_trustable(RiskReason("python runs arbitrary code", trustable=False)) is False
+    assert reason_is_trustable(RiskReason("git history or remote rewrite", trustable=False)) is False
+    assert reason_is_trustable("unclassified command") is False  # no structured flag
     keyboard = build_keyboard(
         "apr_123", "tool:shell", resource=str(env.tmp_path),
         arguments_digest="a" * 64,
-        allow_workspace_trust=reason_is_trustable("python runs arbitrary code"),
+        allow_workspace_trust=reason_is_trustable(ordinary),
     )
     labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
     assert any("Trust workspace" in text for text in labels)
-    assert reason_is_trustable("git history or remote rewrite") is False
-    assert reason_is_trustable("rm is destructive") is False
 
 
 async def test_workspace_trust_survives_a_restart_and_covers_terminal(env) -> None:
@@ -403,7 +410,7 @@ async def test_workspace_trust_survives_a_restart_and_covers_terminal(env) -> No
     for action in ("tool:shell", "tool:terminal"):
         decision = await restarted.authorize(
             "operator", action, workspace, RiskLevel.HIGH,
-            risk_reason="python runs arbitrary code",
+            risk_reason=RiskReason("ordinary command", trustable=True),
         )
         assert decision.allowed is True and decision.reason == "approval grant"
 
@@ -414,7 +421,7 @@ async def test_command_pattern_covers_prefix_variants_but_not_hardlines(env) -> 
         "pytest *", granted_by=OWNER, workspace=workspace
     )
 
-    def authorize(command: str, reason: str = "unclassified command (pytest)"):
+    def authorize(command: str, reason: str = RiskReason("unclassified command (pytest)", trustable=True)):
         return env.permissions.authorize(
             "operator", "tool:shell", workspace, RiskLevel.HIGH,
             risk_reason=reason, review_command=command, arguments_digest=command,
@@ -451,14 +458,14 @@ async def test_standing_grants_are_listed_and_revoked(env) -> None:
 
     allowed = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (git)", review_command="git diff",
+        risk_reason=RiskReason("unclassified command (git)", trustable=True), review_command="git diff",
     )
     assert allowed.allowed is True
 
     assert await env.permissions.revoke_grant(grant_id) is True
     assert (await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (git)", review_command="git diff",
+        risk_reason=RiskReason("unclassified command (git)", trustable=True), review_command="git diff",
     )).requires_approval is True
 
 
@@ -466,7 +473,7 @@ async def test_an_approved_kind_is_remembered_for_that_task_only(env) -> None:
     workspace = str(env.tmp_path.resolve())
     first = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (pytest)", task_id="conv-1",
+        risk_reason=RiskReason("unclassified command (pytest)", trustable=True), task_id="conv-1",
         command_preview="pytest tests/test_a.py", arguments_digest="digest-a",
     )
     assert first.requires_approval is True
@@ -474,14 +481,14 @@ async def test_an_approved_kind_is_remembered_for_that_task_only(env) -> None:
 
     same_task = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (pytest)", task_id="conv-1",
+        risk_reason=RiskReason("unclassified command (pytest)", trustable=True), task_id="conv-1",
         review_command="pytest -q", arguments_digest="digest-b",
     )
     assert same_task.allowed is True and same_task.reason == "approval grant"
 
     other_task = await env.permissions.authorize(
         "operator", "tool:shell", workspace, RiskLevel.HIGH,
-        risk_reason="unclassified command (pytest)", task_id="conv-2",
+        risk_reason=RiskReason("unclassified command (pytest)", trustable=True), task_id="conv-2",
         review_command="pytest -q", arguments_digest="digest-b",
     )
     assert other_task.requires_approval is True
@@ -502,3 +509,78 @@ async def test_a_hardline_approval_is_not_remembered_for_the_task(env) -> None:
         review_command="rm -rf dist", arguments_digest="digest-b",
     )
     assert second.requires_approval is True
+
+
+# Every HIGH branch of the shell classifier, keyed by a command that reaches it.
+# The corpus is deliberately broad: a new HIGH reason may not open a grant hole
+# just because nobody thought to add it to a substring deny-list.
+_HIGH_REASON_COMMANDS = (
+    "rm -rf /", "echo $(whoami)", "echo x > .env", "echo x > /etc/x",
+    "systemctl reboot", "systemctl frobnicate", "sqlite3",
+    "curl https://example.invalid", "curl -s", "curl example.invalid",
+    "wget https://example.invalid", "awk 'BEGIN { system(\"id\") }'",
+    "git push origin main", "git push --force origin main", "git credential fill",
+    "git branch -D old", "git checkout -- README.md", "pip uninstall foo",
+    "chmod -R 777 .", "cp a $OUTSIDE/x", 'cp a "/tmp/x\x00y"',
+    "cp a /etc/x", "echo $API_TOKEN", "curl --token abc localhost",
+    "ls ~/.ssh", "cat .env", "cat server.pem", "ssh user@host",
+    "kubectl apply -f x.yaml", "some-unknown-tool https://example.invalid",
+    "sudo ls", "passwd", "docker run --privileged x", "rm -rf build", "find . -delete",
+    "docker login", "cp a leo.yaml", "python -c 'print(1)'",
+    "python -m http.server", "python", "python mystery.bin", "npm publish",
+    "npm uninstall foo", "pip install git+https://example.invalid/pkg",
+    "pip install -g foo", "gh auth status", "gh api /user", "gh pr merge 7",
+    "env", "printenv", "cd /etc && ls", "echo 'unterminated",
+)
+
+
+async def test_every_high_classifier_reason_defeats_trust_grants_and_reviewer(env) -> None:
+    """R2 floor: no HIGH reason is delegable, whatever words it uses."""
+    reasons: dict[str, object] = {}
+    for command in _HIGH_REASON_COMMANDS:
+        risk, reason = assess_command(command, env.settings)
+        assert risk is RiskLevel.HIGH, (command, risk, reason)
+        assert reason_is_trustable(reason) is False, reason
+        reasons[str(reason)] = reason
+    # Policy-wide HIGH outcomes also travel through the same structured flag.
+    from leo.config import Settings as _Settings
+
+    disabled = _Settings()
+    disabled.security.shell_enabled = False
+    manual = _Settings()
+    manual.security.shell_mode = "manual"
+    for settings in (disabled, manual):
+        risk, reason = assess_command("ls", settings)
+        assert risk is RiskLevel.HIGH and reason_is_trustable(reason) is False
+        reasons[str(reason)] = reason
+    assert len(reasons) >= 40, "the HIGH-reason corpus lost coverage"
+
+    workspace = str(env.tmp_path.resolve())
+    await env.permissions.grant_workspace("tool:shell", workspace, 600, OWNER)
+    await env.permissions.grant_session(
+        "tool:shell", None, 600, OWNER, arguments_digest="grant-digest"
+    )
+    await env.permissions.grant_command_pattern(
+        "git *", granted_by=OWNER, workspace=workspace
+    )
+    env.settings.security.approval_mode = "smart"
+    env.settings.security.reviewer_enabled = True
+    reviewed: list[str] = []
+
+    async def reviewer(**kwargs):
+        reviewed.append(str(kwargs.get("command") or ""))
+        return "allow", "trusted"
+
+    env.permissions.set_reviewer(reviewer)
+
+    for text, reason in reasons.items():
+        for supplied in (reason, text):  # structured and legacy string callers
+            decision = await env.permissions.authorize(
+                "operator", "tool:shell", workspace, RiskLevel.HIGH,
+                risk_reason=supplied, review_command="git push origin main",
+                command_preview="git push origin main",
+                arguments_digest="grant-digest", task_id="conv-1",
+            )
+            assert decision.allowed is False, (text, supplied, decision.reason)
+            assert decision.requires_approval is True, (text, supplied, decision.reason)
+    assert reviewed == [], "a HIGH classifier reason must never reach the reviewer"

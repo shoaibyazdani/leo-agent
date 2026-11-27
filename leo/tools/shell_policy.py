@@ -22,7 +22,7 @@ import shlex
 from pathlib import Path, PurePath
 
 from ..config import Settings
-from ..contracts import RiskLevel
+from ..contracts import RiskLevel, RiskReason
 
 SHELL_TOOL = "shell"
 
@@ -533,7 +533,7 @@ _GH_WRITE_PREFIXES = frozenset({"create", "edit", "close", "reopen", "merge", "d
 # familiar tool cannot smuggle a destructive, credential, outbound or
 # self-modifying action past the classifier.
 _PRIVILEGE_TOOLS = frozenset(
-    {"sudo", "doas", "su", "pkexec", "runuser", "sudoedit", "visudo", "setpriv", "pass" + "wd", "chsh"}
+    {"sudo", "doas", "su", "pkexec", "runuser", "sudoedit", "visudo", "setpriv", "passwd", "chsh"}
 )
 _DESTRUCTIVE_TOOLS = frozenset(_DESTRUCTIVE_COMMANDS) | {
     "shred", "unlink", "chown", "flatpak", "snap",
@@ -963,8 +963,19 @@ def _redirect_is_bounded(text: str, settings: Settings) -> bool:
     return True
 
 
-def assess_command(command: str, settings: Settings) -> tuple[RiskLevel, str]:
-    """Return ``(risk, reason)`` for one shell command line."""
+def assess_command(command: str, settings: Settings) -> tuple[RiskLevel, RiskReason]:
+    """Return ``(risk, reason)`` for one shell command line.
+
+    Every HIGH outcome is tagged ``trustable=False`` here, at the classifier
+    boundary. New HIGH reasons cannot silently become grantable or reviewable by
+    changing their wording.
+    """
+    risk, reason = _assess_command(command, settings)
+    return risk, RiskReason(reason, trustable=risk is not RiskLevel.HIGH)
+
+
+def _assess_command(command: str, settings: Settings) -> tuple[RiskLevel, str]:
+    """Classify one shell command line before the trust flag is attached."""
     shell = settings.security
     if not shell.shell_enabled:
         return RiskLevel.HIGH, "shell disabled by security.shell_enabled"

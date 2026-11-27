@@ -38,6 +38,24 @@ class RiskLevel(str, Enum):
     HIGH = "high"
 
 
+class RiskReason(str):
+    """Reason text carrying the classifier's delegation decision.
+
+    Approval safety must not be inferred from how a reason happens to be worded:
+    a new classifier reason would silently become trustable if the consumer used
+    a substring list. The classifier therefore attaches ``trustable`` at the
+    point it decides the tier, and consumers fail closed when the flag is absent.
+    The type stays a ``str`` subclass so display, audit and storage keep working.
+    """
+
+    trustable: bool
+
+    def __new__(cls, text: str, *, trustable: bool) -> "RiskReason":
+        value = super().__new__(cls, str(text))
+        value.trustable = bool(trustable)
+        return value
+
+
 class TaskStatus(str, Enum):
     CREATED = "created"
     PLANNING = "planning"

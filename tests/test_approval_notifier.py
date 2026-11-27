@@ -558,7 +558,7 @@ async def test_expiry_is_announced_with_the_command_that_waited(monkeypatch) -> 
     await bus.emit(
         "approval.expired", approval_id="apr_expired", action="tool:shell",
         command="pytest tests/test_x.py", risk_reason="python runs arbitrary code",
-        reason="approval expired: the action was not run",
+        risk_trustable=False, reason="approval expired: the action was not run",
     )
 
     assert len(adapter.sent) == 1
@@ -582,8 +582,8 @@ async def test_ordinary_shell_approval_offers_workspace_trust(monkeypatch) -> No
     await bus.emit(
         "approval.requested", approval_id="apr_python", action="tool:shell",
         resource="/root/workspace", risk="high",
-        risk_reason="python runs arbitrary code", arguments_digest="a" * 64,
-        command="python -m pytest -q",
+        risk_reason="ordinary command", risk_trustable=True, arguments_digest="a" * 64,
+        command="rsvg-convert in.png out.png",
     )
 
     labels = [
@@ -592,3 +592,33 @@ async def test_ordinary_shell_approval_offers_workspace_trust(monkeypatch) -> No
     ]
     assert any("Trust workspace" in text for text in labels)
     assert any("This command" in text for text in labels)
+
+
+@pytest.mark.asyncio
+async def test_hardline_shell_approval_offers_no_grant_buttons(monkeypatch) -> None:
+    """The exact-command grant can never cover a HIGH classifier reason."""
+    from leo import db
+
+    monkeypatch.setenv("LEO_DB_PATH", str(db.get_db_path()))
+    bus = EventBus(persist=False)
+    adapter = KeyboardAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    assert notifier.start() is True
+    await _pending_approval("apr_hardline", action="tool:shell")
+
+    await bus.emit(
+        "approval.requested", approval_id="apr_hardline", action="tool:shell",
+        resource="/root/workspace", risk="high",
+        risk_reason="git push publishes a change to a remote",
+        risk_trustable=False, arguments_digest="a" * 64,
+        command="git push origin main",
+    )
+
+    labels = [
+        button["text"] for row in (adapter.markups[0] or {}).get("inline_keyboard", [])
+        for button in row
+    ]
+    assert not any("This command" in text for text in labels)
+    assert not any("Trust workspace" in text for text in labels)
+    assert any("Approve" in text for text in labels)
+    assert any("Reject" in text for text in labels)

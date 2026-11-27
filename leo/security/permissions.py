@@ -16,7 +16,7 @@ from typing import Any
 
 from .. import db
 from ..config import Settings
-from ..contracts import Decision, RiskLevel, new_id, surface_capabilities
+from ..contracts import Decision, RiskLevel, RiskReason, new_id, surface_capabilities
 from ..logging import get_logger
 from ..events import Event, EventBus
 from ..schedules.clock import Clock, SystemClock
@@ -66,41 +66,41 @@ def _bounded_deny_reason(value: Any) -> str:
     return text[:_MAX_DENY_REASON_CHARS]
 
 
-# A workspace trust, a smart-review verdict or a remembered grant may cover
-# ordinary work only. The floor is deliberately keyed to the *specific* reason
-# a classifier escalated a call, not to broad words like "code": "python runs
-# arbitrary code" is the ordinary way LEO runs tests and scripts, so it must
-# reach the reviewer and the trust button just like "unclassified command".
-_HARDLINE_REASON = re.compile(
-    r"(?i)("
-    r"hardline|deny_commands|destruct|delet|wipe|credential|private key|"
-    r"key/keystore|secret|password|privilege|escalat|sudo|doas|"
-    r"remote rewrite|force|branch deletion|outside allowed roots|"
-    r"redirection outside|unparseable|substitution|recursive permission|"
-    r"removes an installed|power/unit|host power|awk can execute|"
-    r"shell disabled|shell policy manual|self-modif|agent.s own|"
-    r"pipe a remote|downloads or posts|outbound"
-    r")"
-)
-_ARBITRARY_CODE_REASON = re.compile(r"(?i)\barbitrary code\b")
-_ORDINARY_INTERPRETER_REASON = re.compile(
-    r"^(?:python|python3|node|ruby|perl|php) runs arbitrary code$", re.I
-)
+# Whether a grant or a smart-review verdict may answer a call is decided by the
+# classifier and carried as data (``RiskReason.trustable``). It is never derived
+# from reason wording here: a newly worded HIGH reason used to open a hole in
+# the floor as soon as it did not match a substring list.
+def reason_is_trustable(reason: Any) -> bool:
+    """True only when the classifier explicitly marked this reason trustable.
 
-
-def reason_is_trustable(reason: str | None) -> bool:
-    """True when a smart reviewer, trust or grant may cover this call.
-
-    Hardline reasons — destructive, credential, privilege, force/remote rewrite,
-    substitution, unparsed input, out-of-root redirection, shell policy overrides
-    and similar — always stay with the human. An interpreter such as ``python``
-    or ``node`` classified as HIGH for "runs arbitrary code" is *ordinary* dev
-    work: the reviewer must see it, and a trusted workspace must cover it.
+    Plain strings and missing reasons fail closed. HIGH classifier outcomes are
+    always tagged untrustable, so no HIGH reason can reach a reviewer, a trust,
+    a pattern grant or a remembered approval.
     """
-    text = str(reason or "").strip()
-    if _ORDINARY_INTERPRETER_REASON.match(text):
-        return True
-    return not _HARDLINE_REASON.search(text) and not _ARBITRARY_CODE_REASON.search(text)
+    return isinstance(reason, RiskReason) and reason.trustable
+
+
+def delegation_allowed(action: str, trustable: bool | None) -> bool:
+    """Whether a stored/pending call may be answered by a grant.
+
+    Shell/terminal authority lives in command text, so a structured ``True`` is
+    required. Other actions keep their resource-scoped grant semantics; a
+    classifier that explicitly marked the reason untrustable still blocks them.
+    """
+    if str(action or "") in ALWAYS_ARG_SCOPED_ACTIONS:
+        return trustable is True
+    return trustable is not False
+
+
+def trust_flag(reason: Any) -> bool | None:
+    """Extract the classifier's delegation flag, or None when it was not given."""
+    return reason.trustable if isinstance(reason, RiskReason) else None
+
+
+def metadata_trustable(action: str, metadata: Any) -> bool:
+    """Read the delegation flag persisted on an approval card."""
+    flag = metadata.get("risk_trustable") if isinstance(metadata, Mapping) else None
+    return delegation_allowed(action, flag)
 
 
 _GRANT_SCOPE_PATTERN = "pattern"
@@ -367,7 +367,9 @@ class PermissionManagerImpl:
         current_digest = context.get("arguments_digest")
         if not current_digest and context.get("arguments") is not None:
             current_digest = arguments_digest(context.get("arguments"))
-        risk_reason = str(context.get("risk_reason") or "")
+        risk_reason_value = context.get("risk_reason")
+        risk_reason = str(risk_reason_value or "")
+        risk_trustable = trust_flag(risk_reason_value)
         command_preview = str(context.get("command_preview") or "")
         # The reviewer needs the real command, but it must not be persisted in
         # the approval metadata: pop it before that mapping is built.
@@ -414,7 +416,7 @@ class PermissionManagerImpl:
             and self.settings.security.high_risk_requires_approval
             and self.settings.security.approval_mode != "off"
             and await self._has_live_grant(
-                action, resource, current_digest, risk_reason,
+                action, resource, current_digest, risk_reason_value,
                 command=grant_command, task_id=task_id,
                 conversation_id=conversation_id,
             )
@@ -431,8 +433,8 @@ class PermissionManagerImpl:
             and self.settings.security.approval_mode == "smart"
             and self.settings.security.reviewer_enabled
             and self._reviewer is not None
-            and action in {"tool:shell", "tool:terminal"}
-            and reason_is_trustable(risk_reason)
+            and action in ALWAYS_ARG_SCOPED_ACTIONS
+            and reason_is_trustable(risk_reason_value)
             and review_command.strip()
         ):
             verdict, note = await self._review(
@@ -460,21 +462,29 @@ class PermissionManagerImpl:
                 metadata["arguments_digest"] = current_digest
             if risk_reason:
                 metadata["risk_reason"] = risk_reason
+            if risk_trustable is not None:
+                metadata["risk_trustable"] = risk_trustable
             if command_preview:
                 metadata["command_preview"] = command_preview
+            timeout = float(
+                getattr(self.settings.security, "approval_timeout_seconds", 900) or 900
+            )
+            created = self._now()
+            # Persist the deadline with the card so a restart can re-evaluate it
+            # instead of leaving a pending row with no live timer.
+            deadline = created + timedelta(seconds=max(0.0, timeout) + _EXPIRY_GRACE_SECONDS)
             await db.execute(
-                "INSERT INTO approvals(id,created_at,status,actor,action,resource,risk,reason,requested_by,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO approvals(id,created_at,expires_at,status,actor,action,resource,risk,reason,requested_by,metadata) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    approval_id, self._now_iso(), "pending", actor, action, resource, risk.value,
+                    approval_id, created.isoformat(), deadline.isoformat(), "pending",
+                    actor, action, resource, risk.value,
                     "high-risk action requires explicit approval", actor,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
             )
             allowed, requires_approval, reason = False, True, "approval required"
-            self._schedule_expiry(
-                approval_id,
-                float(getattr(self.settings.security, "approval_timeout_seconds", 900) or 900),
-            )
+            self._schedule_expiry(approval_id, timeout)
             if self.events:
                 await self.events.emit(
                     "approval.requested",
@@ -488,6 +498,7 @@ class PermissionManagerImpl:
                     # exact command shown.
                     **({"arguments_digest": current_digest} if current_digest else {}),
                     **({"risk_reason": risk_reason} if risk_reason else {}),
+                    **({"risk_trustable": risk_trustable is True}),
                     **({"command": command_preview} if command_preview else {}),
                 )
 
@@ -551,6 +562,63 @@ class PermissionManagerImpl:
         self._expiry_tasks.add(task)
         task.add_done_callback(self._expiry_tasks.discard)
 
+    def _approval_deadline(self, row: Any) -> datetime | None:
+        """Deadline stored on the card, or the legacy created-at derived one."""
+        deadline: datetime | None = None
+        try:
+            keys = row.keys()
+        except AttributeError:  # pragma: no cover - sqlite rows expose keys()
+            keys = ()
+        if "expires_at" in keys:
+            try:
+                stored = datetime.fromisoformat(str(row["expires_at"] or ""))
+                deadline = stored if stored.tzinfo else stored.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                pass
+        if deadline is None:
+            try:
+                created = datetime.fromisoformat(str(row["created_at"]))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                timeout = float(
+                    getattr(self.settings.security, "approval_timeout_seconds", 900) or 900
+                )
+                deadline = created + timedelta(seconds=max(0.0, timeout))
+            except (TypeError, ValueError):
+                return None
+        return deadline
+
+    async def recover_pending_expiries(self) -> int:
+        """Expire stale cards and re-arm live ones after a restart.
+
+        ``call_later`` handles die with the loop, but the deadline is durable on
+        the approval row. Called at startup once the notifier is listening, so
+        an operator still gets the explicit "nothing was run" notice for a card
+        that timed out while the process was down. Returns the number expired.
+        """
+        rows = await db.fetchall(
+            "SELECT id FROM approvals WHERE status='pending' ORDER BY created_at"
+        )
+        expired = 0
+        for row in rows or []:
+            approval_id = str(row["id"])
+            if await self.expire_approval_if_stale(approval_id):
+                expired += 1
+                continue
+            live = await db.fetchone(
+                "SELECT id,created_at,expires_at FROM approvals WHERE id=? AND status='pending'",
+                (approval_id,),
+            )
+            deadline = self._approval_deadline(live) if live is not None else None
+            if deadline is None:
+                continue
+            remaining = (deadline - self._now()).total_seconds()
+            if remaining > 0:
+                # _schedule_expiry adds the grace again; subtract it here so the
+                # re-armed timer lands on the stored deadline, not later.
+                self._schedule_expiry(approval_id, max(0.0, remaining - _EXPIRY_GRACE_SECONDS))
+        return expired
+
     async def expire_approval_if_stale(self, approval_id: str) -> bool:
         """Mark a timed-out command approval expired and tell the operator.
 
@@ -563,14 +631,8 @@ class PermissionManagerImpl:
         if row is None or str(row["status"]) != "pending":
             self._cancel_expiry(approval_id)
             return False
-        try:
-            created = datetime.fromisoformat(str(row["created_at"]))
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            return False
-        timeout = float(getattr(self.settings.security, "approval_timeout_seconds", 900) or 900)
-        if self._now() < created + timedelta(seconds=max(0.0, timeout)):
+        deadline = self._approval_deadline(row)
+        if deadline is None or self._now() < deadline:
             return False
         now = self._now_iso()
         async with db.transaction() as conn:
@@ -690,7 +752,7 @@ class PermissionManagerImpl:
         action: str,
         resource: str | None,
         arguments_digest: str | None = None,
-        risk_reason: str | None = None,
+        risk_reason: Any = None,
         *,
         command: str = "",
         task_id: str = "",
@@ -712,9 +774,10 @@ class PermissionManagerImpl:
         """
         if self.settings.security.approval_mode == "manual":
             return False
-        # The hardline floor lives here as well as in the reviewer gate: a
-        # pattern or a trust must never silently absorb a dangerous command.
-        if risk_reason and not reason_is_trustable(risk_reason):
+        # The hardline floor lives here as well as in the reviewer gate: every
+        # grant scope (exact command, pattern, trust, remembered kind) obeys the
+        # classifier's explicit delegation flag. Wording is never consulted.
+        if not delegation_allowed(action, trust_flag(risk_reason)):
             return False
         try:
             now = self._now_iso()
@@ -839,9 +902,8 @@ class PermissionManagerImpl:
     ) -> str:
         """Trust ordinary shell/terminal work in one workspace for a bounded time.
 
-        Destructive, credential, privilege, arbitrary-code and self-modifying
-        commands are excluded by :func:`reason_is_trustable`; the hardline and
-        deny-glob floors still apply before this is consulted.
+        Every HIGH classifier reason is excluded by :func:`delegation_allowed`;
+        the hardline and deny-glob floors still apply before this is consulted.
         """
         from datetime import timedelta
 
@@ -1782,9 +1844,9 @@ class PermissionManagerImpl:
         ).strip()
         if not task_id:
             return
-        if not reason_is_trustable(str(metadata.get("risk_reason") or "")):
-            return
         action = str(row["action"] or "")
+        if not metadata_trustable(action, metadata):
+            return
         resource = str(row["resource"] or "")
         if action in ALWAYS_ARG_SCOPED_ACTIONS:
             pattern = _command_pattern(metadata.get("command_preview") or "")
