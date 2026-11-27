@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import base64
@@ -1202,29 +1203,35 @@ async def test_export_rate_limit_is_durable_and_shared_across_workers(
     # A genuinely different worker (separate interpreter and module state)
     # reads the same SQLite counters and must refuse the third request.
     repo = Path(__file__).resolve().parents[1]
-    # A transient cross-process SQLite lock is environmental, not a rate-limit
-    # result. Retry only that condition so the assertion still pins the real
-    # durable denial.
     worker = (
-        "import asyncio, sqlite3, sys, time\n"
+        "import asyncio, sys\n"
         "from leo import db\n"
         "from leo.interfaces import api\n"
         "db.set_db_path(sys.argv[1])\n"
         "api.EXPORT_RATE_LIMIT = 2\n"
-        "for attempt in range(20):\n"
-        "    try:\n"
-        "        asyncio.run(api._check_export_rate(sys.argv[2]))\n"
-        "    except sqlite3.OperationalError as exc:\n"
-        "        if 'locked' not in str(exc).lower() or attempt == 19: raise\n"
-        "        time.sleep(0.05)\n"
-        "    else:\n"
-        "        break\n"
+        "asyncio.run(api._check_export_rate(sys.argv[2]))\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", worker, str(db.get_db_path()), principal],
-        cwd=str(repo), env={**os.environ, "PYTHONPATH": str(repo)},
-        capture_output=True, text=True, timeout=60,
-    )
+    # A transient cross-process SQLite lock is environmental, not a rate-limit
+    # result. Retry the whole worker on timeout/lock so the assertion still
+    # pins the real durable denial without accepting a slow hang as success.
+    result = None
+    for attempt in range(3):
+        try:
+            candidate = subprocess.run(
+                [sys.executable, "-c", worker, str(db.get_db_path()), principal],
+                cwd=str(repo), env={**os.environ, "PYTHONPATH": str(repo)},
+                capture_output=True, text=True, timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            candidate = None
+        if candidate is not None and "rate limit" in candidate.stderr:
+            result = candidate
+            break
+        if candidate is not None and "locked" not in candidate.stderr.lower():
+            result = candidate  # real failure: let the assertion report it
+            break
+        await asyncio.sleep(0.2 * (attempt + 1))
+    assert result is not None
     assert result.returncode != 0 and "rate limit" in result.stderr
 
     # Buckets are per principal, and expired kv counters are pruned.
