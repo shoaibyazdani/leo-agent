@@ -57,6 +57,8 @@
     // approval_id -> { card, toolCallId, title, body }. Inline cards are
     // read-only blockers; only the Approvals view can decide them.
     pendingApprovals: new Map(),
+    // approval_id -> rendered literal card node; ":card" -> frozen projection.
+    scheduleCards: new Map(),
     terminalStatus: null,   // last terminal run status; `finally` never clears it
     streamDropped: false,   // dropped/aborted stream => reload durable history
     // Live updates: the open thread follows the durable event feed so turns
@@ -592,6 +594,48 @@
     if (actions) actions.remove();
   }
 
+  // Schedule approvals are full literal cards, not blocked tool-call rows.
+  // The shared renderer inserts every value with textContent and sends back
+  // only the digest the human saw.
+  const SCHEDULE_CARD_KINDS = new Set(['schedule_create', 'schedule_edit']);
+
+  function scheduleCardNode(card, host) {
+    if (!card || !window.LEO_APPROVALS) return null;
+    const node = document.createElement('div');
+    node.className = 'chat-approval-card';
+    node.dataset.approvalId = card.approval_id || '';
+    const onChoice = async (view, choice) => {
+      try {
+        const result = await window.LEO_APPROVALS.acknowledgeThenResolve(view, choice);
+        if (result?.card) window.LEO_APPROVALS.renderTerminal(node, result.card, result.status || 'approved');
+        window.dispatchEvent(new CustomEvent('leo:data'));
+      } catch (error) { toast(`Approval failed: ${error.message}`, 'danger'); }
+    };
+    window.LEO_APPROVALS.renderCard(node, card, { onChoice });
+    state.scheduleCards.set(String(card.approval_id || ''), node);
+    if (host) { host.appendChild(node); maybeScroll(); }
+    // Receipt of a live card is an acknowledgement, never a decision.
+    window.LEO_APPROVALS.acknowledge(card).catch(() => {});
+    return node;
+  }
+
+  function rewriteScheduleCard(payload) {
+    const id = String(payload?.approval_id || '');
+    const node = state.scheduleCards.get(id);
+    if (!node) return;
+    const card = state.scheduleCards.get(`${id}:card`);
+    if (card) {
+      window.LEO_APPROVALS.renderTerminal(node, {
+        ...card,
+        status: payload.status || card.status,
+        outcome: payload.outcome || card.outcome,
+        deny_reason: payload.deny_reason || card.deny_reason,
+        decision: payload.decision || card.decision,
+      }, payload.status || 'denied');
+    }
+    state.pendingApprovals.delete(id);
+  }
+
   // Repeated approvals for the same tool are grouped into one collapsed card.
   // Every approval id remains present as a row, so reconciliation and the
   // Approvals view still see all pending decisions.
@@ -631,9 +675,22 @@
     let data;
     try { data = await api('/approvals'); } catch { return; }
     const pending = Array.isArray(data?.approvals) ? data.approvals : [];
+    const views = Array.isArray(data?.cards) ? data.cards : [];
     const ids = new Set(pending.map((a) => String(a?.id || '')));
     for (const id of [...state.pendingApprovals.keys()]) {
       if (!ids.has(id)) { markApprovalResolved(id); state.pendingApprovals.delete(id); }
+    }
+    for (const id of [...state.scheduleCards.keys()]) {
+      if (id.endsWith(':card')) continue;
+      if (!ids.has(id)) {
+        const node = state.scheduleCards.get(id);
+        const card = state.scheduleCards.get(`${id}:card`);
+        if (node && card && window.LEO_APPROVALS) {
+          window.LEO_APPROVALS.renderTerminal(node, card, 'resolved');
+        }
+        state.scheduleCards.delete(id);
+        state.scheduleCards.delete(`${id}:card`);
+      }
     }
     const thread = threadEl();
     if (!thread) return;
@@ -641,6 +698,15 @@
     for (const record of pending) {
       const id = String(record?.id || '');
       if (!id || shown.has(id) || state.pendingApprovals.has(id)) continue;
+      if (SCHEDULE_CARD_KINDS.has(String(record.kind || ''))) {
+        const view = views.find((item) => String(item?.approval_id || '') === id);
+        if (view && (!state.activeId || !view.conversation_id || view.conversation_id === state.activeId)) {
+          scheduleCardNode(view, thread);
+          state.scheduleCards.set(`${id}:card`, view);
+          shown.add(id);
+        }
+        continue;
+      }
       let meta = {};
       try { meta = JSON.parse(record.metadata || '{}') || {}; } catch { meta = {}; }
       if (state.activeId && meta.task_id && String(meta.task_id) !== String(state.activeId)) continue;
@@ -761,7 +827,35 @@
   }
 
   function handleBusEvent(event) {
-    if (!event || event.topic !== 'chat.completed') return;
+    if (!event) return;
+    if (event.topic === 'approval.presented') {
+      const payload = event.payload || {};
+      const id = String(payload.approval_id || '');
+      const thread = threadEl();
+      if (!id || !thread || state.scheduleCards.has(id)) return;
+      if (payload.conversation_id && state.activeId && payload.conversation_id !== state.activeId) return;
+      if (!SCHEDULE_CARD_KINDS.has(String(payload.kind || ''))) return;
+      const card = {
+        approval_id: id, proposal_id: payload.proposal_id, kind: payload.kind,
+        status: payload.status || 'pending', title: payload.title, body: payload.body,
+        choices: (payload.choices || []).map((value, index) => ({
+          value: String(value),
+          label: String((payload.choice_labels || [])[index] || value),
+        })),
+        deny_only: Boolean(payload.deny_only), deadline: payload.deadline,
+        proposal_digest: payload.proposal_digest, deny_reason: payload.deny_reason,
+        conversation_id: payload.conversation_id,
+      };
+      scheduleCardNode(card, thread);
+      state.scheduleCards.set(`${id}:card`, card);
+      return;
+    }
+    if (event.topic === 'approval.resolved') {
+      const payload = event.payload || {};
+      if (SCHEDULE_CARD_KINDS.has(String(payload.kind || ''))) rewriteScheduleCard(payload);
+      return;
+    }
+    if (event.topic !== 'chat.completed') return;
     const payload = event.payload || {};
     // The sidebar counters follow every conversation, including channels.
     refreshSessions();
@@ -823,6 +917,7 @@
     state.reasoningClosedRuns = new Set();
     state.turnNodes = [];
     state.pendingApprovals.clear();
+    state.scheduleCards.clear();
     updateMessageCount();
     if (!id) { renderEmpty(); maybeScroll(true); return; }
     if (!silent) setChatStatus('live', 'Loading…');
@@ -1327,9 +1422,9 @@
     }
   }
 
-  // A command whose busy policy is "interrupt" (/stop) must run while a turn is
-  // live — Hermes's interrupt_then_dispatch. It goes to the dedicated endpoint
-  // so the running stream keeps its state instead of being replaced or queued.
+  // A command whose busy policy is "interrupt" (/stop) must run while a turn
+  // is live. It goes to the dedicated endpoint so the running stream keeps its
+  // state instead of being replaced or queued.
   function commandName(text) {
     const match = /^\s*\/([a-z][a-z0-9_-]*)/i.exec(text || '');
     return match ? match[1].toLowerCase() : null;

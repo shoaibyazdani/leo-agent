@@ -21,13 +21,23 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .. import db
-from ..contracts import new_id, utcnow
+from ..contracts import (
+    SurfaceCapabilities,
+    TurnContext,
+    new_id,
+    surface_capabilities,
+    turn_context,
+    utcnow,
+)
 from ..core import LeoApp
 from ..integrations.attachments import AttachmentError
 from ..integrations.gateway import GatewayAdmissionError
+from ..security.approval_cards import is_schedule_kind, project_cards
+from ..schedules.compiler import ScheduleCompileError
+from ..schedules.service import ScheduleServiceError
 from ..tools import conversation_tools
 from ..tools.conversation_tools import (
     ExportStorageError,
@@ -506,12 +516,23 @@ class MemoryRequest(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
-    approved: bool
+    # Ordinary command approvals keep the legacy approved/confirm_action shape.
+    approved: bool | None = None
     resolver: str = "user"
     # The approval's own action string must be echoed back. A blind or stale
     # client that POSTs ``{approved: true}`` for whatever id it last polled
     # cannot drive a HIGH-risk decision; the dashboard sends the row's action.
     confirm_action: str | None = None
+    # Schedule cards are digest-bound choices, not booleans. The client must
+    # echo the proposal digest it actually displayed and name one frozen choice.
+    choice: str | None = None
+    confirm_proposal_digest: str | None = None
+    deny_reason: str | None = None
+
+
+class ApprovalAckRequest(BaseModel):
+    # The surface is derived from the authenticated route, never this body.
+    surface: str | None = None
 
 
 class OperatorToolRequest(BaseModel):
@@ -684,14 +705,52 @@ async def attachment_content(attachment_id: str) -> FileResponse:
     )
 
 
+def _request_turn(
+    request: Request,
+    *,
+    surface: str,
+    channel: str | None = None,
+    subject: str | None = None,
+    conversation_id: str | None = None,
+    source: str = "api",
+) -> TurnContext:
+    """Trusted turn context for one HTTP route.
+
+    The authenticated request state decides ``principal``; the route decides
+    ``surface``/``source``. Request-body ``channel``/``subject`` are routing
+    hints only and can never become authority.
+    """
+    principal = str(getattr(request.state, "principal", "local") or "local")
+    return TurnContext(
+        principal=principal,
+        channel=str(channel or surface),
+        conversation_id=conversation_id,
+        target=str(subject) if subject is not None else None,
+        surface=surface,
+        capabilities=surface_capabilities(surface),
+        origin=f"api:{principal}",
+        source=source,
+    )
+
+
 @api.post("/chat")
 async def chat(request: Request, req: ChatRequest) -> dict[str, Any]:
     if not req.message.strip() and not req.attachments and not req.attachment_ids:
         raise HTTPException(400, "empty message")
     try:
         combined = list(req.attachments) + [{"id": item} for item in req.attachment_ids]
+        # The blocking route cannot wait for a mid-flight card decision, so its
+        # surface is explicitly incapable no matter what the body says.
+        turn = _request_turn(
+            request,
+            surface="api",
+            channel=req.channel,
+            subject=req.subject,
+            conversation_id=req.conversation_id,
+        )
         result = await get_app().ask(
-            req.message, req.channel, req.subject, req.conversation_id, combined
+            req.message, req.channel, req.subject, req.conversation_id, combined,
+            turn=turn,
         )
     except Exception as exc:  # noqa: BLE001 - boundary must never leak a 500/raw traceback
         code = str(getattr(exc, "code", None) or type(exc).__name__)[:80]
@@ -738,8 +797,18 @@ async def chat_stream(request: Request, req: ChatStreamRequest) -> StreamingResp
     async def generate():
         try:
             combined = list(req.attachments) + [{"id": item} for item in req.attachment_ids]
+            # The authenticated web/Electron stream is the capable dashboard
+            # surface. A body channel is still only a routing hint.
+            turn = _request_turn(
+                request,
+                surface="web",
+                channel=req.channel,
+                subject=req.subject,
+                conversation_id=req.conversation_id,
+            )
             async for event in app.ask_stream(
-                req.message, req.channel, req.subject, req.conversation_id, combined
+                req.message, req.channel, req.subject, req.conversation_id,
+                combined, turn=turn,
             ):
                 # tool.finished echoes tool results, which can contain a live
                 # preview URL. A browser without the API token must not be able
@@ -1105,7 +1174,16 @@ async def run_task(task_id: str) -> dict[str, Any]:
 
 @api.get("/approvals")
 async def approvals() -> dict[str, Any]:
-    return {"approvals": await get_app().permissions.pending_approvals()}
+    pending = await get_app().permissions.pending_approvals()
+    # ``approvals`` stays the legacy raw-row shape for existing callers. The
+    # card projection is additive and never carries authority of its own.
+    cards = project_cards(pending)
+    return {
+        "approvals": pending,
+        # The shared ScheduleCardView projection: choices carry value+label so
+        # every renderer shows the frozen choice set without guessing.
+        "cards": [card.view().model_dump(mode="json") for card in cards],
+    }
 
 
 def _require_decision_origin(request: Request) -> None:
@@ -1134,14 +1212,141 @@ def _require_decision_origin(request: Request) -> None:
     raise HTTPException(403, "cross-origin approval decision rejected")
 
 
+def _schedule_operator_turn(request: Request) -> TurnContext:
+    """Build the trusted operator context for an unasked schedule mutation.
+
+    Authority comes from the middleware-authenticated route identity, never from
+    a request-body channel/subject. Browser callers must be same-origin on an
+    allowed loopback/configured host; when ``LEO_API_TOKEN`` is configured the
+    mutation must carry that token. The actor is ``api:<authenticated principal>``
+    so the audit row names the real operator boundary that performed the write.
+    Ordinary command approvals keep their separate compatibility resolver.
+    """
+    _require_decision_origin(request)
+    principal = str(getattr(request.state, "principal", "") or "")
+    configured_token = os.getenv("LEO_API_TOKEN")
+    if configured_token and principal != "api-token":
+        raise HTTPException(401, "schedule mutation requires LEO_API_TOKEN")
+    if principal not in ("api-token", "local"):
+        raise HTTPException(403, "schedule mutation requires an operator surface")
+
+    host_header = (request.headers.get("host") or "").strip().lower()
+    hostname = urlsplit(f"http://{host_header}").hostname or "" if host_header else ""
+    allowed_origins = {
+        item.rstrip("/").lower()
+        for item in cors_origins(_Settings.load().server.cors_origins)
+    }
+    allowed_hosts = set(_LOCAL_HOSTS) | {
+        urlsplit(origin).hostname or "" for origin in allowed_origins
+    }
+    allowed_hosts.discard("")
+    if hostname not in allowed_hosts:
+        raise HTTPException(403, "schedule mutation requires a trusted host")
+    origin = (request.headers.get("origin") or "").strip().rstrip("/").lower()
+    if origin:
+        parsed = urlsplit(origin)
+        if parsed.hostname != hostname or hostname not in allowed_hosts:
+            raise HTTPException(403, "cross-origin schedule mutation rejected")
+        if origin not in allowed_origins and origin != f"{parsed.scheme}://{hostname}":
+            raise HTTPException(403, "cross-origin schedule mutation rejected")
+
+    actor = f"api:{principal}"
+    # The dashboard origin is a card-capable surface; operator direct writes do
+    # not need a card, but using its real capability keeps one context shape.
+    return TurnContext(
+        principal=actor,
+        channel="api",
+        surface="web",
+        capabilities=surface_capabilities("web"),
+        origin=actor,
+        source="operator",
+    )
+
+
+def _schedule_http_error(exc: BaseException) -> HTTPException:
+    code = str(getattr(exc, "code", "") or type(exc).__name__)
+    message = str(getattr(exc, "message", "") or exc)
+    status = 404 if code == "unknown_schedule" else 400
+    return HTTPException(status, f"{code}: {message}")
+
+
+@api.post("/approvals/{approval_id}/ack")
+async def acknowledge_approval(
+    approval_id: str, request: Request, req: ApprovalAckRequest | None = None
+) -> dict[str, Any]:
+    """Acknowledge a presented schedule card without deciding anything.
+
+    The dashboard/Electron stream is the presenting surface. A body-supplied
+    surface is ignored: route identity wins. Ack never grants authority and
+    never marks an approval approved.
+    """
+    _require_decision_origin(request)
+    try:
+        card = await get_app().permissions.acknowledge_schedule_card(
+            approval_id, surface="web"
+        )
+    except KeyError:
+        raise HTTPException(404, "approval not found")
+    except PermissionError as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return {"card": card.model_dump(mode="json")}
+
+
 @api.post("/approvals/{approval_id}/resolve")
 async def resolve_approval(approval_id: str, req: ApprovalRequest, request: Request) -> dict[str, Any]:
     from .. import db
 
     _require_decision_origin(request)
-    row = await db.fetchone("SELECT action FROM approvals WHERE id=?", (approval_id,))
+    row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (approval_id,))
     if not row:
         raise HTTPException(404, "approval not found")
+    principal = str(getattr(request.state, "principal", "local") or "local")
+
+    if is_schedule_kind(row["kind"]):
+        # A schedule decision is a frozen choice bound to the proposal digest
+        # the client displayed. ``approved``/``confirm_action`` are not enough.
+        if not req.choice or not req.confirm_proposal_digest:
+            raise HTTPException(
+                409,
+                "schedule approval requires choice and confirm_proposal_digest",
+            )
+        try:
+            resolution = await get_app().permissions.resolve_schedule_card(
+                approval_id,
+                choice=req.choice,
+                resolver=f"operator:{principal}",
+                confirm_proposal_digest=req.confirm_proposal_digest,
+                deny_reason=req.deny_reason,
+            )
+        except KeyError:
+            raise HTTPException(404, "approval not found")
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc))
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        if resolution.status == "expired":
+            raise HTTPException(
+                409,
+                {
+                    "status": resolution.status,
+                    "outcome": resolution.outcome,
+                    "decline_message": resolution.decline_message,
+                    "approval_id": approval_id,
+                },
+            )
+        card = await get_app().permissions.get_schedule_card(approval_id)
+        return {
+            **resolution.as_dict(),
+            "protocol_version": row["protocol_version"],
+            "card": card.model_dump(mode="json") if card is not None else None,
+        }
+
+    # Legacy command-kind compatibility wrapper: unchanged wording, binding and
+    # resolver identity except that a missing boolean is now explicit.
+    if req.approved is None:
+        raise HTTPException(409, "command approval requires approved: true/false")
     if not req.confirm_action or str(req.confirm_action) != str(row["action"]):
         raise HTTPException(
             409,
@@ -1150,7 +1355,7 @@ async def resolve_approval(approval_id: str, req: ApprovalRequest, request: Requ
     # The requester does not get to choose the identity recorded as resolver.
     try:
         decision = await get_app().permissions.resolve_approval(
-            approval_id, req.approved, getattr(request.state, "principal", "local")
+            approval_id, req.approved, principal
         )
     except KeyError:
         raise HTTPException(404, "approval not found")
@@ -1180,6 +1385,10 @@ async def execute_operator_tool(
         name=name, arguments=req.arguments,
         actor=f"operator:{principal}", task_id=req.arguments.get("task_id"),
         correlation_id=req.arguments.get("correlation_id"),
+        source="operator",
+        origin=f"api:{principal}",
+        principal=principal,
+        capabilities=SurfaceCapabilities().model_dump(mode="json"),
     )
     try:
         result = await app.operator_executor.execute(call)
@@ -1191,14 +1400,27 @@ async def execute_operator_tool(
 
 
 @api.post("/agents/delegate")
-async def delegate_agent(req: DelegateRequest) -> dict[str, Any]:
+async def delegate_agent(req: DelegateRequest, request: Request) -> dict[str, Any]:
     """Delegate one objective with the same engine used by agent tools."""
     app = get_app()
+    # An API delegation is an unattended subagent turn: no card surface and the
+    # authenticated route principal, never a body-supplied identity.
+    turn = _request_turn(
+        request,
+        surface="api",
+        channel=req.context.get("channel") if isinstance(req.context, dict) else None,
+        conversation_id=(
+            str(req.context.get("conversation_id"))
+            if isinstance(req.context, dict) and req.context.get("conversation_id")
+            else None
+        ),
+    )
     try:
-        result = await app.agent_engine.delegate(
-            req.objective, agent_id=req.agent_id, context=dict(req.context),
-            verify=req.verify,
-        )
+        with turn_context(turn):
+            result = await app.agent_engine.delegate(
+                req.objective, agent_id=req.agent_id, context=dict(req.context),
+                verify=req.verify,
+            )
     except (KeyError, LookupError, ValueError) as exc:
         raise HTTPException(400, str(exc))
     outcome = result[0] if isinstance(result, (list, tuple)) else result
@@ -1246,11 +1468,19 @@ async def execute_tool(name: str, req: ToolRunRequest, request: Request) -> dict
     if name == "conversation_export":
         principal = str(getattr(request.state, "principal", "local") or "local")
         await _check_export_rate(principal)
+    principal = str(getattr(request.state, "principal", "local") or "local")
     call = ToolCall(
         name=name,  # path is the only identity used for risk, permissions and audit
         arguments=req.arguments, actor="api", dry_run=req.dry_run,
         task_id=req.task_id, correlation_id=req.correlation_id,
         max_tool_calls=req.max_tool_calls,
+        # Route identity, never a body field: an HTTP caller cannot choose the
+        # principal recorded for the call or the surface's capabilities.
+        source="api",
+        origin=f"api:{principal}",
+        principal=principal,
+        conversation_id=req.correlation_id or req.task_id,
+        capabilities=surface_capabilities("api").model_dump(mode="json"),
     )
     try:
         result = await app.executor.execute(call, approval_id=req.approval_id)
@@ -2008,9 +2238,58 @@ class AdoptionRequest(BaseModel):
 
 
 class ScheduleRequest(BaseModel):
-    name: str
-    seconds: float
-    objective: str
+    """Operator schedule create payload.
+
+    The legacy dashboard sent ``name``/``seconds``/``objective``. The final-head
+    field names are accepted alongside those two compatibility spellings; the
+    compiler still rejects anything that is not a real schedule field.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    schedule: str | None = None
+    seconds: float | None = None
+    prompt: str | None = None
+    objective: str | None = None
+    repeat: int | str | None = None
+    timezone: str | None = None
+    deliver: Any = None
+    failure_deliver: Any = None
+    skills: list[str] | None = None
+    catch_up: bool | None = None
+    wrap_response: str | None = None
+    script: str | None = None
+    monitor: str | None = None
+    no_agent: bool | None = None
+    context_from: list[str] | None = None
+    continuity: bool | None = None
+    enabled_toolsets: list[str] | None = None
+    workdir: str | None = None
+    attach_to_session: bool | None = None
+    pinned: bool | None = None
+    paused: bool | None = None
+    paused_reason: str | None = None
+    request_key: str | None = None
+
+    def arguments(self) -> dict[str, Any]:
+        data = self.model_dump(exclude_none=True)
+        schedule = data.get("schedule")
+        if schedule is None and data.get("seconds") is not None:
+            seconds = float(data["seconds"])
+            # The legacy dashboard sent seconds. The final-head grammar's
+            # recurring durations are minute-based, so a whole-minute legacy
+            # value maps exactly; a sub-minute value is rejected honestly by
+            # the compiler instead of being silently rounded.
+            if seconds > 0 and seconds % 60 == 0:
+                data["schedule"] = f"{int(seconds // 60)}m"
+            else:
+                data["schedule"] = f"{seconds}s"
+        if data.get("prompt") is None and data.get("objective") is not None:
+            data["prompt"] = data["objective"]
+        data.pop("seconds", None)
+        data.pop("objective", None)
+        return data
 
 
 class IntegrationEvaluateRequest(BaseModel):
@@ -2047,30 +2326,68 @@ async def schedules() -> dict[str, Any]:
 
 
 @api.post("/schedules")
-async def create_schedule(req: ScheduleRequest) -> dict[str, Any]:
-    return await get_app().scheduler.register_interval(req.name, req.seconds, req.objective)
+async def create_schedule(req: ScheduleRequest, request: Request) -> dict[str, Any]:
+    """Operator-direct create; unasked but audited and origin-checked."""
+    turn = _schedule_operator_turn(request)
+    app = get_app()
+    await app.initialize()
+    arguments = req.arguments()
+    request_key = arguments.pop("request_key", None)
+    try:
+        return await app.schedule_service.create(
+            arguments,
+            actor=turn.principal,
+            turn=turn,
+            request_key=request_key,
+        )
+    except (ScheduleServiceError, ScheduleCompileError, ValueError) as exc:
+        raise _schedule_http_error(exc) from exc
+
+
+@api.patch("/schedules/{schedule_id}")
+async def update_schedule(
+    schedule_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Operator-direct update; the same canonical service as every surface."""
+    turn = _schedule_operator_turn(request)
+    app = get_app()
+    await app.initialize()
+    arguments = dict(body or {})
+    revision = arguments.pop("config_revision", None)
+    request_key = arguments.pop("request_key", None)
+    try:
+        return await app.schedule_service.update(
+            schedule_id=schedule_id,
+            name=schedule_id,
+            arguments=arguments,
+            actor=turn.principal,
+            turn=turn,
+            request_key=request_key,
+            expected_config_revision=(
+                int(revision) if isinstance(revision, int) else None
+            ),
+        )
+    except (ScheduleServiceError, ScheduleCompileError, ValueError) as exc:
+        raise _schedule_http_error(exc) from exc
 
 
 @api.delete("/schedules/{name}")
-async def delete_schedule(name: str) -> dict[str, Any]:
-    """Remove a schedule after verifying it with the scheduler."""
-    from .. import db
-    from ..contracts import utcnow
-
+async def delete_schedule(name: str, request: Request) -> dict[str, Any]:
+    """Operator-direct removal through the one schedule authority."""
+    turn = _schedule_operator_turn(request)
     app = get_app()
+    await app.initialize()
     try:
-        await app.scheduler.get(name)
-    except KeyError:
-        raise HTTPException(404, "schedule not found")
-    await db.execute("DELETE FROM schedules WHERE name=?", (name,))
-    await db.execute(
-        "INSERT INTO audit_log(ts,actor,action,resource,risk,decision,reason,metadata) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        (utcnow(), "api", "schedule.delete", name, "medium", "allowed",
-         "dashboard schedule removal", json.dumps({"name": name})),
-    )
-    await app.events.emit("schedule.deleted", name=name)
-    return {"deleted": name}
+        result = await app.schedule_service.remove(
+            schedule_id=name,
+            name=name,
+            actor=turn.principal,
+            turn=turn,
+        )
+    except (ScheduleServiceError, ValueError) as exc:
+        raise _schedule_http_error(exc) from exc
+    # Preserve the legacy route projection used by the dashboard.
+    return {**result, "deleted": result.get("name") or name}
 
 
 @api.get("/gateway/sessions")

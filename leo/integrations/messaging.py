@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
@@ -52,6 +53,31 @@ TELEGRAM_MAX_MEDIA_BYTES = 50 * 1024 * 1024
 _MEDIA_PHOTO_SUFFIXES = frozenset({
     ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
 })
+
+
+@dataclass(frozen=True)
+class AdapterCapabilities:
+    """What a channel adapter can honestly do for scheduled delivery.
+
+    All capabilities default to False. A platform name alone never entitles an
+    adapter to room routing, approval cards or terminal rewrites.
+    """
+
+    delivery_capable: bool = False
+    room_capable: bool = False
+    approval_card: bool = False
+    full_text: bool = False
+    terminal_edit: bool = False
+
+    @classmethod
+    def for_adapter(cls, adapter: Any) -> "AdapterCapabilities":
+        return cls(
+            delivery_capable=bool(getattr(adapter, "supports_delivery", True)),
+            room_capable=bool(getattr(adapter, "supports_rooms", False)),
+            approval_card=bool(getattr(adapter, "supports_approval_cards", False)),
+            full_text=bool(getattr(adapter, "supports_full_text", False)),
+            terminal_edit=callable(getattr(adapter, "edit_message_text", None)),
+        )
 
 
 def _is_entity_error(response: Any) -> bool:
@@ -107,6 +133,37 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS,
     if parts and parts[-1].count("```") % 2 == 1:
         parts[-1] = parts[-1].rstrip() + "\n```"
     return parts
+
+
+def split_plain_text(
+    text: str, limit: int = TELEGRAM_MAX_CHARS,
+    max_chunks: int = MAX_MESSAGE_CHUNKS,
+) -> list[str]:
+    """Split literal text with *no* loss, truncation or markup repair.
+
+    Approval cards are consent evidence: every character shown in the dashboard
+    must reach the chat unchanged. Chunks therefore partition the original text
+    exactly (``"".join(chunks) == text``), and an oversized body raises rather
+    than being clipped or fenced back together.
+    """
+    body = text or ""
+    if len(body) <= limit:
+        return [body]
+    chunks: list[str] = []
+    remaining = body
+    while remaining:
+        if len(chunks) >= max_chunks or len(remaining) > limit * max_chunks:
+            raise MessagingError("text does not fit the transport chunk cap")
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        window = remaining[:limit]
+        cut = max(window.rfind("\n\n") + 2, window.rfind("\n") + 1, window.rfind(" ") + 1)
+        if cut <= 0 or cut >= len(remaining):
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    return chunks
 
 
 class MessagingError(RuntimeError):
@@ -435,6 +492,12 @@ class MessagingAdapter:
     # webhook-capable; the base poll() simply raises.
     supports_webhook: bool = True
     supports_polling: bool = False
+    # A thread is part of the destination. Declare these explicitly rather than
+    # guessing from method signatures: a ``**kwargs`` sink is not proof that a
+    # channel can place a message in a named thread (or in a threaded media
+    # post). The gateway fails closed when the relevant flag is absent.
+    supports_threaded_text: bool = False
+    supports_threaded_media: bool = False
 
     def __init__(
         self,
@@ -473,7 +536,7 @@ class MessagingAdapter:
     def verify_webhook(self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None) -> bool:
         raise NotImplementedError
 
-    async def typing(self, target: str) -> None:
+    async def send_typing(self, target: str) -> None:
         """Best-effort 'is typing' indicator. Channels without one do nothing."""
         return None
 
@@ -515,27 +578,17 @@ class MessagingAdapter:
         *,
         caption: str = "",
         root: str | Path | None = None,
+        thread_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one local file as an attachment.
 
         Default is "unsupported", not "silently send the caption only": a
         channel without attachment support must make the caller see that the
-        file did not arrive.
+        file did not arrive. ``thread_id`` is part of the destination: a media
+        sender that advertises ``supports_threaded_media`` must honour it or
+        raise; it must never silently post to the root.
         """
         raise MessagingError(f"{self.channel} does not support outbound media")
-
-    async def typing(self, target: str) -> None:
-        """sendChatAction(typing). Cosmetic: failures are swallowed by the caller."""
-        token = credential("TELEGRAM_BOT_TOKEN")
-        if not token:
-            return None
-        url = f"{self.API_BASE}/bot{token}/sendChatAction"
-        response = await self._http().post(
-            url, json={"chat_id": str(target), "action": "typing"}, timeout=self.timeout
-        )
-        if response.status_code >= 400:
-            raise MessagingError(f"telegram typing failed: HTTP {response.status_code}")
-        return None
 
     async def react(self, target: str, message_id: str, emoji: str = "\U0001F44D") -> bool:
         """setMessageReaction on one message. Best effort, never raises.
@@ -635,13 +688,15 @@ class TelegramAdapter(MessagingAdapter):
         *,
         caption: str = "",
         root: str | Path | None = None,
+        thread_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one whitelisted local file via ``sendPhoto`` or ``sendDocument``.
 
         The path is confined to the outbound media root (resolved, so a symlink
         cannot escape) and refused above 50 MB *before* any bytes leave the box.
         Every failure raises ``MessagingError``: an attachment that did not
-        arrive must never be reported as sent.
+        arrive must never be reported as sent. A named forum topic is carried
+        as ``message_thread_id`` on the very same upload.
         """
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -658,6 +713,8 @@ class TelegramAdapter(MessagingAdapter):
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/{method}"
         form: dict[str, Any] = {"chat_id": str(target)}
+        if thread_id not in (None, ""):
+            form["message_thread_id"] = str(thread_id)
         if caption:
             # 1024 is Telegram's caption limit; a longer one is rejected outright.
             form["caption"] = str(caption)[:1024]
@@ -707,6 +764,36 @@ class TelegramAdapter(MessagingAdapter):
     # for a box with no public HTTPS endpoint (allow-listed, fails closed).
     supports_webhook = True
     supports_polling = True
+    supports_delivery = True
+    supports_approval_cards = True
+    supports_full_text = True
+    supports_threaded_text = True
+    supports_threaded_media = True
+
+    async def send_typing(self, target: str) -> None:
+        """Best-effort sendChatAction(typing); never raises to the caller.
+
+        A failed hint is cosmetic and must not reach the reply path, so the
+        adapter swallows transport and API errors just like ``Gateway.typing``.
+        The token is in the URL: log only the status or the error class.
+        """
+        try:
+            token = credential("TELEGRAM_BOT_TOKEN")
+            if not token:
+                return None
+            url = f"{self.API_BASE}/bot{token}/sendChatAction"
+            response = await self._http().post(
+                url, json={"chat_id": str(target), "action": "typing"}, timeout=self.timeout
+            )
+            if response.status_code >= 400:
+                _LOG.warning("telegram typing failed", extra={
+                    "channel": self.channel, "status": response.status_code,
+                })
+        except Exception as exc:  # noqa: BLE001 - a failed hint is never fatal
+            _LOG.warning("telegram typing failed", extra={
+                "channel": self.channel, "error": type(exc).__name__,
+            })
+        return None
 
     def verify_webhook(self, payload: Any, headers: HeaderMap = None, *, raw_body: bytes | None = None) -> bool:
         secret = credential("TELEGRAM_WEBHOOK_SECRET")
@@ -723,14 +810,22 @@ class TelegramAdapter(MessagingAdapter):
     async def send(
         self, target: str, text: str, *, reply_markup: dict[str, Any] | None = None,
         reply_to: str | None = None,
+        thread_id: str | None = None,
         silent: bool = False,
+        plain_text: bool = False,
+
     ) -> dict[str, Any]:
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token:
             raise MessagingError("telegram send blocked: TELEGRAM_BOT_TOKEN is not set")
         # Telegram caps one message at 4096 characters and rejects the whole send
         # with 400 otherwise. A long answer must arrive in parts, not vanish.
-        chunks = split_message(str(text), TELEGRAM_MAX_CHARS)
+        # Approval cards use the lossless splitter: no truncation, no fenced
+        # rewrite, and no Markdown interpretation of the literal card body.
+        chunks = (
+            split_plain_text(str(text), TELEGRAM_MAX_CHARS)
+            if plain_text else split_message(str(text), TELEGRAM_MAX_CHARS)
+        )
         last: dict[str, Any] = {}
         for index, chunk in enumerate(chunks):
             # The keyboard belongs to the message the human reads last, not to a
@@ -738,7 +833,9 @@ class TelegramAdapter(MessagingAdapter):
             keyboard = reply_markup if index + 1 == len(chunks) else None
             last = await self._send_one(
                 token, target, chunk, reply_markup=keyboard, silent=silent,
+                plain=plain_text,
                 reply_to=reply_to if index == 0 else None,
+                thread_id=thread_id,
             )
             if index + 1 < len(chunks):
                 _LOG.info("telegram long message split", extra={
@@ -763,12 +860,15 @@ class TelegramAdapter(MessagingAdapter):
     async def edit_message_text(
         self, target: str, message_id: str, text: str,
         reply_markup: dict[str, Any] | None = None,
+        *, thread_id: str | None = None, plain_text: bool = False,
     ) -> bool:
         """Replace the text of a sent message (best effort).
 
         ``parse_mode`` is required here too, not only on the first send. Without
         it the initial message renders markdown and every later edit shows the
         raw markup, so a progress line ends up displaying its own ``**``.
+        Schedule cards opt into literal text and carry the forum topic so the
+        terminal rewrite lands where the card was presented.
         """
         token = credential("TELEGRAM_BOT_TOKEN")
         if not token or not message_id:
@@ -776,8 +876,13 @@ class TelegramAdapter(MessagingAdapter):
         url = f"{self.API_BASE}/bot{token}/editMessageText"
         payload: dict[str, Any] = {
             "chat_id": str(target), "message_id": str(message_id), "text": str(text),
-            "parse_mode": TELEGRAM_PARSE_MODE,
         }
+        if plain_text:
+            payload["text"] = str(text)[:4096]
+        else:
+            payload["parse_mode"] = TELEGRAM_PARSE_MODE
+        if thread_id not in (None, ""):
+            payload["message_thread_id"] = str(thread_id)
         if reply_markup:
             payload["reply_markup"] = reply_markup
         try:
@@ -796,7 +901,7 @@ class TelegramAdapter(MessagingAdapter):
             description = ""
         if "not modified" in description.lower():
             return True
-        if response.status_code == 400 and _is_entity_error(response):
+        if not plain_text and response.status_code == 400 and _is_entity_error(response):
             # An unbalanced `**` or stray `<` must not freeze the update at its
             # last good text. Drop the formatting and show the text as written.
             payload.pop("parse_mode", None)
@@ -827,11 +932,16 @@ class TelegramAdapter(MessagingAdapter):
         reply_markup: dict[str, Any] | None = None,
         silent: bool = False,
         reply_to: str | None = None,
+        *, plain: bool = False, thread_id: str | None = None,
+
     ) -> dict[str, Any]:
         # The token appears in the URL: never echo the URL or httpx's exception text.
         url = f"{self.API_BASE}/bot{token}/sendMessage"
-        payload: dict[str, Any] = {"chat_id": str(target), "text": text,
-                                   "parse_mode": TELEGRAM_PARSE_MODE}
+        payload: dict[str, Any] = {"chat_id": str(target), "text": text}
+        if thread_id not in (None, ""):
+            payload["message_thread_id"] = str(thread_id)
+        if not plain:
+            payload["parse_mode"] = TELEGRAM_PARSE_MODE
         if reply_markup:
             payload["reply_markup"] = reply_markup
         if reply_to:
@@ -843,7 +953,7 @@ class TelegramAdapter(MessagingAdapter):
             response = await self._http().post(url, json=payload, timeout=self.timeout)
         except httpx.HTTPError as exc:
             raise MessagingError(f"telegram send failed: {type(exc).__name__}") from None
-        if response.status_code == 400 and _is_entity_error(response):
+        if not plain and response.status_code == 400 and _is_entity_error(response):
             # The text is markdown-ish but not valid Telegram entities (an unclosed
             # `**` or a stray underscore). Plain text keeps the content; a 400 loses
             # the whole message, and a user would rather read raw markers than nothing.
@@ -880,6 +990,7 @@ class TelegramAdapter(MessagingAdapter):
         )
         if updates is None:
             updates = data if isinstance(data, list) else [data]
+        await self._dispatch_callbacks(updates)
         return self._messages_from_updates(updates)
 
     def _messages_from_updates(self, updates: list[Any]) -> list[NormalizedMessage]:
@@ -888,9 +999,12 @@ class TelegramAdapter(MessagingAdapter):
         for update in updates:
             if not isinstance(update, dict):
                 continue
+            if isinstance(update.get("callback_query"), dict):
+                # A tap is an approval decision, never a chat turn. Dispatching
+                # happens in handle_webhook/poll; turning it into a message would
+                # replay the approval body as if the operator had typed it.
+                continue
             message = update.get("message") or update.get("edited_message")
-            if not message and isinstance(update.get("callback_query"), dict):
-                message = update["callback_query"].get("message")
             if not isinstance(message, dict):
                 continue
             sender_data = message.get("from") if isinstance(message.get("from"), dict) else {}
@@ -1099,6 +1213,9 @@ class TelegramAdapter(MessagingAdapter):
                 "sender_id": _ref(sender.get("id")),
                 "chat_id": _ref(chat.get("id")),
                 "message_id": _ref(message.get("message_id")),
+                # Forum topics are a durable place; a schedule card's tap must
+                # keep the thread it was sent to so the rewrite lands there.
+                "thread_id": _ref(message.get("message_thread_id")),
             }
             sink = self.callback_sink
             if sink is None:

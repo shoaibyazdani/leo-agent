@@ -115,6 +115,37 @@ Regression evidence: `tests/test_tools_approval.py`,
 `tests/test_api.py` (approval binding, replay/expiry, audit traceability,
 cross-site rejection and confirmation).
 
+### Proactive schedule hardening (2026-11-26)
+
+- **Unattended side effects fail closed**: a scheduled/unattended tool call of
+  MEDIUM or HIGH risk in the outbound, browser, computer, plugin or shell class
+  is denied in `ToolExecutorImpl` before `PermissionManager`, quota or dispatch.
+  No approval row is created; exactly one durable `automation.needs_you` notice
+  names the refused class and provenance. Attended command approvals keep their
+  ordinary behavior.
+- **Execution-time re-scan**: a stored schedule prompt is scanned again when the
+  agent adapter prepares a run. Tampered control/injection/secret text fails the
+  task closed with a needs-you notice and never reaches the model or an audit
+  row as raw text.
+- **Secret sinks**: opt-in tools refuse a detected credential before
+  authorization, quota, handler and persistence, storing only a canonical digest
+  and refusal category. Intrinsic detection covers vendor-less opaque tokens and
+  private-key headers with no matching end marker. All other tools still get
+  intrinsic redaction in `tool_calls`, `audit_log`, events, errors and logs.
+- **Schedule API authority**: create/patch/delete routes require
+  `LEO_API_TOKEN` when configured, validate `Host`, `Origin` and
+  `Sec-Fetch-Site`, and record the actor as `api:<authenticated principal>`.
+  Body-supplied channel/subject fields are data, never authority; ordinary
+  command approval decisions keep their compatibility wrapper.
+- **Surface capability manifest**: only TUI, web/Electron streams and Telegram
+  with native callbacks can present a card. Unknown surfaces and notify-only
+  IPCs are incapable by default. No approval authority is derived from a
+  notification.
+
+Evidence: `tests/test_schedule_security.py`, `tests/test_secret_sinks.py`,
+`tests/test_unattended_gate.py`, `tests/test_schedule_compat.py` and
+[docs/SCHEDULES.md](docs/SCHEDULES.md).
+
 ## Residual risks
 
 - **Browser is not uniformly BLOCKED**: the persistent per-actor browser
@@ -141,4 +172,7 @@ resistance. Evidence: [LEO_KNOWN_ISSUES.md](LEO_KNOWN_ISSUES.md).
 Still-open items are listed in [LEO_KNOWN_ISSUES.md](LEO_KNOWN_ISSUES.md):
 `/events` and `/metrics` lack a keyset-pagination cursor, tool-call counters
 are per-process, memory recall has no per-request opt-out, and per-principal
-scoping is deliberately not implemented.
+scoping is deliberately not implemented. Scheduled scripts remain restricted
+operator-provisioned executables, not a sandbox, and no live Telegram or gateway
+smoke was performed for this release; both limits are recorded in the schedule
+release receipt.

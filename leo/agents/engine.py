@@ -27,9 +27,11 @@ from ..contracts import (
     ChatMessage,
     ModelRequest,
     ModelResponse,
+    SurfaceCapabilities,
     TaskRecord,
     TaskStatus,
     ToolCall,
+    current_turn_context,
     new_id,
     utcnow,
 )
@@ -316,6 +318,9 @@ _KEYWORD_AGENTS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("architect", "design", "module boundary", "trade-off"), "architecture"),
     (("code", "implement", "refactor", "bug", "function", "python"), "coding"),
 )
+
+
+_UNSET_ENABLED_TOOLSETS = object()
 
 
 class ScopedTools:
@@ -825,7 +830,12 @@ class AgentEngine:
             nonlocal worktree, isolation_manager
             actual_task_id = getattr(task_arg, "id", None) or task.id
             evidence: list[Any] = []
-            scoped = self._scoped_tools(spec)
+            scoped = self._scoped_tools(
+                spec,
+                request.context.get(
+                    "enabled_toolsets", _UNSET_ENABLED_TOOLSETS
+                ),
+            )
             handler_context: dict[str, Any] = {
                 **{
                     key: value for key, value in dict(request.context).items()
@@ -1007,13 +1017,42 @@ class AgentEngine:
                                            evaluations=[{"kind": "execution", "success": False, "reason": str(exc)}])
             return self._failure(spec.id, task.id, exc)
 
-    def _scoped_tools(self, spec: AgentSpec) -> ScopedTools | None:
-        """The agent's tool view: its declared permissions, deny-by-default."""
+    def _scoped_tools(
+        self,
+        spec: AgentSpec,
+        enabled_toolsets: Any = _UNSET_ENABLED_TOOLSETS,
+    ) -> ScopedTools | None:
+        """The agent's tool view: its declared permissions, deny-by-default.
+
+        ``enabled_toolsets`` can only narrow the declared scope, never widen it.
+        Absent means inherit; an explicit empty list means no tools at all.
+        """
         if self.tools is None:
             return None
         allow = frozenset(
             str(entry).strip() for entry in (spec.tool_permissions or []) if str(entry).strip()
         )
+        if enabled_toolsets is not _UNSET_ENABLED_TOOLSETS:
+            requested = frozenset(
+                str(entry).strip()
+                for entry in (enabled_toolsets or [])
+                if str(entry).strip()
+            )
+            registry = getattr(self.tools, "registry", None)
+            specs = registry.list_specs() if callable(getattr(registry, "list_specs", None)) else []
+            keep = {
+                str(getattr(item, "name", ""))
+                for item in specs
+                if (
+                    str(getattr(item, "name", "")) in allow
+                    or str(getattr(item, "category", "")) in allow
+                )
+                and (
+                    str(getattr(item, "name", "")) in requested
+                    or str(getattr(item, "category", "")) in requested
+                )
+            }
+            allow = frozenset(name for name in keep if name)
         return ScopedTools(self.tools, allow, spec.id)
 
     @staticmethod
@@ -1065,7 +1104,20 @@ class AgentEngine:
         # sending a tag as `model` would be rejected by a live provider.
         configured = getattr(self.router, "providers", {}) or {}
         preferred = [name for name in (spec.model_preferences or []) if name in configured]
-        scoped = self._scoped_tools(spec)
+        # A pinned schedule freezes an operator-owned provider/model at creation
+        # time. It outranks agent preferences, and the model surface never sees
+        # or chooses it.
+        pinned_provider = str(context.get("pinned_provider") or "").strip()
+        if pinned_provider and pinned_provider not in configured:
+            raise AgentError(
+                f"pinned provider {pinned_provider!r} is no longer configured"
+            )
+        if pinned_provider:
+            preferred = [pinned_provider, *[name for name in preferred if name != pinned_provider]]
+        pinned_model = str(context.get("pinned_model") or "").strip() or None
+        scoped = self._scoped_tools(
+            spec, context.get("enabled_toolsets", _UNSET_ENABLED_TOOLSETS)
+        )
         # Advertise exactly the agent's declared tool scope; an agent whose
         # permissions reference no registered tool gets no tools at all.
         tool_specs = [s.model_dump(mode="json") for s in scoped.specs()] if scoped else []
@@ -1100,6 +1152,7 @@ class AgentEngine:
             task_category=spec.id,
             task_id=context.get("task_id"),
             agent_id=spec.id,
+            model=pinned_model,
             tools=tool_specs,
             reasoning_effort=reasoning.get("effort") if reasoning else None,
             reasoning_show=bool(reasoning.get("show")) if reasoning else False,
@@ -1134,6 +1187,30 @@ class AgentEngine:
                 role="assistant", content=str(content or ""),
                 tool_calls=[dict(raw) if isinstance(raw, Mapping) else raw for raw in raw_calls],
             ))
+            # Nested/delegated work inherits the parent's trusted principal and
+            # conversation, but never its card capability. If the parent was
+            # scheduled/unattended, keep that source so the unattended gate
+            # still applies to the child's tools.
+            turn = current_turn_context()
+            parent_source = str(getattr(turn, "source", "") or "")
+            nested_source = (
+                parent_source
+                if parent_source in {"scheduled", "schedule", "unattended"}
+                else "agent"
+            )
+            nested_provenance = {
+                "source": nested_source,
+                "origin": f"agent:{spec.id}",
+                "principal": getattr(turn, "principal", None) if turn else None,
+                "conversation_id": (
+                    getattr(turn, "conversation_id", None) if turn else None
+                ),
+                "thread_id": getattr(turn, "thread_id", None) if turn else None,
+                "capabilities": SurfaceCapabilities().model_dump(mode="json"),
+                # A scheduled job's workdir anchors relative tool paths and
+                # shell cwd; it is not an OS chroot and never widens roots.
+                "workdir": context.get("workdir"),
+            }
             for raw in raw_calls:
                 data = self._tool_call_data(raw)
                 if scoped is None:
@@ -1143,6 +1220,7 @@ class AgentEngine:
                 call = ToolCall(
                     id=data["id"], name=data["name"], arguments=data["arguments"],
                     actor=f"agent:{spec.id}", correlation_id=context.get("correlation_id"),
+                    **nested_provenance,
                 )
                 try:
                     outcome = await scoped.execute(call)

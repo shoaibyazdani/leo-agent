@@ -191,6 +191,18 @@ class EventBus:
         return queued
 
     async def publish(self, event: Event) -> Event:
+        # An event emitted inside a write transaction must not be persisted or
+        # delivered before COMMIT. Deferring the whole publication also means a
+        # rollback leaves no phantom history and wakes no subscriber.
+        if db.in_transaction():
+            async def _deferred_publish() -> None:
+                await self._publish_now(event)
+
+            await db.after_commit(_deferred_publish)
+            return event
+        return await self._publish_now(event)
+
+    async def _publish_now(self, event: Event) -> Event:
         seq = await self._persist_event(event)
         await self._queue_durable(event, seq)
 

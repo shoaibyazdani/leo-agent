@@ -18,7 +18,9 @@ from ..commands import create_registry
 from ..config import Settings, upstream_provider
 from ..contracts import (
     ChatMessage, MemoryCategory, MemoryKind, MemoryRecord, ModelRequest,
-    StreamChunk, ToolCall, new_id, utcnow,
+    SURFACE_CAPABILITIES, StreamChunk, SurfaceCapabilities, ToolCall,
+    TurnContext, current_turn_context, new_id, reset_turn_context,
+    set_turn_context, surface_capabilities, turn_context, utcnow,
 )
 from ..events import Event, EventBus
 from ..integrations.attachments import AttachmentStore
@@ -29,6 +31,23 @@ from ..models.router import FINAL_ANSWER_ONLY_INSTRUCTION
 from ..security import ApprovalRequired, PermissionManagerImpl
 from ..security.notifier import ApprovalNotifier
 from ..integrations.progress import ProgressReporter
+from ..schedules.outcome import (
+    ScheduleOutcomeRegistry,
+    current_schedule_outcomes,
+    enforce_truthful_answer,
+    reset_schedule_outcomes,
+    resolve_outcomes,
+    set_schedule_outcomes,
+)
+from ..schedules.execution import (
+    WORKER_MONITOR,
+    WORKER_SCRIPT,
+    ScheduleExecution,
+    apply_wrap_response,
+    record_session_note,
+)
+from ..schedules.service import ScheduleService
+from ..schedules.store import ScheduleStore
 from .stall import looks_like_stall
 from .turn_intent import (
     build_resume_instruction,
@@ -74,6 +93,32 @@ _MODEL_ERROR_TEXT_BY_CODE = {
 # A repeated call is identified by what it asks for, not by the provider's
 # per-call id: models invent a fresh id for every repeat of the same operation.
 _NO_MORE_TOOLS_INSTRUCTION = FINAL_ANSWER_ONLY_INSTRUCTION
+# Added only when the trusted turn can actually show and answer a schedule
+# card. The card, not this hint, is the authority to save anything.
+_PROACTIVE_SCHEDULE_GUIDANCE = (
+    "SCHEDULING: If a concrete future moment is clearly user-authorized, call "
+    "schedule_list first to see what already exists, prefer a one-shot or a "
+    "finite run count, and call schedule_create only for that authorized "
+    "moment. A job is shown for approval before it is saved: describe it as "
+    "pending until the human answers, and never retry after a decline."
+)
+# A live create grant changes the truth the model must narrate: there is no
+# card to wait for. It never widens what may be scheduled.
+_GRANTED_SCHEDULE_GUIDANCE = (
+    "SCHEDULING: This conversation has a live allowance for new schedules, so "
+    "schedule_create saves immediately without showing a card. Call "
+    "schedule_list first to see what already exists, create only a concrete "
+    "user-authorized moment, and say plainly that the job was saved."
+)
+# A turn with no human at the gate must never see scheduling guidance or a
+# create grant, even when it inherited an interactive conversation. These are
+# the app/service labels, which also include "agent" (a nested agent turn).
+# The executor's unattended gate is deliberately narrower: it covers only the
+# three scheduled/unattended labels, so a nested agent from an attended parent
+# keeps that parent's tool authority. "schedule" is a real delegated source.
+_UNATTENDED_TURN_SOURCES = frozenset({
+    "scheduled", "schedule", "unattended", "agent",
+})
 _STALL_NUDGE = (
     "You announced a next action but did not perform it. Continue now: either "
     "call the needed tool(s) or deliver the complete final answer. Do not "
@@ -362,6 +407,7 @@ class LeoApp:
         requested_at = utcnow()
         self._stop_requested_at[key] = requested_at
         self._stop_event(conversation_id).set()
+        stopped_runs: list[str] = []
         for run_id, info in tuple(self._runs.items()):
             if run_id == exclude_run_id:
                 continue
@@ -371,12 +417,31 @@ class LeoApp:
                 continue
             if str(info.get("conversation_id")) == key:
                 self._stop_runs.add(run_id)
+                stopped_runs.append(run_id)
         await db.execute(
             "INSERT INTO turn_cancels(conversation_id, requested_at, requested_by) "
             "VALUES(?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET "
             "requested_at=excluded.requested_at, requested_by=excluded.requested_by",
             (key, requested_at, str(requested_by)),
         )
+        # A schedule card presented by a turn that is being stopped must not
+        # survive as an answerable decision, and must never be committed by the
+        # stop itself. Withdraw exactly that run's pending card/proposal.
+        withdraw = getattr(
+            getattr(self, "schedule_service", None), "withdraw_turn", None
+        )
+        if callable(withdraw):
+            try:
+                if stopped_runs:
+                    for stopped in stopped_runs:
+                        await withdraw(run_id=stopped, reason="turn stopped")
+                else:
+                    await withdraw(conversation_id=key, reason="turn stopped")
+            except Exception as exc:  # noqa: BLE001 - a stop must still happen
+                _LOG.warning(
+                    "could not withdraw stopped-turn schedule cards",
+                    extra={"error": f"{type(exc).__name__}: {exc}"},
+                )
         return True
 
     async def _turn_stop_requested(self, conversation_id: str, since: str) -> bool:
@@ -618,6 +683,11 @@ class LeoApp:
         self.compaction.memory = self.memory
         self.tasks = DurableTaskEngine(self.settings, self.events)
         self.scheduler = Scheduler(self.tasks, self.settings, self.events)
+        # Phase 5: one schedule authority. It reads/writes the same schedules
+        # table and uses the same clock as the scheduler. The service is built
+        # after the skill registry is ready so a creation-time documentation
+        # snapshot can be frozen into the schedule config.
+        self.schedule_store = ScheduleStore(clock=self.scheduler.clock)
         # Bridge task-engine events to the chat that asked for the work: one
         # edited message per running task, exactly like the chat-turn reporter.
         from ..tasks.reporting import TaskProgressHub
@@ -632,6 +702,7 @@ class LeoApp:
         # built: index_prompt_block() is synchronous and reads the in-memory
         # snapshot.
         await self.skills.ready()
+        self._wire_schedule_execution(services)
         from ..review.consolidate import ConsolidationEngine
         from ..skills.curator import CuratorEngine
 
@@ -689,6 +760,11 @@ class LeoApp:
         # A reminder carries its own message: delivering it is the whole job, so
         # it never enters the agent loop where it spent tool rounds and failed.
         self.tasks.register_worker("reminder", self._reminder_worker)
+        # Phase 6 native adapters. The scheduler preflight selects these worker
+        # names from persisted execution config; the default worker remains the
+        # agent adapter.
+        self.tasks.register_worker(WORKER_SCRIPT, self._schedule_script_worker)
+        self.tasks.register_worker(WORKER_MONITOR, self._schedule_monitor_worker)
         self.tasks.register_delivery("channel", self._channel_delivery)
         self.tasks.register_delivery("gateway", self._channel_delivery)
         self.tasks.register_default_delivery(self._channel_delivery)
@@ -761,6 +837,86 @@ class LeoApp:
         )
         _LOG.info("LEO initialized", extra={"db": str(self.settings.db_path)})
         return self
+
+    def _schedule_allowed_roots(self) -> list[Any]:
+        """The same roots the schedule compiler validates workdir/scripts against."""
+        return [
+            self.settings.root,
+            *(self.settings.resolve(path) for path in self.settings.security.allowed_roots),
+            self.settings.resolve(self.settings.paths.workspaces),
+        ]
+
+    def _wire_schedule_execution(self, services: dict[str, Any]) -> None:
+        """Build the one schedule service and native execution registry.
+
+        This is the composition root for every operator-owned execution input:
+        the scripts root, the toolset roster, and the pinned provider/model.
+        None of these can be supplied by the model surface.
+        """
+        automation = self.settings.automation
+        allowed_roots = self._schedule_allowed_roots()
+        scripts_root = (
+            self.settings.resolve(automation.scripts_root)
+            if automation.scripts_root is not None
+            else None
+        )
+        specs = list(self.registry.list_specs())
+        available_toolsets = sorted(
+            {
+                str(value)
+                for spec in specs
+                for value in (
+                    getattr(spec, "name", ""),
+                    getattr(spec, "category", ""),
+                )
+                if str(value or "").strip()
+            }
+        )
+        pinned_provider, pinned_model = self._operator_pinned_target()
+
+        self.schedule_service = ScheduleService(
+            store=self.schedule_store,
+            scheduler=self.scheduler,
+            engine=self.tasks,
+            permissions=self.permissions,
+            events=self.events,
+            settings=self.settings,
+            clock=self.scheduler.clock,
+            scripts_root=scripts_root,
+            allowed_workdir_roots=allowed_roots,
+            available_toolsets=available_toolsets,
+            pinned_provider=pinned_provider,
+            pinned_model=pinned_model,
+            skills=self.skills,
+            adapters=getattr(getattr(self, "gateway", None), "adapters", None),
+        )
+        self.permissions.set_schedule_committer(self.schedule_service.commit)
+        self.schedule_execution = ScheduleExecution(
+            settings=self.settings,
+            store=self.schedule_store,
+            clock=self.scheduler.clock,
+            scripts_root=scripts_root,
+            allowed_workdir_roots=allowed_roots,
+        )
+        self.scheduler.attach_execution(self.schedule_execution)
+        services.update(
+            schedule_store=self.schedule_store,
+            schedule_service=self.schedule_service,
+            schedule_execution=self.schedule_execution,
+        )
+
+    def _operator_pinned_target(self) -> tuple[str | None, str | None]:
+        """The current operator-owned provider slot and its model.
+
+        A pinned schedule freezes exactly this pair at creation; it is never
+        derived from a model argument.
+        """
+        providers = getattr(self.settings.models, "providers", {}) or {}
+        slot = str(getattr(self.settings.models, "default", "") or "").strip()
+        if not slot or slot not in providers:
+            return None, None
+        model = str(getattr(providers[slot], "model", "") or "").strip()
+        return (slot, model or None)
 
     async def start_background(self, *, inbound: bool = True) -> None:
         """Start the long-lived loops.
@@ -935,28 +1091,223 @@ class LeoApp:
     async def _default_task_worker(self, task: Any, engine: Any, context: dict[str, Any]) -> Any:
         """Execute a scheduled/owner-assigned objective through AgentEngine."""
         objective = str(context.get("objective") or getattr(task, "objective", ""))
-        owner = context.get("owner_agent") or getattr(task, "owner_agent", None)
         await self._start_heartbeat(getattr(task, "id", ""))
         try:
+            return await self._run_schedule_agent(
+                task, engine, context, objective=objective
+            )
+        except Exception as exc:
+            await self._schedule_worker_failed(task, context, exc)
+            await engine.fail(getattr(task, "id"), f"{type(exc).__name__}: {exc}")
+            raise
+
+    async def _schedule_script_worker(
+        self, task: Any, engine: Any, context: dict[str, Any]
+    ) -> Any:
+        """Run the operator-provisioned script; feed or become the result."""
+        await self._start_heartbeat(getattr(task, "id", ""))
+        try:
+            outcome = await self.schedule_execution.run_script(
+                task=task, context=context
+            )
+            script = outcome["script"]
+            execution = outcome["execution"]
+            objective = str(context.get("objective") or getattr(task, "objective", ""))
+            stdout = str(script.get("stdout") or "")
+            stderr = str(script.get("stderr") or "")
+            if execution.get("no_agent"):
+                result = {
+                    "output": stdout,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": script.get("exit_code"),
+                    "truncated": bool(script.get("truncated")),
+                    "script": script.get("argv", [None])[0] if script.get("argv") else None,
+                }
+                evidence = [{
+                    "source": "scheduled_script",
+                    "claim": f"script exited {script.get('exit_code')}",
+                    "task_id": getattr(task, "id", None),
+                    "exit_code": script.get("exit_code"),
+                    "truncated": bool(script.get("truncated")),
+                }]
+                await engine.complete(
+                    getattr(task, "id"), result, evidence, note="scheduled script"
+                )
+                await self.schedule_execution.record_outcome(
+                    task=task, context=context, status="completed", text=stdout
+                )
+                return result
+            extra = "Script output"
+            if stdout.strip():
+                extra += f"\n{stdout}"
+            if stderr.strip():
+                extra += f"\nScript stderr:\n{stderr}"
+            return await self._run_schedule_agent(
+                task, engine, context, objective=objective, extra_objective=extra
+            )
+        except Exception as exc:
+            await self._schedule_worker_failed(task, context, exc)
+            await engine.fail(getattr(task, "id"), f"{type(exc).__name__}: {exc}")
+            raise
+
+    async def _schedule_monitor_worker(
+        self, task: Any, engine: Any, context: dict[str, Any]
+    ) -> Any:
+        """Complete or fail a monitor wake; the preflight already observed it.
+
+        A monitor with a prompt or skill is a gate: when it changes, the job's
+        agent actually runs with the bounded old/new content. A monitor-only
+        schedule delivers the observed change itself.
+        """
+        await self._start_heartbeat(getattr(task, "id", ""))
+        try:
+            result = await self.schedule_execution.run_monitor(
+                task=task, context=context
+            )
+            payload = result.get("payload") or {}
+            execution = result.get("execution") or {}
+            has_prompt = bool(str(payload.get("prompt") or "").strip()) or bool(
+                execution.get("skills")
+            )
+            if has_prompt:
+                return await self._run_schedule_agent(
+                    task,
+                    engine,
+                    context,
+                    objective=str(context.get("objective") or getattr(task, "objective", "")),
+                    extra_objective=str(result.get("output") or ""),
+                )
+            evidence = [{
+                "source": "schedule_monitor",
+                "claim": "monitor target changed",
+                "task_id": getattr(task, "id", None),
+                "source_kind": result["monitor"].get("source"),
+                "truncated": bool(result["monitor"].get("truncated")),
+            }]
+            await engine.complete(
+                getattr(task, "id"), result, evidence, note="monitor change"
+            )
+            await self.schedule_execution.record_outcome(
+                task=task, context=context, status="completed",
+                text=str(result.get("output") or ""),
+            )
+            return result
+        except Exception as exc:
+            await self._schedule_worker_failed(task, context, exc)
+            await engine.fail(getattr(task, "id"), f"{type(exc).__name__}: {exc}")
+            raise
+
+    async def _run_schedule_agent(
+        self,
+        task: Any,
+        engine: Any,
+        context: dict[str, Any],
+        *,
+        objective: str | None = None,
+        extra_objective: str | None = None,
+    ) -> Any:
+        """The agent adapter shared by default and feed-script schedules."""
+        owner = context.get("owner_agent") or getattr(task, "owner_agent", None)
+        prepared = await self.schedule_execution.prepare_agent(
+            task=task,
+            context=context,
+            extra_objective=extra_objective,
+        )
+        effective_objective = prepared.objective or objective or ""
+        # Scheduled/background work has no human watching. Mark it
+        # ``scheduled`` so the executor's unattended gate refuses side
+        # effects instead of parking an approval nobody can answer, and so
+        # no card surface is inherited from whichever chat started the job.
+        scheduled_turn = TurnContext(
+            principal="scheduled",
+            channel="scheduled",
+            conversation_id=(
+                str(context.get("conversation_id"))
+                if context.get("conversation_id") else None
+            ),
+            target=None,
+            surface="scheduled",
+            capabilities=SurfaceCapabilities(),
+            origin="scheduled",
+            source="scheduled",
+        )
+        with turn_context(scheduled_turn):
             result = await self.agent_engine.delegate(
-                objective,
+                effective_objective,
                 agent_id=owner,
                 context={
                     "task_id": getattr(task, "id", None),
                     "correlation_id": context.get("correlation_id"),
                     "schedule_payload": context.get("schedule_payload"),
+                    **prepared.context,
                 },
             )
-            payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
-            evidence = [{
-                "source": "agent_engine", "claim": objective,
-                "task_id": getattr(task, "id", None), "agent_id": owner,
-            }]
-            await engine.complete(getattr(task, "id"), payload, evidence, note="scheduled worker")
+        payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+        evidence = [{
+            "source": "agent_engine", "claim": effective_objective,
+            "task_id": getattr(task, "id", None), "agent_id": owner,
+        }]
+        await engine.complete(getattr(task, "id"), payload, evidence, note="scheduled worker")
+        await self.schedule_execution.record_outcome(
+            task=task, context=context, status="completed",
+            text=LeoApp._payload_text(payload),
+        )
+        return payload
+
+    async def _schedule_worker_failed(
+        self, task: Any, context: dict[str, Any], exc: BaseException
+    ) -> None:
+        """Emit one durable needs-you notice for an execution refusal.
+
+        Pinning and other operator-configuration failures are never retried
+        silently and never become an invisible approval.
+        """
+        code = str(getattr(exc, "code", "") or type(exc).__name__)
+        if code not in {
+            "prompt_unsafe_at_execution",
+            "pinned_target_missing",
+            "pinned_target_unavailable",
+            "workdir_outside_allowed_roots",
+            "invalid_workdir",
+            "scripts_disabled",
+            "script_not_allowed",
+            "script_outside_allowed_root",
+            "script_symlink",
+        }:
+            return
+        metadata = getattr(task, "metadata", None) or {}
+        try:
+            await self.events.emit(
+                "automation.needs_you",
+                source="schedule_execution",
+                reason=code,
+                detail=str(getattr(exc, "message", "") or exc)[:400],
+                schedule=metadata.get("schedule"),
+                schedule_id=metadata.get("schedule_id"),
+                task_id=getattr(task, "id", None),
+            )
+        except Exception:  # noqa: BLE001 - a notice must not mask the failure
+            _LOG.warning("schedule needs-you notice failed", extra={"reason": code})
+
+    @staticmethod
+    def _payload_text(payload: Any) -> str:
+        """Readable result text from an agent/script/monitor payload."""
+        if isinstance(payload, str):
             return payload
-        except Exception as exc:
-            await engine.fail(getattr(task, "id"), f"{type(exc).__name__}: {exc}")
-            raise
+        if isinstance(payload, dict):
+            for key in ("output", "content", "summary", "result", "answer"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+                if isinstance(value, dict):
+                    nested = LeoApp._payload_text(value)
+                    if nested.strip():
+                        return nested
+        try:
+            return json.dumps(payload, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(payload or "")
 
     async def _reminder_worker(self, task: Any, engine: Any, context: dict[str, Any]) -> Any:
         """Complete a reminder task without a model: the payload is the message.
@@ -982,6 +1333,14 @@ class LeoApp:
         await engine.complete(
             getattr(task, "id"), {"reminder": text}, evidence, note="reminder queued for delivery",
         )
+        execution = self.schedule_execution if hasattr(self, "schedule_execution") else None
+        if execution is not None:
+            try:
+                await execution.record_outcome(
+                    task=task, context=context, status="completed", text=text
+                )
+            except Exception:  # noqa: BLE001 - the note must not fail delivery
+                _LOG.warning("schedule reminder note failed", extra={"task_id": getattr(task, "id", None)})
         return {"reminder": text}
 
     async def _channel_delivery(self, task: Any, channel: str, target: Any, context: dict[str, Any]) -> Any:
@@ -994,12 +1353,52 @@ class LeoApp:
         # reaches nobody and the gateway reports the adapter failure as a dict,
         # so refusing here keeps a bogus claim of "sent" out of the receipt.
         address = str(target).strip() if target is not None else ""
+        info = context.get("delivery_target") if isinstance(context.get("delivery_target"), dict) else {}
+        kind = str(info.get("kind") or "")
+        if kind in ("local", "bot_chat") or channel in ("local", "bot-chat"):
+            # Local notes go through the same durable transcript path as
+            # attach_to_session. The next turn in that conversation rehydrates
+            # them with schedule/run metadata; no adapter is involved.
+            conversation_id = self._local_conversation_id(task, info)
+            await record_session_note(
+                schedule_id=str(
+                    (getattr(task, "metadata", {}) or {}).get("schedule_id") or ""
+                ),
+                name=self._delivery_label(task),
+                task_id=str(getattr(task, "id", "") or ""),
+                status=status,
+                text=context.get("delivery_text_override")
+                or self._delivery_text(task, status, context),
+                conversation_id=conversation_id,
+                channel="bot-chat" if kind == "bot_chat" else "local",
+                note_meta={
+                    "delivery_lane": context.get("delivery_lane"),
+                    "delivery_target_key": context.get("delivery_target_key"),
+                },
+            )
+            return f"local:note:{conversation_id}"
+        send_channel = str(channel)
+        if kind == "room" or channel == "room":
+            room_channel = str(
+                getattr(getattr(self.settings, "automation", None), "default_room_channel", "")
+                or ""
+            ).strip()
+            if not room_channel or not address:
+                raise ValueError("no configured room-capable channel for room delivery")
+            adapter = self.gateway._adapter(room_channel)  # noqa: SLF001 - same package
+            from ..integrations.messaging import AdapterCapabilities
+
+            if not AdapterCapabilities.for_adapter(adapter).room_capable:
+                raise ValueError(f"{room_channel} is not room-capable")
+            send_channel = room_channel
         if address in ("", "None", "null"):
-            raise ValueError(f"no delivery address for {channel}; refusing to send")
-        text = self._delivery_text(task, status, context)
+            raise ValueError(f"no delivery address for {send_channel}; refusing to send")
+        text = context.get("delivery_text_override") or self._delivery_text(task, status, context)
+        thread_id = str(info.get("thread_id") or "") or None
         response = await self.gateway.send(
-            str(channel), address, text,
+            send_channel, address, text,
             subject=f"task:{getattr(task, 'id', '')}",
+            thread_id=thread_id,
         )
         if isinstance(response, dict) and response.get("success") is False:
             # The adapter swallows its own errors into this dict; surfacing it
@@ -1008,7 +1407,18 @@ class LeoApp:
         message_id = response.get("message_id") if isinstance(response, dict) else None
         # Return proof, not a dict: the engine persists a scalar detail on the
         # receipt, so "sent" always carries the provider's message id.
-        return f"{channel}:{message_id}" if message_id is not None else f"{channel}:sent"
+        return f"{send_channel}:{message_id}" if message_id is not None else f"{send_channel}:sent"
+
+    @staticmethod
+    def _local_conversation_id(task: Any, info: dict[str, Any]) -> str:
+        """Durable local conversation for a local/bot-chat delivery target."""
+
+        metadata = getattr(task, "metadata", {}) or {}
+        schedule_id = str(metadata.get("schedule_id") or "")
+        chat = str(info.get("chat_id") or "").strip()
+        if info.get("kind") == "bot_chat":
+            return f"bot-chat:{chat or schedule_id or 'own'}"
+        return chat or f"schedule-{schedule_id}"
 
     @staticmethod
     def _delivery_text(task: Any, status: str, context: dict[str, Any]) -> str:
@@ -1019,12 +1429,18 @@ class LeoApp:
         sentence would be worse than useless.
         """
         payload = context.get("schedule_payload")
+        text = ""
         if isinstance(payload, dict):
             for key in ("text", "message", "reminder"):
                 declared = payload.get(key)
                 if isinstance(declared, str) and declared.strip():
-                    return declared.strip()
-        return LeoApp._task_summary(task, status)
+                    text = declared.strip()
+                    break
+        if not text:
+            text = LeoApp._task_summary(task, status)
+        # wrap_response is part of the stored execution config and the edit
+        # fingerprint; it must also control the text that is actually sent.
+        return apply_wrap_response(text, payload if isinstance(payload, dict) else None)
 
     @staticmethod
     def _clip(text: str, limit: int) -> str:
@@ -1373,6 +1789,31 @@ class LeoApp:
                 "reason": "missing channel or reply target",
             }
         subject = payload.get("subject") or str(target)
+        # A gateway payload is durable admission state written by the transport,
+        # not a model- or request-body-supplied identity. Build the trusted turn
+        # from it so the brain's tools see the real sender and thread.
+        turn = TurnContext(
+            principal=str(
+                payload.get("principal")
+                or payload.get("sender_id")
+                or payload.get("sender")
+                or "gateway"
+            ),
+            channel=channel,
+            conversation_id=(
+                str(payload["conversation_id"])
+                if payload.get("conversation_id") else None
+            ),
+            thread_id=(
+                str(payload["thread_id"] or payload["thread"])
+                if payload.get("thread_id") or payload.get("thread") else None
+            ),
+            target=str(target),
+            surface=channel,
+            capabilities=surface_capabilities(channel),
+            origin=f"gateway:{channel}",
+            source="gateway",
+        )
         reply_context = ""
         quoted = str(payload.get("reply_text") or "").strip()
         if quoted:
@@ -1390,6 +1831,7 @@ class LeoApp:
             subject=str(subject),
             conversation_id=payload.get("conversation_id"),
             attachments=payload.get("attachments") or None,
+            turn=turn,
             reply_to=payload.get("reply_ref"),
         )
         # The outbox id is the stable idempotency key: a retried drain can
@@ -2716,7 +3158,20 @@ class LeoApp:
             blocks.append(f"{label} ({name}):\n{text}")
         return "\n\n".join(blocks)
 
-    def _conversation_system_prompt(self) -> str:
+    async def _turn_has_create_grant(self, turn: TurnContext | None) -> bool:
+        """True when a live create grant covers this interactive turn."""
+        if turn is None or str(turn.source or "").strip().lower() in _UNATTENDED_TURN_SOURCES:
+            return False
+        service = getattr(self, "schedule_service", None)
+        checker = getattr(service, "has_live_create_grant", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(await checker(turn))
+        except Exception:  # noqa: BLE001 - a prompt hint must never fail a turn
+            return False
+
+    def _conversation_system_prompt(self, *, create_grant: bool = False) -> str:
         """Production system prompt for the conversation tool loop.
 
         The model receives every registered tool spec; the prompt makes tool
@@ -2761,6 +3216,24 @@ class LeoApp:
                 block = ""
             if block:
                 parts.append(block)
+        automation = getattr(getattr(self, "settings", None), "automation", None)
+        mode = getattr(automation, "proactive_mode", "offer")
+        turn = current_turn_context()
+        capabilities = getattr(turn, "capabilities", None)
+        if (
+            mode != "off"
+            and turn is not None
+            and capabilities is not None
+            and str(turn.source or "").strip().lower() not in _UNATTENDED_TURN_SOURCES
+            and capabilities.can_present_card
+            and capabilities.can_wait_for_decision
+            and capabilities.full_text
+            and capabilities.can_rewrite
+        ):
+            parts.append(
+                _GRANTED_SCHEDULE_GUIDANCE if create_grant
+                else _PROACTIVE_SCHEDULE_GUIDANCE
+            )
         return "\n\n".join(parts)
 
     async def _persist_stall_interim(
@@ -2787,6 +3260,18 @@ class LeoApp:
                 utcnow(),
             ),
         )
+
+    @staticmethod
+    async def _schedule_truthful_answer(content: str) -> str:
+        """Replace a false schedule success claim with durable store truth."""
+        registry = current_schedule_outcomes()
+        if registry is None:
+            return content
+        outcomes = registry.outcomes()
+        if not outcomes:
+            return content
+        resolved = await resolve_outcomes(outcomes)
+        return enforce_truthful_answer(content, resolved)
 
     @staticmethod
     def _final_answer(content: str, pending_names: list[str]) -> tuple[str, str]:
@@ -2975,6 +3460,65 @@ class LeoApp:
             "tool_calls": [],
         }
 
+    @staticmethod
+    def _default_surface(channel: str) -> str:
+        """The surface name for a channel-driven turn; unknown stays incapable."""
+        key = str(channel or "").strip().lower()
+        return key if key in SURFACE_CAPABILITIES else "chat"
+
+    def _resolve_turn_context(
+        self,
+        turn: TurnContext | None,
+        *,
+        channel: str,
+        subject: str | None,
+        conversation_id: str | None,
+    ) -> TurnContext:
+        """Build/fill the trusted context for this turn.
+
+        An explicitly supplied context is trusted: its principal, surface,
+        source and capabilities are never replaced by the channel/subject
+        arguments. Only routing facts the caller could not know (the generated
+        conversation id, an empty target/origin) are filled in.
+        """
+        if turn is None:
+            surface = self._default_surface(channel)
+            return TurnContext(
+                principal="chat",
+                channel=str(channel or "cli"),
+                conversation_id=conversation_id,
+                target=str(subject) if subject is not None else None,
+                surface=surface,
+                capabilities=surface_capabilities(surface),
+                origin=str(channel or "cli"),
+                source="chat",
+            )
+        updates: dict[str, Any] = {}
+        if not turn.channel and channel:
+            updates["channel"] = str(channel)
+        if turn.conversation_id is None and conversation_id is not None:
+            updates["conversation_id"] = conversation_id
+        if turn.target is None and subject is not None:
+            updates["target"] = str(subject)
+        if not turn.origin:
+            updates["origin"] = str(turn.channel or channel or "")
+        return turn.model_copy(update=updates) if updates else turn
+
+    @staticmethod
+    def _legacy_origin_snapshot(
+        turn: TurnContext, *, subject: str | None, channel: str
+    ) -> dict[str, str]:
+        """Read-only compatibility snapshot for legacy tools.
+
+        Authority lives in the ``TurnContext`` ContextVar; this dict survives
+        only because older tools read ``app._turn_origin`` directly.
+        """
+        return {
+            "channel": str(turn.channel or channel or ""),
+            "target": str(turn.target if turn.target is not None else subject or ""),
+            "conversation_id": str(turn.conversation_id or ""),
+        }
+
     async def ask(
         self,
         text: str,
@@ -2982,20 +3526,52 @@ class LeoApp:
         subject: str | None = None,
         conversation_id: str | None = None,
         attachments: list[Any] | None = None,
+        *,
+        turn: TurnContext | None = None,
         reply_to: str | None = None,
     ) -> dict[str, Any]:
         await self.initialize()
         text = self._redact(text)
         conversation_id = conversation_id or new_id("conv")
+        turn = self._resolve_turn_context(
+            turn, channel=channel, subject=subject,
+            conversation_id=conversation_id,
+        )
+        token = set_turn_context(turn)
+        outcome_token = set_schedule_outcomes(ScheduleOutcomeRegistry())
+        try:
+            return await self._ask_turn(
+                text,
+                channel=channel,
+                subject=subject,
+                conversation_id=conversation_id,
+                attachments=attachments,
+                turn=turn,
+                reply_to=reply_to,
+            )
+        finally:
+            reset_schedule_outcomes(outcome_token)
+            reset_turn_context(token)
+
+    async def _ask_turn(
+        self,
+        text: str,
+        channel: str = "cli",
+        subject: str | None = None,
+        conversation_id: str | None = None,
+        attachments: list[Any] | None = None,
+        *,
+        turn: TurnContext,
+        reply_to: str | None = None,
+    ) -> dict[str, Any]:
         # Live progress only where a human is watching; a CLI turn has no adapter
         # and begin() declines quietly.
         await self.progress.begin(channel, str(subject or ""), self.round_budget)
-        # The origin chat of THIS turn: a background task created inside it
-        # reports its progress here. Cleared at the end of the turn.
-        self._turn_origin = {
-            "channel": str(channel or ""), "target": str(subject or ""),
-            "conversation_id": conversation_id,
-        }
+        # Compatibility snapshot only: the trusted origin lives in the turn
+        # ContextVar, so concurrent turns cannot overwrite each other.
+        self._turn_origin = self._legacy_origin_snapshot(
+            turn, subject=subject, channel=channel
+        )
         # A stop only counts if it arrives during THIS turn: clear any leftover
         # request first, then remember when the turn started. A slash command is
         # not a turn — clearing here would consume the request /stop just wrote.
@@ -3118,7 +3694,9 @@ class LeoApp:
         budget = self._context_budget()
         # Memories are injected exactly once by ContextOptimizer, which applies
         # relevance selection and a dedicated token budget.
-        system = self._conversation_system_prompt()
+        system = self._conversation_system_prompt(
+            create_grant=await self._turn_has_create_grant(turn)
+        )
         tool_specs = [spec.model_dump(mode="json") for spec in self.registry.list_specs()]
         user_message = ChatMessage(role="user", content=turn_text, images=images)
         # One effective selection per turn: session override > global default >
@@ -3264,6 +3842,7 @@ class LeoApp:
                             actor=f"chat:{channel}",
                             correlation_id=conversation_id,
                             task_id=conversation_id,
+                            **turn.tool_fields(),
                         )
                         try:
                             if await self._turn_stop_requested(conversation_id, turn_started):
@@ -3318,6 +3897,7 @@ class LeoApp:
             assistant_meta["content"] = content
             assistant_meta["reasoning"] = ""
             final_status, final_content = self._final_answer(content, pending_names)
+            final_content = await self._schedule_truthful_answer(final_content)
             final_content += self._reasoning_reply_footer(
                 selection,
                 summary=str(getattr(response, "reasoning_summary", "") or ""),
@@ -3399,23 +3979,58 @@ class LeoApp:
         subject: str | None = None,
         conversation_id: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        turn: TurnContext | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream a chat turn as typed events.
 
         Mirrors :meth:`ask` but emits progressive text, tool lifecycle events
         and approval requests as they happen. The blocking endpoint remains a
         compatibility wrapper over the same model/tool loop.
+
+        The trusted turn context is installed for the whole iteration (including
+        yields), and reset when the stream closes or is cancelled, so concurrent
+        streams in one process cannot inherit each other's card capabilities.
         """
         await self.initialize()
         text = self._redact(text)
-        run_id = new_id("run")
         conversation_id = conversation_id or new_id("conv")
+        turn = self._resolve_turn_context(
+            turn, channel=channel, subject=subject,
+            conversation_id=conversation_id,
+        )
+        token = set_turn_context(turn)
+        outcome_token = set_schedule_outcomes(ScheduleOutcomeRegistry())
+        try:
+            async for event in self._ask_stream_turn(
+                text,
+                channel=channel,
+                subject=subject,
+                conversation_id=conversation_id,
+                attachments=attachments,
+                turn=turn,
+            ):
+                yield event
+        finally:
+            reset_schedule_outcomes(outcome_token)
+            reset_turn_context(token)
+
+    async def _ask_stream_turn(
+        self,
+        text: str,
+        channel: str = "cli",
+        subject: str | None = None,
+        conversation_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        *,
+        turn: TurnContext,
+    ) -> AsyncIterator[dict[str, Any]]:
+        run_id = new_id("run")
         await self.progress.begin(channel, str(subject or ""), self.round_budget)
-        # Same origin fact for the streaming path as for ask().
-        self._turn_origin = {
-            "channel": str(channel or ""), "target": str(subject or ""),
-            "conversation_id": conversation_id,
-        }
+        # Same compatibility snapshot as ask(); authority is the ContextVar.
+        self._turn_origin = self._legacy_origin_snapshot(
+            turn, subject=subject, channel=channel
+        )
         # A stop only counts if it arrives during THIS turn: clear any leftover
         # request first, then remember when the turn started. A slash command is
         # not a turn — clearing here would consume the request /stop just wrote.
@@ -3576,7 +4191,9 @@ class LeoApp:
             prompt, images = await self._images_for_turn(prompt, images)
 
             memories = await self.search.search(prompt, limit=5) if self.search else []
-            system = self._conversation_system_prompt()
+            system = self._conversation_system_prompt(
+                create_grant=await self._turn_has_create_grant(turn)
+            )
             tool_specs = [spec.model_dump(mode="json") for spec in self.registry.list_specs()]
             user_message = ChatMessage(role="user", content=prompt, images=images)
             selection = await self.reasoning_selection(conversation_id)
@@ -3877,6 +4494,7 @@ class LeoApp:
                         call = ToolCall(
                             name=name, arguments=arguments, actor=f"chat:{channel}",
                             correlation_id=conversation_id, task_id=conversation_id,
+                            **turn.tool_fields(),
                         )
                         try:
                             if await self._turn_stop_requested(conversation_id, turn_started):
@@ -3950,6 +4568,7 @@ class LeoApp:
             # A tool round ending the budget is not an answer even when the
             # model emitted narration; a blank answer is never "completed".
             final_status, content = self._final_answer(content, pending_names)
+            content = await self._schedule_truthful_answer(content)
             # The streaming path renders summaries in its dedicated thinking
             # channel. Keeping them out of `content` preserves the existing
             # contract that an answer never contains reasoning text; the
@@ -4114,6 +4733,10 @@ class LeoApp:
             name="approval_resolve",
             arguments={"approval_id": approval_id, "approved": bool(approved)},
             actor=actor,
+            source="operator",
+            origin="operator",
+            principal=actor,
+            capabilities=SurfaceCapabilities().model_dump(mode="json"),
         ))
         return result.model_dump(mode="json")
 

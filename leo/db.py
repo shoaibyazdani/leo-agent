@@ -6,21 +6,60 @@ audit trails and event history live in one inspectable file.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import json
+import logging
 import sqlite3
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 import aiosqlite
 
 _db_path: Path | None = None
 
-# A task-local handle to the open write transaction, if any. Helpers below use
-# it so a read-modify-write sequence can include ordinary ``db.execute`` calls
-# (audits, events) in the SAME transaction instead of opening a second, blocked
-# connection. ContextVar keeps concurrent asyncio tasks isolated.
-_active_transaction: ContextVar[aiosqlite.Connection | None] = ContextVar(
+_log = logging.getLogger("leo.db")
+
+# The version recorded in ``kv`` once the schedule schema/migration has fully
+# committed. It is deliberately only written after the partial unique indexes
+# exist, so a blocked migration never claims success.
+# Version 2 adds the schedule-ID occurrence-key backfill so a task claimed
+# under the legacy name-based key is still found after the cutover.
+SCHEDULE_SCHEMA_VERSION = 2
+_SCHEDULE_SCHEMA_VERSION_KEY = "schedule_schema_version"
+# Durable marker written only once the occurrence-key aliases are in place.
+# A v1 database without this marker may still hold name-keyed claims.
+_OCCURRENCE_KEY_VERSION_KEY = "schedule_occurrence_key_version"
+_OCCURRENCE_KEY_VERSION = 2
+_OCCURRENCE_KEY_PREFIX = "task:idempotency:schedule:"
+# Matches ``SecurityConfig.approval_timeout_seconds``. Legacy approval rows had
+# no expiry column; the migration gives them the timeout they were created
+# under instead of inventing a new policy.
+_LEGACY_APPROVAL_TIMEOUT_SECONDS = 900
+
+
+@dataclass
+class _TransactionState:
+    """The write transaction owned by exactly one asyncio task.
+
+    ``ContextVar`` values are inherited (copied) by child tasks. Storing the
+    owning task here lets :func:`transaction` and the SQL helpers distinguish a
+    genuine same-task nested call (savepoint) from a child task that merely
+    inherited the context copy and must open its own connection.
+    """
+
+    conn: aiosqlite.Connection
+    owner: Any
+    depth: int = 0
+    savepoint_seq: int = 0
+    callbacks: list[Callable[[], Any]] = field(default_factory=list)
+
+
+_active_transaction: ContextVar[_TransactionState | None] = ContextVar(
     "leo_active_transaction", default=None
 )
 
@@ -203,6 +242,7 @@ CREATE TABLE IF NOT EXISTS transport_heartbeats (
 CREATE TABLE IF NOT EXISTS gateway_admissions (
   admission_id TEXT PRIMARY KEY, request_id TEXT, channel TEXT NOT NULL,
   subject TEXT NOT NULL, principal TEXT NOT NULL DEFAULT '',
+  thread_id TEXT, reply_target TEXT,
   payload TEXT NOT NULL, payload_digest TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -245,10 +285,47 @@ CREATE TABLE IF NOT EXISTS tool_quotas (
   PRIMARY KEY(bucket, window_start)
 );
 
+-- The schedule table stays the one schedule authority. The legacy-compatible
+-- definition is (id, name, kind, expression, payload, enabled, next_run_at,
+-- last_run_at, created_at) while the Phase 1 columns are additive durable state
+-- for later phases, backfilled and idempotent for legacy databases.
 CREATE TABLE IF NOT EXISTS schedules (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, expression TEXT NOT NULL,
   payload TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 1,
-  next_run_at TEXT, last_run_at TEXT, created_at TEXT NOT NULL
+  next_run_at TEXT, last_run_at TEXT, created_at TEXT NOT NULL,
+  schedule_type TEXT, run_at TEXT, timezone TEXT,
+  repeat_limit INTEGER, claimed_count INTEGER NOT NULL DEFAULT 0,
+  completed_count INTEGER NOT NULL DEFAULT 0,
+  config_revision INTEGER NOT NULL DEFAULT 1, grace_minutes INTEGER,
+  config TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'active',
+  created_by TEXT, origin TEXT, consent_digest TEXT, updated_at TEXT
+);
+
+-- A model-initiated create/edit reservation. It is not a second schedule: a
+-- proposal has no execution cursor and can only commit through ScheduleService.
+CREATE TABLE IF NOT EXISTS schedule_proposals (
+  id TEXT PRIMARY KEY, active_name TEXT, principal TEXT NOT NULL,
+  operation TEXT NOT NULL, request_key TEXT, status TEXT NOT NULL DEFAULT 'pending',
+  digest TEXT NOT NULL, spec TEXT NOT NULL DEFAULT '{}',
+  origin TEXT, conversation_id TEXT, run_id TEXT, tool_call_id TEXT,
+  config_revision INTEGER, schedule_id TEXT, error TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+
+-- Durable retirement/removal record so an active name may be reused by policy
+-- while the removed schedule remains inspectable by ID.
+CREATE TABLE IF NOT EXISTS schedule_tombstones (
+  id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, name TEXT NOT NULL,
+  reason TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+  origin TEXT, created_by TEXT, created_at TEXT NOT NULL,
+  removed_at TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+-- Fail-closed migration report. Rows here are durable and are cleared only by a
+-- successful re-initialization after the operator resolves the ambiguity.
+CREATE TABLE IF NOT EXISTS schedule_migration_blockers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT,
+  detail TEXT NOT NULL, created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS integrations (
@@ -321,23 +398,53 @@ async def connection() -> AsyncIterator[aiosqlite.Connection]:
 
 @asynccontextmanager
 async def transaction() -> AsyncIterator[aiosqlite.Connection]:
-    """A single serialized write transaction: ``BEGIN IMMEDIATE`` .. ``COMMIT``.
+    """A serialized write transaction, reentrant only for its owning task.
 
-    All statements in the block share one connection and commit atomically;
-    competing writers wait up to ``busy_timeout``. Use this for any
-    read-modify-write sequence whose intermediate state must never be
-    observable (claims, dedupe-and-insert pairs, approval + its audit row).
+    The outermost call runs ``BEGIN IMMEDIATE`` .. ``COMMIT`` on one connection
+    and all statements in the block commit atomically; competing writers wait
+    up to ``busy_timeout``. A nested call from the *same* asyncio task opens a
+    ``SAVEPOINT`` instead of a second connection, so a failed inner block rolls
+    back only its own writes. A child task never reuses the parent connection
+    (which would corrupt ownership and can deadlock); it opens its own and
+    waits for the writer lock.
+
     The :func:`execute`/:func:`fetchone`/:func:`fetchall` helpers automatically
-    reuse this connection inside the block, so writes made through them commit
-    or roll back atomically with the transaction body. Event bus persistence
-    is best-effort and stays outside the block by design.
+    reuse an owned transaction connection, so writes made through them commit
+    or roll back atomically with the block. :func:`after_commit` callbacks are
+    awaited only after the outer ``COMMIT`` and are discarded on rollback.
     """
+    own_state = _transaction_state()
+    if own_state is not None:
+        # Same-task nested transaction -> savepoint. Callbacks registered in a
+        # nested scope are dropped if that savepoint rolls back.
+        own_state.depth += 1
+        savepoint = f"leo_sp_{own_state.depth}_{own_state.savepoint_seq}"
+        own_state.savepoint_seq += 1
+        callback_mark = len(own_state.callbacks)
+        await own_state.conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield own_state.conn
+        except BaseException:
+            del own_state.callbacks[callback_mark:]
+            try:
+                await own_state.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                await own_state.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                own_state.depth -= 1
+            raise
+        else:
+            await own_state.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            own_state.depth -= 1
+        return
+
     conn = await aiosqlite.connect(
         # isolation_level=None must be set at connect time: it is applied on
         # aiosqlite's worker thread, so explicit BEGIN/COMMIT control is safe.
         get_db_path(), timeout=10.0, isolation_level=None
     )
-    token = _active_transaction.set(conn)
+    state = _TransactionState(conn=conn, owner=asyncio.current_task())
+    token = _active_transaction.set(state)
+    callbacks: list[Callable[[], Any]] = []
     try:
         conn.row_factory = sqlite3.Row
         await conn.execute("PRAGMA foreign_keys=ON")
@@ -345,17 +452,23 @@ async def transaction() -> AsyncIterator[aiosqlite.Connection]:
         try:
             await conn.execute("BEGIN IMMEDIATE")
             yield conn
-            await conn.execute("COMMIT")
         except BaseException:
+            state.callbacks.clear()
             try:
                 await conn.execute("ROLLBACK")
             except Exception:  # noqa: BLE001 - rollback is best-effort cleanup
                 pass
             raise
+        else:
+            await conn.execute("COMMIT")
+            # Capture and clear before the connection closes; callbacks run
+            # after the write lock is released, never before commit.
+            callbacks, state.callbacks = list(state.callbacks), []
     finally:
         _active_transaction.reset(token)
         # See connection(): never leak the connection if PRAGMA/BEGIN fails.
         await conn.close()
+    await _run_callbacks(callbacks)
 
 
 async def _enable_wal(conn: aiosqlite.Connection) -> None:
@@ -396,6 +509,313 @@ async def _add_column(
             raise
 
 
+class ScheduleMigrationBlocked(RuntimeError):
+    """A schedule migration cannot proceed without an operator decision.
+
+    The report is persisted in ``schedule_migration_blockers`` *before* this is
+    raised, so a restart still knows why startup was blocked.
+    """
+
+    def __init__(self, blockers: list[dict[str, str]]) -> None:
+        self.blockers = blockers
+        names = ", ".join(sorted({item.get("name", "") for item in blockers if item.get("name")}))
+        super().__init__(
+            "schedule migration blocked: duplicate active schedule name(s): "
+            f"{names}. Rename the duplicate rows, disable all but one, or delete "
+            "the extra rows, then restart. Details are recorded in the "
+            "schedule_migration_blockers table."
+        )
+
+
+# New schedule columns. Kept explicit so a legacy database is upgraded in one
+# deterministic pass and a fresh database is a no-op.
+_SCHEDULE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("schedule_type", "TEXT"),
+    ("run_at", "TEXT"),
+    ("timezone", "TEXT"),
+    ("repeat_limit", "INTEGER"),
+    ("claimed_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("completed_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("config_revision", "INTEGER NOT NULL DEFAULT 1"),
+    ("grace_minutes", "INTEGER"),
+    ("config", "TEXT NOT NULL DEFAULT '{}'"),
+    ("status", "TEXT NOT NULL DEFAULT 'active'"),
+    ("created_by", "TEXT"),
+    ("origin", "TEXT"),
+    ("consent_digest", "TEXT"),
+    ("updated_at", "TEXT"),
+)
+
+_APPROVAL_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("kind", "TEXT NOT NULL DEFAULT 'command'"),
+    ("protocol_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("proposal_id", "TEXT"),
+    ("digest", "TEXT"),
+    ("choices", "TEXT NOT NULL DEFAULT '[]'"),
+    ("expires_at", "TEXT"),
+    ("shown_at", "TEXT"),
+    ("answered_at", "TEXT"),
+    ("origin", "TEXT"),
+    ("conversation_id", "TEXT"),
+    ("run_id", "TEXT"),
+    ("tool_call_id", "TEXT"),
+    ("card_revision", "INTEGER"),
+    ("presented_surface", "TEXT"),
+    ("deny_reason", "TEXT"),
+    ("card", "TEXT"),
+)
+
+_APPROVAL_GRANT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("principal", "TEXT"),
+    ("subject_type", "TEXT"),
+    ("subject_id", "TEXT"),
+    ("conversation_id", "TEXT"),
+    ("revoked_at", "TEXT"),
+)
+
+# Trusted gateway facts that must survive admission -> claim -> worker -> reply.
+# Thread and reply target are provider facts; the principal is the immutable
+# sender identity. Conversation ownership is the durable route keyed by
+# (channel, subject), never a request-body target.
+_GATEWAY_ADMISSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("thread_id", "TEXT"),
+    ("reply_target", "TEXT"),
+)
+
+_BLOCKERS_DDL = """
+CREATE TABLE IF NOT EXISTS schedule_migration_blockers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT,
+  detail TEXT NOT NULL, created_at TEXT NOT NULL
+)
+""".strip()
+
+# Partial unique indexes. They are created in ``_migrate`` (not in SCHEMA)
+# because a legacy database lacks the columns they reference until the ALTERs
+# above have run. "Active" is ``status='active'``; legacy ``enabled=0`` rows are
+# migrated to ``paused`` so they never occupy an active name.
+_SCHEDULE_INDEXES: tuple[str, ...] = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_schedules_active_name "
+    "ON schedules(name) WHERE status='active'",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_proposals_active_name "
+    "ON schedule_proposals(active_name) "
+    "WHERE active_name IS NOT NULL AND status IN ('pending','approved')",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_proposals_request_key "
+    "ON schedule_proposals(principal, operation, request_key) "
+    "WHERE request_key IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_approval_grants_subject "
+    "ON approval_grants(principal, subject_type, subject_id, action) "
+    "WHERE principal IS NOT NULL AND revoked_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_schedule_tombstones_schedule "
+    "ON schedule_tombstones(schedule_id)",
+)
+
+
+def _parse_json(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _payload_one_shot(payload: Any) -> bool:
+    """Match the scheduler's legacy ``payload.one_shot`` interpretation."""
+    if not isinstance(payload, Mapping):
+        return False
+    flag = payload.get("one_shot")
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, str):
+        return flag.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _create_index(conn: aiosqlite.Connection, statement: str) -> None:
+    try:
+        await conn.execute(statement)
+    except sqlite3.OperationalError as exc:  # pragma: no cover - race dependent
+        if "already exists" not in str(exc).lower():
+            raise
+
+
+async def _schema_version(conn: aiosqlite.Connection) -> int:
+    try:
+        cursor = await conn.execute("SELECT value FROM kv WHERE key=?", (_SCHEDULE_SCHEMA_VERSION_KEY,))
+        row = await cursor.fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if row is None:
+        return 0
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _set_schema_version(conn: aiosqlite.Connection, version: int) -> None:
+    await conn.execute(
+        "INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (_SCHEDULE_SCHEMA_VERSION_KEY, str(version), _now_iso()),
+    )
+
+
+async def _legacy_backfill_schedules(conn: aiosqlite.Connection) -> None:
+    """One-time backfill of the additive schedule columns.
+
+    ``payload.one_shot`` becomes the canonical ``kind='once'`` form with
+    ``run_at`` equal to the existing aware ``next_run_at`` and ``repeat_limit=1``.
+    The cursor (``next_run_at``) is never rewritten, so a legacy one-shot still
+    fires exactly when it did before.
+    """
+    cursor = await conn.execute(
+        "SELECT id,name,kind,expression,payload,enabled,next_run_at,created_at,"
+        "schedule_type,run_at,repeat_limit,status,created_by,updated_at FROM schedules"
+    )
+    rows = await cursor.fetchall()
+    for row in rows:
+        one_shot = _payload_one_shot(_parse_json(row["payload"]))
+        status = "active" if bool(row["enabled"]) else "paused"
+        schedule_type = "once" if one_shot else (row["schedule_type"] or row["kind"])
+        created_by = row["created_by"] or "legacy"
+        updated_at = row["updated_at"] or row["created_at"]
+        if one_shot:
+            run_at = row["run_at"] or row["next_run_at"]
+            repeat_limit = (
+                row["repeat_limit"] if row["repeat_limit"] is not None else 1
+            )
+            await conn.execute(
+                "UPDATE schedules SET kind='once', schedule_type=?, status=?, "
+                "created_by=?, updated_at=?, run_at=?, repeat_limit=? WHERE id=?",
+                (schedule_type, status, created_by, updated_at, run_at, repeat_limit, row["id"]),
+            )
+        else:
+            await conn.execute(
+                "UPDATE schedules SET schedule_type=?, status=?, created_by=?, "
+                "updated_at=? WHERE id=?",
+                (schedule_type, status, created_by, updated_at, row["id"]),
+            )
+
+
+async def _backfill_occurrence_keys(conn: aiosqlite.Connection) -> None:
+    """Alias legacy name-keyed occurrence claims to their schedule IDs.
+
+    Older schedulers deduplicated an occurrence on
+    ``task:idempotency:schedule:<name>:<instant>``. Phase 7 moves the canonical
+    key to ``schedule:<id>:<instant>``. Without an alias an occurrence that was
+    claimed under the old key but whose cursor was not advanced (a crash window)
+    would create a second task after the upgrade. This pass inserts the ID-keyed
+    alias for every still-known schedule name and records a durable marker so
+    the rewrite runs once and is idempotent on every later startup.
+    """
+    cursor = await conn.execute(
+        "SELECT id,name,status,created_at FROM schedules "
+        "ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at"
+    )
+    rows = await cursor.fetchall()
+    name_to_id: dict[str, str] = {}
+    for row in rows:
+        # The pinning order above means an active row wins over a paused
+        # duplicate; a genuinely ambiguous duplicate still blocks startup.
+        name_to_id.setdefault(str(row["name"]), str(row["id"]))
+
+    if name_to_id:
+        ordered_names = sorted(name_to_id, key=len, reverse=True)
+        claimed = await (
+            await conn.execute(
+                "SELECT key,value FROM kv WHERE key LIKE ?",
+                (f"{_OCCURRENCE_KEY_PREFIX}%",),
+            )
+        ).fetchall()
+        for item in claimed:
+            key = str(item["key"])
+            rest = key[len(_OCCURRENCE_KEY_PREFIX):]
+            for name in ordered_names:
+                marker = f"{name}:"
+                if not rest.startswith(marker):
+                    continue
+                instant = rest[len(marker):]
+                if not instant:
+                    break
+                alias = f"{_OCCURRENCE_KEY_PREFIX}{name_to_id[name]}:{instant}"
+                if alias != key:
+                    await conn.execute(
+                        "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+                        (alias, str(item["value"]), _now_iso()),
+                    )
+                break
+
+    await conn.execute(
+        "INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (_OCCURRENCE_KEY_VERSION_KEY, str(_OCCURRENCE_KEY_VERSION), _now_iso()),
+    )
+
+
+async def _legacy_backfill_approvals(conn: aiosqlite.Connection) -> None:
+    cursor = await conn.execute(
+        "SELECT id,created_at,expires_at FROM approvals WHERE expires_at IS NULL"
+    )
+    rows = await cursor.fetchall()
+    for row in rows:
+        try:
+            created = datetime.fromisoformat(str(row["created_at"]))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            expires = (created + timedelta(seconds=_LEGACY_APPROVAL_TIMEOUT_SECONDS)).isoformat()
+        except (TypeError, ValueError):
+            expires = row["created_at"]
+        await conn.execute(
+            "UPDATE approvals SET kind=COALESCE(NULLIF(kind,''),'command'), "
+            "protocol_version=COALESCE(protocol_version,1), expires_at=? WHERE id=?",
+            (expires, row["id"]),
+        )
+    # Columns added with defaults already populate legacy rows; this is a
+    # defensive normalization for databases that had a partial migration.
+    await conn.execute(
+        "UPDATE approvals SET kind='command' WHERE kind IS NULL OR kind=''"
+    )
+    await conn.execute(
+        "UPDATE approvals SET protocol_version=1 WHERE protocol_version IS NULL"
+    )
+
+
+async def _duplicate_active_names(conn: aiosqlite.Connection) -> list[dict[str, str]]:
+    cursor = await conn.execute(
+        "SELECT name, COUNT(*) AS n, GROUP_CONCAT(id) AS ids FROM schedules "
+        "WHERE status='active' GROUP BY name HAVING COUNT(*) > 1 ORDER BY name"
+    )
+    rows = await cursor.fetchall()
+    return [
+        {
+            "kind": "duplicate_active_name",
+            "name": str(row["name"]),
+            "detail": (
+                f"{int(row['n'])} active schedules share this name "
+                f"(ids: {row['ids']}); a unique active name is required"
+            ),
+        }
+        for row in rows
+    ]
+
+
+async def _record_blockers(blockers: list[dict[str, str]]) -> None:
+    """Persist the blocker report on a fresh connection (survives rollback)."""
+    async with connection() as conn:
+        await conn.execute(_BLOCKERS_DDL)
+        await conn.execute("DELETE FROM schedule_migration_blockers")
+        for item in blockers:
+            await conn.execute(
+                "INSERT INTO schedule_migration_blockers(kind,name,detail,created_at) "
+                "VALUES(?,?,?,?)",
+                (item["kind"], item.get("name"), item["detail"], _now_iso()),
+            )
+
+
 async def _migrate(conn: aiosqlite.Connection) -> None:
     """Idempotent in-place migrations for databases created before a change."""
     # Compare-and-swap guard for task rows (durable engine lost-update defence).
@@ -404,22 +824,123 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     # and default to ``native`` so no existing row changes meaning.
     await _add_column(conn, "skills", "created_by", "TEXT NOT NULL DEFAULT 'native'")
 
+    # Additive schedule/approval/consent domain columns.
+    for column, declaration in _SCHEDULE_COLUMNS:
+        await _add_column(conn, "schedules", column, declaration)
+    for column, declaration in _APPROVAL_COLUMNS:
+        await _add_column(conn, "approvals", column, declaration)
+    for column, declaration in _APPROVAL_GRANT_COLUMNS:
+        await _add_column(conn, "approval_grants", column, declaration)
+    for column, declaration in _GATEWAY_ADMISSION_COLUMNS:
+        await _add_column(conn, "gateway_admissions", column, declaration)
+
+    version = await _schema_version(conn)
+    if version < SCHEDULE_SCHEMA_VERSION:
+        await _legacy_backfill_schedules(conn)
+        await _legacy_backfill_approvals(conn)
+        await _backfill_occurrence_keys(conn)
+
+    # Fail closed before creating the unique index: a partial unique index
+    # cannot represent the ambiguity of two active rows with the same name.
+    blockers = await _duplicate_active_names(conn)
+    if blockers:
+        raise ScheduleMigrationBlocked(blockers)
+
+    try:
+        for statement in _SCHEDULE_INDEXES:
+            await _create_index(conn, statement)
+    except sqlite3.IntegrityError:
+        # A writer inserted a conflicting active name between the check above
+        # and index creation. Re-read and fail closed with the same report.
+        blockers = await _duplicate_active_names(conn)
+        if blockers:
+            raise ScheduleMigrationBlocked(blockers) from None
+        raise
+
+    # A successful pass means the operator resolved any previous blocker.
+    try:
+        await conn.execute("DELETE FROM schedule_migration_blockers")
+    except sqlite3.OperationalError:
+        pass
+    if version < SCHEDULE_SCHEMA_VERSION:
+        await _set_schema_version(conn, SCHEDULE_SCHEMA_VERSION)
+
 
 async def initialize(path: str | Path | None = None) -> Path:
     if path is not None:
         set_db_path(path)
     target = get_db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    async with connection() as conn:
-        await _enable_wal(conn)
-        for statement in _SCHEMA_STATEMENTS:
-            await conn.execute(statement)
-        await _migrate(conn)
+    try:
+        async with connection() as conn:
+            await _enable_wal(conn)
+            for statement in _SCHEMA_STATEMENTS:
+                await conn.execute(statement)
+            await _migrate(conn)
+    except ScheduleMigrationBlocked as exc:
+        await _record_blockers(exc.blockers)
+        raise
     return target
 
 
+async def schedule_migration_blockers() -> list[dict[str, Any]]:
+    """Return the durable migration blocker report (empty when healthy)."""
+    try:
+        rows = await fetchall(
+            "SELECT kind,name,detail,created_at FROM schedule_migration_blockers ORDER BY id"
+        )
+    except sqlite3.OperationalError:
+        return []
+    return [dict(row) for row in rows]
+
+
 def _transaction_connection() -> aiosqlite.Connection | None:
-    return _active_transaction.get()
+    state = _transaction_state()
+    return state.conn if state is not None else None
+
+
+def _transaction_state() -> _TransactionState | None:
+    """The active transaction only when the *current task* owns it."""
+    state = _active_transaction.get()
+    if state is None:
+        return None
+    if state.owner is not asyncio.current_task():
+        return None
+    return state
+
+
+def in_transaction() -> bool:
+    """Whether the current task is inside an owned write transaction."""
+    return _transaction_state() is not None
+
+
+async def after_commit(callback: Callable[[], Any]) -> None:
+    """Run ``callback`` after the current task's transaction commits.
+
+    Inside a transaction the callback is deferred; a rollback (including a
+    rolled-back nested savepoint) drops it. Outside a transaction it runs
+    immediately. Callbacks are only awaited after ``COMMIT`` returns, so no
+    subscriber can observe uncommitted state or fire after a rollback.
+    """
+    state = _transaction_state()
+    if state is None:
+        await _invoke_callback(callback)
+        return
+    state.callbacks.append(callback)
+
+
+async def _invoke_callback(callback: Callable[[], Any]) -> None:
+    try:
+        result = callback()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:  # noqa: BLE001 - one listener must not undo a commit
+        _log.exception("after-commit callback failed")
+
+
+async def _run_callbacks(callbacks: list[Callable[[], Any]]) -> None:
+    for callback in callbacks:
+        await _invoke_callback(callback)
 
 
 async def execute(sql: str, params: Sequence[Any] = ()) -> aiosqlite.Cursor:

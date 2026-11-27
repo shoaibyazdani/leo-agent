@@ -156,6 +156,43 @@ def _send_accepts_reply_to(send: Any) -> bool:
     )
 
 
+def _accepts_thread_keyword(sender: Any) -> bool:
+    """True when the concrete sender can be handed a ``thread_id`` keyword.
+
+    A declaration alone is not enough: a sender with no such parameter would
+    raise on the call, so the send must be refused before any work is done.
+    A ``**kwargs`` sink can take the keyword; the declaration is what promises
+    it will honour it rather than silently posting to the group root.
+    Signature failures fail closed.
+    """
+    try:
+        params = inspect.signature(sender).parameters
+    except (TypeError, ValueError):
+        return False
+    param = params.get("thread_id")
+    if param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    ):
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _adapter_accepts_thread(adapter: MessagingAdapter, *, media: bool) -> bool:
+    """Declaration validated against the sender that will actually be used.
+
+    Text and media take different code paths, so the media declaration says
+    nothing about ``send`` and vice versa. Both the flag and a concrete
+    ``thread_id`` keyword are required before the gateway may claim a threaded
+    delivery in the receipt.
+    """
+    attribute = "supports_threaded_media" if media else "supports_threaded_text"
+    if not bool(getattr(adapter, attribute, False)):
+        return False
+    sender = getattr(adapter, "send_media" if media else "send", None)
+    return callable(sender) and _accepts_thread_keyword(sender)
+
+
 class Gateway:
     """Unified conversation store and inbound/outbound channel router."""
 
@@ -836,15 +873,32 @@ class Gateway:
     # handler returns; a failure is cosmetic and must never break delivery.
     TYPING_INTERVAL_SECONDS = 4.0
 
+    async def typing(self, channel: str, target: str) -> None:
+        """Best-effort presence hint; never raises to the reply path.
+
+        Typing is cosmetic: a transport failure must not fail or delay delivery.
+        Built-in adapters swallow their own errors; a custom adapter may still
+        raise, so this boundary logs and swallows defensively.
+        """
+        adapter = self.adapters.get(str(channel))
+        if adapter is None:
+            return
+        try:
+            await adapter.send_typing(str(target))
+        except Exception as exc:  # noqa: BLE001 - a failed hint is never fatal
+            _LOG.warning("typing indicator failed", extra={
+                "channel": str(channel), "target": str(target),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
     async def _typing_heartbeat(self, payload: dict[str, Any]) -> None:
         channel = str(payload.get("channel") or "")
         target = str(payload.get("reply_target") or payload.get("subject") or "")
-        adapter = self.adapters.get(channel)
-        if not target or adapter is None:
+        if not target or channel not in self.adapters:
             return
         while True:
             try:
-                await adapter.typing(target)
+                await self.typing(channel, target)
             except Exception:
                 return
             await asyncio.sleep(self.TYPING_INTERVAL_SECONDS)
@@ -980,6 +1034,7 @@ class Gateway:
         caption: str | None = None,
         reply_markup: dict[str, Any] | None = None,
         reply_to: str | None = None,
+        thread_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one outbound message through the channel's adapter.
 
@@ -996,8 +1051,26 @@ class Gateway:
         adapter = self._adapter(channel)
         subject = subject or str(target)
         target_str = str(target)
+        thread = str(thread_id) if thread_id not in (None, "") else None
+        media_requested = media is not None and str(media).strip() != ""
+        # A requested thread is part of the destination. Check the capability
+        # BEFORE resolving the attachment: an undeclared/unhonourable thread
+        # destination is refused the same way for text and media, with no file
+        # work and no exception tumbling out of path resolution. Fail closed
+        # rather than recording a "sent" receipt for the group root.
+        if thread and not _adapter_accepts_thread(adapter, media=media_requested):
+            return {
+                "channel": channel,
+                "target": target_str,
+                "success": False,
+                "error": (
+                    f"{channel} adapter cannot address a thread"
+                    if not media_requested else
+                    f"{channel} adapter cannot address a thread with media"
+                ),
+            }
         media_path: Path | None = None
-        if media is not None and str(media).strip() != "":
+        if media_requested:
             # Confine and canonicalize before authorizing: the digest must cover
             # the file that will actually be read, not the string that was typed.
             media_path = resolve_outbound_media(media, self.outbound_media_root)
@@ -1011,6 +1084,8 @@ class Gateway:
         }
         if reply_to:
             send_arguments["reply_to"] = str(reply_to)
+        if thread:
+            send_arguments["thread_id"] = thread
         if media_path is not None:
             # Keys are added only when media is actually attached so existing
             # text-only digests stay byte-identical (no spurious approval churn).
@@ -1045,11 +1120,15 @@ class Gateway:
         conversation_id = await self._conversation(channel, subject)
         try:
             if media_path is not None:
+                media_extra = (
+                    {"thread_id": thread} if thread else {}
+                )
                 result = await adapter.send_media(
                     target,
                     media_path,
                     caption=str(caption) if caption is not None else str(text),
                     root=self.outbound_media_root,
+                    **media_extra,
                 )
             else:
                 extra = {"reply_markup": reply_markup} if (
@@ -1057,6 +1136,8 @@ class Gateway:
                 ) else {}
                 if reply_to and _send_accepts_reply_to(adapter.send):
                     extra["reply_to"] = str(reply_to)
+                if thread:
+                    extra["thread_id"] = thread
                 result = await adapter.send(target, text, **extra)
             if not isinstance(result, Mapping):
                 raise MessagingError(f"{channel} adapter returned an invalid send result")
@@ -1075,6 +1156,7 @@ class Gateway:
             "provider_message_id": result.get("message_id"),
             "idempotency_key": idempotency_key,
             "reply_to": str(reply_to) if reply_to else None,
+            "thread_id": thread,
         }
         if media_path is not None:
             # Name and size only: the absolute local path is not stored in the
@@ -1108,6 +1190,7 @@ class Gateway:
             target=target_str,
             provider_message_id=result.get("message_id"),
             idempotency_key=idempotency_key,
+            thread_id=metadata["thread_id"],
         )
         return response
 

@@ -82,6 +82,47 @@ async def test_approve_command_resolves_as_operator_principal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tui_presents_and_resolves_a_schedule_card_with_a_choice() -> None:
+    from leo import db
+
+    app = await _mock_app()
+    try:
+        card = await app.permissions.create_schedule_card(
+            kind="schedule_create",
+            body='Schedule "Water" (every day at 8am): Drink water.',
+            proposal_digest="tui-digest",
+            requested_by="chat:web",
+            conversation_id="conv-tui",
+        )
+        console, stream = _console()
+        tui = tui_mod.ChatTUI(app, console=console)
+
+        assert await tui.run_command("approvals", []) is True
+        row = await db.fetchone(
+            "SELECT shown_at FROM approvals WHERE id=?", (card.approval_id,)
+        )
+        assert row["shown_at"], "listing the full card on the TUI is presentation"
+        assert "Allow for this chat [session]" in stream.getvalue()
+
+        assert await tui.run_command(
+            "approve", [card.approval_id, "session"]
+        ) is True
+        row = await db.fetchone(
+            "SELECT status FROM approvals WHERE id=?", (card.approval_id,)
+        )
+        assert row["status"] == "approved"
+        grants = await db.fetchall(
+            "SELECT subject_type, subject_id FROM approval_grants"
+        )
+        assert [dict(item) for item in grants] == [{
+            "subject_type": "conversation", "subject_id": "conv-tui"
+        }]
+        assert "approved" in stream.getvalue().lower()
+    finally:
+        await app.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_unknown_command_returns_false_and_approve_needs_an_id() -> None:
     app = await _mock_app()
     try:
@@ -97,16 +138,45 @@ async def test_unknown_command_returns_false_and_approve_needs_an_id() -> None:
 def test_cli_exposes_chat_and_tui_commands() -> None:
     import inspect
 
+    from typer.main import get_command
+
     commands = {command.name: command for command in cli_mod.cli.registered_commands}
     assert {"chat", "tui"} <= set(commands)
-    # Both commands accept --conversation so a session can be resumed.
+    # Click builds the real help path from the command's parameter objects.
+    # Rich elides long option names when it detects a narrow console (CI has
+    # no TTY), so inspect the declaration rather than rendered help text.
+    root = get_command(cli_mod.cli)
+    runner = CliRunner()
     for name in ("chat", "tui"):
         signature = inspect.signature(commands[name].callback)
         assert "conversation" in signature.parameters
-    runner = CliRunner()
-    help_result = runner.invoke(cli_mod.cli, ["chat", "--help"])
-    assert help_result.exit_code == 0
-    assert "--conversation" in help_result.stdout
+        options = [
+            param for param in root.commands[name].params
+            if getattr(param, "name", None) == "conversation"
+        ]
+        assert len(options) == 1
+        assert "--conversation" in options[0].opts
+        assert "-c" in options[0].opts
+        # Rendered Rich help elides long option names on a non-TTY console, so
+        # the declaration above is the deterministic contract. Invoke help only
+        # to prove the command remains dispatchable.
+        help_result = runner.invoke(cli_mod.cli, [name, "--help"])
+        assert help_result.exit_code == 0
+
+
+def test_cli_conversation_option_is_not_tty_width_dependent() -> None:
+    """The option is declared in the command object, independent of console width."""
+    from typer.main import get_command
+
+    for width in ("30", "120"):
+        help_result = CliRunner().invoke(
+            cli_mod.cli, ["chat", "--help"], env={"COLUMNS": width}
+        )
+        assert help_result.exit_code == 0
+    command = get_command(cli_mod.cli).commands["chat"]
+    assert any(
+        "--conversation" in getattr(param, "opts", ()) for param in command.params
+    )
 
 
 @pytest.mark.asyncio

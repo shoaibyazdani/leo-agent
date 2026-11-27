@@ -604,6 +604,32 @@ async def test_long_echo_fields_are_bounded_and_hashed(env):
     assert long_path not in json.dumps(result.output, ensure_ascii=True)
 
 
+# --------------------------------------------------------------------------- scheduled research fetch
+
+
+async def test_scheduled_read_only_research_fetch_still_works(env):
+    """The unattended gate allows GET-based research, not just local reads."""
+    builtins.register_builtins(env.registry)
+    cases = [
+        ("http_get", {"url": _url(env, "/rates")}),
+        ("http_json", {"url": _url(env, "/rates"), "path": "rates.PKR"}),
+        ("http_json_paths", {"url": _url(env, "/rates"), "prefix": "rates"}),
+    ]
+    for name, arguments in cases:
+        result = await _run(
+            env, name, arguments,
+            source="scheduled", origin="scheduled", principal="scheduled",
+            conversation_id="conv-scheduled", correlation_id=f"fetch-{name}",
+        )
+        assert result.success, result.error
+        assert "unattended_gate" not in result.metadata
+        assert result.metadata["source"] == "scheduled"
+    assert len(env.state.requests) == len(cases)
+    assert (await db.fetchone(
+        "SELECT COUNT(*) AS n FROM approvals"
+    ))["n"] == 0
+
+
 # --------------------------------------------------------------------------- F3: no model-callable fabrication path
 
 

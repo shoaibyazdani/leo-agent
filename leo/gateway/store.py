@@ -58,8 +58,16 @@ class GatewayStore:
         payload: dict[str, Any],
         principal: str = "",
         request_id: str = "",
+        thread_id: str | None = None,
+        reply_target: str | None = None,
     ) -> tuple[str, bool]:
-        """Record an inbound payload. Returns (admission_id, created)."""
+        """Record an inbound payload. Returns (admission_id, created).
+
+        ``principal`` is the provider's immutable sender id, ``thread_id`` the
+        finer-grained topic, and ``reply_target`` the transport target a reply
+        must use. They are persisted with the admission so a worker never has
+        to trust the model, a request body, or a channel name for identity.
+        """
         digest = payload_digest(payload)
         existing = await db.fetchone(
             "SELECT admission_id FROM gateway_admissions WHERE channel=? AND payload_digest=?",
@@ -73,8 +81,10 @@ class GatewayStore:
         encoded = json.dumps(payload, sort_keys=True, default=str)
         await db.execute(
             "INSERT INTO gateway_admissions(admission_id,request_id,channel,subject,principal,"
-            "payload,payload_digest,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (admission_id, request_id, channel, subject, principal, encoded, digest,
+            "thread_id,reply_target,payload,payload_digest,status,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (admission_id, request_id, channel, subject, principal,
+             thread_id, reply_target, encoded, digest,
              ADMISSION_QUEUED, now, now),
         )
         await db.execute(
@@ -86,8 +96,8 @@ class GatewayStore:
 
     async def admission(self, admission_id: str) -> dict[str, Any] | None:
         row = await db.fetchone(
-            "SELECT admission_id,channel,subject,principal,payload,status FROM gateway_admissions "
-            "WHERE admission_id=?",
+            "SELECT admission_id,channel,subject,principal,payload,status,"
+            "thread_id,reply_target FROM gateway_admissions WHERE admission_id=?",
             (admission_id,),
         )
         if row is None:
@@ -95,6 +105,7 @@ class GatewayStore:
         return {
             "admission_id": row[0], "channel": row[1], "subject": row[2],
             "principal": row[3], "payload": json.loads(row[4] or "{}"), "status": row[5],
+            "thread_id": row[6], "reply_target": row[7],
         }
 
     async def admission_by_status(self, status: str) -> dict[str, Any] | None:

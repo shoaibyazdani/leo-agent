@@ -1,0 +1,1782 @@
+{
+  "schema_version": 1,
+  "oracle_commit": "7cf9e92cd6277b327b36a51fb897cdc8403902d6",
+  "section_order": [
+    "Final-Head Parity",
+    "LEO Adaptations",
+    "LEO Hardening",
+    "Deferred"
+  ],
+  "sections": {
+    "Final-Head Parity": [
+      {
+        "area": "Parity / Scope",
+        "given": "The port is evaluated against upstream final head 7cf9e92c.",
+        "id": "PARITY-SCOPE-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "scope audit",
+          "docs",
+          "tool registry"
+        ],
+        "then": "The port contains proactive scheduling plus schedule/schedule_edit consent only; removed intermediate watcher, script_content, state-dir, gate-context, and connector-call features are absent, while ordinary pre-existing script/no-agent/monitor behavior is unchanged.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:14-23; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:17,21-23; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:52-58; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1153-1266",
+        "when": "The final changed-file and behavior audit runs.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Scope",
+        "given": "LEO has conversation tools, direct operator commands, dashboard/API creation, and an automation-operator specialist.",
+        "id": "PARITY-SCOPE-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "model tool",
+          "operator CLI",
+          "dashboard/API",
+          "automation operator"
+        ],
+        "then": "Only model-initiated create and semantic edit draw schedule cards; trusted direct creation remains unasked, and existing automation-operator durable approvals remain intact.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:9,32; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:7,29,42-44; /Users/macbook/LEO/leo/tools/automation_tools.py:110-120; /Users/macbook/LEO/leo/agents/specs/automation_operator.py",
+        "when": "Each creation/management entry point is exercised.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Scheduler baseline",
+        "given": "LEO's existing scheduler semantics are the baseline.",
+        "id": "PARITY-SCOPE-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "scheduler",
+          "task engine",
+          "delivery"
+        ],
+        "then": "Occurrence anchoring, bounded catch-up, deterministic idempotency, backlog deferral, one-shot retirement, manual-trigger isolation, terminal replay, and delivery receipts all remain unchanged.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:31-34,61; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:94-95; /Users/macbook/LEO/leo/tasks/scheduler.py:387-683",
+        "when": "The scheduler regression suite runs before and after the port.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Approval security",
+        "given": "LEO approvals are durable, digest-bound, actor-bound, audited, and one-shot.",
+        "id": "PARITY-SCOPE-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "permissions",
+          "executor",
+          "API",
+          "channel callbacks"
+        ],
+        "then": "Schedule approvals preserve exact proposal binding, expiry, no self-approval, atomic audit, callback authorization, API origin checks, and replay/double-tap rejection.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:33-35,64; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:24; /Users/macbook/LEO/leo/security/permissions.py:209-372,582-642; /Users/macbook/LEO/leo/interfaces/api.py:1111-1159",
+        "when": "Security regression tests run with schedule and schedule_edit approvals.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Approval eligibility",
+        "given": "An interactive CLI, TUI, static web/Electron, or answerable chat session has a bound notifier.",
+        "id": "PARITY-ELIG-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "CLI",
+          "TUI",
+          "static web",
+          "Electron",
+          "answerable chat"
+        ],
+        "then": "Proactive guidance is present and a model create shows one schedule card before any row is saved; denial leaves zero rows.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:6,62; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:7-9; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:207-213",
+        "when": "The model invokes a valid create.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Create validation",
+        "given": "A model submits an invalid create.",
+        "id": "PARITY-CREATE-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "model tool",
+          "scheduler"
+        ],
+        "then": "Bad schedule/timezone/workdir, no_agent without script, missing prompt/skills, paused_reason without paused, invalid wrapper/toolsets, invalid delivery/context refs, monitor conflicts, and unrecoverable past one-shots fail before any card and persist nothing.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:50; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:39,89; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:675-739",
+        "when": "The full invalid-input matrix is dispatched.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Create card fidelity",
+        "given": "A valid create has omitted name, paused state, or a relative/absolute one-shot.",
+        "id": "PARITY-CREATE-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "approval card",
+          "scheduler"
+        ],
+        "then": "The card uses the final saved/derived name; paused says it will not run and shows no first run; an active one-shot shows its absolute instant in the profile clock; a timezone pin does not falsely relabel or move that instant.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:10-13,90-91; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1299-1312; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:100-139",
+        "when": "Approval text is captured and compared with the persisted row.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Create card fidelity",
+        "given": "A valid recurring create has a schedule, zone, and run limit.",
+        "id": "PARITY-CREATE-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "approval card",
+          "scheduler"
+        ],
+        "then": "The card shows normalized schedule wording, effective recurring zone, exact first run, and normalized N-run count; repeat supplied as string '3' persists and displays as three runs.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:10-11,38,88; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1299-1337,1420-1426",
+        "when": "The approved row is read back and compared with the card.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Create card fidelity",
+        "given": "The create uses prompt plus skills, script-only no_agent mode, an attached script, monitor, workdir, context_from, toolsets, or attach_to_session.",
+        "id": "PARITY-CREATE-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "approval card",
+          "runtime configuration"
+        ],
+        "then": "The card shows canonical prompt and skills; no_agent shows only the script as the task; agent mode mentions an attached script; monitor script/URL, workdir, source IDs, explicit empty/nonempty toolsets, and session attachment are disclosed exactly as stored.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:10,14,36-37,47,90; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1315-1337",
+        "when": "Each execution-affecting field is varied independently.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Full consent text",
+        "given": "A proposal contains a prompt or job body longer than the old preview cap.",
+        "id": "PARITY-CREATE-05",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "CLI",
+          "TUI",
+          "static web",
+          "Electron",
+          "messaging"
+        ],
+        "then": "The complete proposal is transported and reviewable; no silent 300-character truncation occurs, and a surface that cannot prove full delivery offers Deny only.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:12,25,45,92-94; /tmp/upstream-pr-158289.UY9bvi/source/gateway/platforms/base_exec_approval.py:322-355",
+        "when": "Long single-line and multi-line proposals are rendered.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Create decisions",
+        "given": "A create card is answerable.",
+        "id": "PARITY-CREATE-06",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "CLI",
+          "TUI",
+          "Desktop/static",
+          "messaging",
+          "grant store"
+        ],
+        "then": "Choices are allow once, allow for this chat/session, always allow new jobs, and deny; once authorizes one canonical create, session/always affect creates only, and denial/timeout/cancellation persist nothing.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:26,49; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:14,17; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1379-1412",
+        "when": "Each decision is selected through every supported surface.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Decline semantics",
+        "given": "The user denies, times out, cancels, or supplies /deny reason.",
+        "id": "PARITY-CREATE-07",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "tool result",
+          "guardrails",
+          "all approval surfaces"
+        ],
+        "then": "The result is success=false with declined=true, saves nothing, preserves deny_reason/user_summary, tells the model not to retry, and does not count as a dangerous-command or tool-failure loop event.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:17,52; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:17,93; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:142-155,432-448",
+        "when": "Four consecutive declines and reason-bearing denials are exercised.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Authority binding",
+        "given": "A model attempts to supply approve, first_run_at, approval id, or altered canonical arguments.",
+        "id": "PARITY-CREATE-08",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "tool schema",
+          "executor",
+          "approval store"
+        ],
+        "then": "Model input cannot forge approval or pin an unshown instant; consent is bound to the validated proposal, actor, resource, risk, expiry, and unique approval identity.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:40,65; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:23-24; /Users/macbook/LEO/leo/security/permissions.py:227-278",
+        "when": "Forged and replayed tool calls are dispatched.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Concurrent creates",
+        "given": "Two valid creates with distinct names wait concurrently, or persistence succeeds but scheduler registration fails.",
+        "id": "PARITY-CREATE-09",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "approval queue",
+          "scheduler registration"
+        ],
+        "then": "Concurrent valid creates have distinct proposal/card identities and transactional name reservation; one answer cannot resolve both.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:27,44,61; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:31; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:740-756",
+        "when": "Parallel approvals and a registration failure are injected.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Timing and staleness",
+        "given": "A create card showed a future first run and the answer arrives before it.",
+        "id": "PARITY-TIME-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "create approval",
+          "scheduler"
+        ],
+        "then": "The exact shown first_run_at is saved for both one-shot and recurring creates, even if approval latency is substantial; the time is not recomputed from answer time.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:49; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:13,42; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:57-80",
+        "when": "Answers arrive minutes later but still before the shown instant.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Timing and staleness",
+        "given": "A shown future first run passes while a create card waits.",
+        "id": "PARITY-TIME-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "create approval",
+          "scheduler",
+          "tool result"
+        ],
+        "then": "At or after the shown instant the result is declined=true, no row is saved, no approve-then-error occurs, and no different recurring occurrence is silently substituted.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:17,49; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:9; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1415-1433",
+        "when": "One-shot, every-2-minute, and every-minute creates are answered late.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Timing and staleness",
+        "given": "A one-shot is already due inside the existing grace window and no card is shown.",
+        "id": "PARITY-TIME-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "no-card create",
+          "scheduler"
+        ],
+        "then": "The job saves with legacy grace behavior and no stale-card wording; the stale check applies only when a card was actually shown and its first run was initially in the future.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:9,30,68; /tmp/upstream-pr-158289.UY9bvi/cource-results/result-08.md:13,80",
+        "when": "A just-past one-shot is created in approvals-off/no-notifier context.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Timing and staleness",
+        "given": "An enabled job is updated with an equivalent recurring schedule such as every 24h versus every 1d.",
+        "id": "PARITY-TIME-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler"
+        ],
+        "then": "No card appears, the update is a successful no-op, and next_run_at is not re-anchored; a name-only update carrying the same schedule also preserves the cursor.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:15,67; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:995-1006,1475-1481",
+        "when": "Equivalent schedule spellings are resubmitted.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Timing and staleness",
+        "given": "A one-shot is moved by seconds or to another offset with the same wall-clock text.",
+        "id": "PARITY-TIME-05",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler"
+        ],
+        "then": "A schedule_edit card appears with the true instants, denial leaves the old instant unchanged, and approval stores the new exact instant.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:50,105; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:372-380,408-415",
+        "when": "Second-level and offset-only one-shot edits are proposed.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Timing and staleness",
+        "given": "An edit changes a job to a one-shot whose new instant passes while its card waits.",
+        "id": "PARITY-TIME-06",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler"
+        ],
+        "then": "The edit returns declined=true before saving, the original job remains byte-identical, and no post-consent scheduler error occurs.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:16,68; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1525-1531",
+        "when": "The new one-shot instant is crossed during approval.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Timing and staleness",
+        "given": "A recurring edit is answered after its previously displayed first run.",
+        "id": "PARITY-TIME-07",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler"
+        ],
+        "then": "Normal recurring-update semantics apply and a future occurrence is computed from answer time; the one-shot-only late-edit decline is not incorrectly applied to recurring edits.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:13,79; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1525-1531",
+        "when": "A late recurring edit is approved.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit consent",
+        "given": "A model edit changes any behavior-affecting field.",
+        "id": "PARITY-EDIT-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler"
+        ],
+        "then": "One schedule_edit card lists old -> new for prompt, no_agent, skills, context_from, semantic schedule, timezone, grace_minutes, catch_up, repeat, deliver, failure_deliver, attach_to_session, monitor, script, enabled_toolsets, workdir, and model/provider where applicable.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:21; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:10; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1436-1459",
+        "when": "Each field is changed independently and in combinations.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit consent",
+        "given": "An edit is invalid, semantically unchanged, name-only, wrapper-only, or has no listed-field change.",
+        "id": "PARITY-EDIT-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler"
+        ],
+        "then": "Invalid edits fail before asking; equivalent schedule resends are no-ops without re-anchoring; cosmetic name/wrap_response-only changes remain unasked; no-card behavior is logged rather than misreported as stale.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:15,30; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:995-1036,1511-1517",
+        "when": "The invalid/no-op/cosmetic edit matrix is dispatched.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit consent",
+        "given": "A valid semantic edit card is answerable.",
+        "id": "PARITY-EDIT-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "grant store",
+          "scheduler"
+        ],
+        "then": "Choices are Allow and Deny only; deny leaves the row byte-identical; allow applies exactly the shown merged update; no session/permanent grant is created; a cron_create grant never suppresses the edit card.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:21-22,53; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:223-264",
+        "when": "Allow, deny, and prior-create-grant cases are exercised.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit concurrency",
+        "given": "The job is removed while an edit card waits.",
+        "id": "PARITY-EDIT-05",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler transaction"
+        ],
+        "then": "The save-time locked re-read returns a clear removed/nothing-saved error, does not crash formatting a missing job, and does not recreate the row.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:13,66; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1492-1502",
+        "when": "Deletion occurs during the approval wait.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit concurrency",
+        "given": "The job is paused or resumed while an edit card waits.",
+        "id": "PARITY-EDIT-06",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler transaction"
+        ],
+        "then": "The approved edit is refused as stale and the intervening enabled/paused state and schedule remain unchanged.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:13,66; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:357-369",
+        "when": "Pause and resume are injected independently during the wait.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit concurrency",
+        "given": "Another surface changes any card-listed field or semantic schedule while the edit waits.",
+        "id": "PARITY-EDIT-07",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler transaction"
+        ],
+        "then": "The fingerprint mismatch rejects the stale save; the newer prompt, delivery, timezone, execution mode, or schedule is not overwritten.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:17,107; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1484-1502",
+        "when": "Concurrent edits are injected for every fingerprint component.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit concurrency",
+        "given": "A run completes while an edit card waits, or repeat is lowered below completed runs.",
+        "id": "PARITY-EDIT-08",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "edit approval",
+          "scheduler transaction"
+        ],
+        "then": "Only the requested repeat limit is patched and merged under lock with current completed count; completed runs and next-run bookkeeping are preserved, and the card discloses N runs already done when lowering the limit.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:22; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:12,82-83; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:977-982,1513-1515",
+        "when": "repeat.completed advances from 0 to 2 during the wait and the new limit is 5 or 2.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit concurrency",
+        "given": "An edit approval is waiting.",
+        "id": "PARITY-EDIT-09",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "approval wait",
+          "scheduler transaction"
+        ],
+        "then": "No schedule write transaction is held during the human wait; the final existence/fingerprint check and write occur under the same jobs lock.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:17,40; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1029-1032,1492-1502",
+        "when": "A second writer attempts a schedule mutation during approval.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Delivery recipients",
+        "given": "deliver=origin and the captured origin exactly matches the resolved destination.",
+        "id": "PARITY-DELIV-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "delivery resolver",
+          "create/edit cards"
+        ],
+        "then": "The card says this chat only for the matching normalized platform/chat/topic identity and uses the scheduler's actual resolver output.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:11,33; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1340-1376",
+        "when": "Origin delivery is rendered for CLI, chat, and topic-capable sessions.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Delivery recipients",
+        "given": "Origin has no captured chat, or a configured home fallback exists or does not exist.",
+        "id": "PARITY-DELIV-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "delivery resolver",
+          "create/edit cards"
+        ],
+        "then": "The card names the real home channel or honest nowhere/history-only state and never claims this chat without an origin.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:33,63; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:327-339",
+        "when": "Home configured, empty, and absent cases are rendered.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Delivery recipients",
+        "given": "Delivery uses explicit platform:chat[:thread], all, local, comma-combined tokens, a bare unconfigured platform, or a typo.",
+        "id": "PARITY-DELIV-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "delivery resolver",
+          "create/edit cards"
+        ],
+        "then": "Each token resolves independently to the explicit address, all home channels, local history only/nowhere, or an honest no-destination message; no nonexistent recipient is promised.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:55,104; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1354-1376",
+        "when": "The complete delivery-token matrix is rendered and compared with runtime routing.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Delivery recipients",
+        "given": "failure_deliver differs from deliver, or only the audience changes.",
+        "id": "PARITY-DELIV-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "delivery resolver",
+          "create/edit cards"
+        ],
+        "then": "Failure notices name their separate resolved audience; edit cards show raw token plus audience; jobs differing only by audience produce different consent text.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:8,54; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:119-130,451-456",
+        "when": "Result and failure routes are varied independently.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "Command, schedule, and schedule_edit approvals use the shared card infrastructure.",
+        "id": "PARITY-RENDER-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "CLI",
+          "TUI",
+          "static web",
+          "Electron",
+          "messaging"
+        ],
+        "then": "One frame/menu/dialog model renders schedule and edit bodies without synthetic command targets, Run wording, or dangerous-command labels; edit uses Change this job wording.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:6,33; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:23; /tmp/upstream-pr-158289.UY9bvi/source/gateway/platforms/base_exec_approval.py:113-141,296-319",
+        "when": "All three known kinds and missing/unknown kind are rendered.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "An approval kind is absent or unknown.",
+        "id": "PARITY-RENDER-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "all renderers",
+          "legacy clients"
+        ],
+        "then": "Rendering falls back to the existing command card and authority behavior; schedule wording never leaks into command approvals and command payloads remain compatible.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:33; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:101; /tmp/upstream-pr-158289.UY9bvi/source/gateway/platforms/base_exec_approval.py:72-75",
+        "when": "Backward/forward-compatible payloads are rendered.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "Model-written text contains triple/longer backticks, links, spoilers, headings, HTML, or fake card lines.",
+        "id": "PARITY-RENDER-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "native cards",
+          "text fallback",
+          "timeout rewrite",
+          "Teams",
+          "CLI",
+          "TUI",
+          "Desktop/static"
+        ],
+        "then": "All proposal text remains literal inside one adaptive fence or escaped text node; no embedded markup can close the fence, hide text, or relabel the plan.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:23,30; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:15,91; /tmp/upstream-pr-158289.UY9bvi/source/gateway/platforms/base_exec_approval.py:211-238",
+        "when": "Adversarial markup is rendered live, after timeout, and after a click.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "A native card send fails or the user invokes a plain-text approval path.",
+        "id": "PARITY-RENDER-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "messaging fallback",
+          "typed approval",
+          "timeout notice"
+        ],
+        "then": "Fallback and timeout text use the same dynamic fence and schedule/edit wording, state that no job/change was saved, and never say a command ran or waited.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:23,59-60; /tmp/upstream-pr-158289.UY9bvi/source/gateway/platforms/base_exec_approval.py:184-222",
+        "when": "Native send failure, /approve text, and timeout rewrite are injected.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "A Telegram, Slack, or Teams schedule card is clicked, expires, or lacks a request id.",
+        "id": "PARITY-RENDER-05",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "Telegram",
+          "Slack",
+          "Teams"
+        ],
+        "then": "Resolved and expired rebuilds retain schedule/schedule_edit header, body, choices, fence, and no-command wording; kind is carried on the prompt and adapter-local card state, not a duplicate global registry.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:16,20; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:17,70; /tmp/upstream-pr-158289.UY9bvi/source/gateway/platforms/base_exec_approval.py:113-131",
+        "when": "Allow, Deny, expiry, and no-request-id paths are exercised.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "A classic/plain-input CLI panel cannot fit the full proposal.",
+        "id": "PARITY-RENDER-06",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "CLI",
+          "plain-input fallback"
+        ],
+        "then": "The complete body is printed to scrollback before the compact panel, no synthetic cronjob command is shown, edit choices are Allow/Deny only, and printed-above copy is emitted only when full text was actually printed.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:136-141; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:26,113",
+        "when": "100x18, 80x18, 100x14, 100x40, and long single-line cards are rendered.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "A TUI receives a long schedule or edit body.",
+        "id": "PARITY-RENDER-07",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "TUI"
+        ],
+        "then": "The body pages/scrolls through every wrapped line before a choice can be submitted, uses schedule/edit labels, and omits the synthetic command/view-command choice.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:25,105,108; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:26",
+        "when": "Long command and long schedule bodies are paged with keyboard/event synchronization.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "A static web or Electron client receives or restores a schedule approval.",
+        "id": "PARITY-RENDER-08",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "static web",
+          "Electron",
+          "approvals API"
+        ],
+        "then": "The card is a turn-blocking approval with full proposal text and correct choices; missing folder/site target does not reject it; reconnect/reload restores kind and the same plan rather than a read-only generic blocker.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:196-201; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:27; /Users/macbook/LEO/leo/interfaces/static/ui/conversation/chat.js:551-657; /Users/macbook/LEO/leo/interfaces/static/ui/app.js:353-360",
+        "when": "Live, reload, restore-pending, and resolve-from-approvals-view flows run.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "A messaging adapter has a hard cap or Teams rich-text rendering.",
+        "id": "PARITY-RENDER-09",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "all capped messaging adapters",
+          "Teams"
+        ],
+        "then": "The full body is sent with a safe adaptive fence or the card is Deny-only; Teams shows literal text; no truncation can change the approved content.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:25,76,107; /tmp/upstream-pr-158289.UY9bvi/source/gateway/platforms/base_exec_approval.py:322-355",
+        "when": "Caps, chunk failures, and triple-backtick bodies are injected.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "Existing command/folder/site/access/network approvals are exercised after the port.",
+        "id": "PARITY-RENDER-11",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "existing approval suites"
+        ],
+        "then": "Their wording, targets, risk display, actions, and callback payloads remain unchanged except intentional safe fencing; schedule copy never leaks into them.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:33,111; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:101",
+        "when": "Existing approval regression suites run.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Replay and transport",
+        "given": "A schedule approval crosses canonical events, legacy server requests, or a gateway/managed worker frame.",
+        "id": "PARITY-REPLAY-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "canonical protocol",
+          "legacy protocol",
+          "worker frame",
+          "API/UI contracts"
+        ],
+        "then": "kind=schedule/schedule_edit survives every closed allowlist and transport; same-version workers validate it; missing/unknown kind remains command.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:12,57; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:14,157; /tmp/upstream-pr-158289.UY9bvi/source/tests/gateway/test_managed_worker_approval_kind.py",
+        "when": "Real frame serialization/deserialization and contract validation run.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Replay and transport",
+        "given": "A client reconnects, resumes, restores pending approvals, or has multiple queued cards and answers a sibling.",
+        "id": "PARITY-REPLAY-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "static web",
+          "Electron",
+          "TUI",
+          "API",
+          "queued approvals"
+        ],
+        "then": "Replay preserves kind, choices, body, and request identity; answering one card cannot downgrade or resolve another; the restored schedule card blocks the correct turn.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:125-133,196-201; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:96-97",
+        "when": "Reconnect, resume, queued-card, and sibling-answer scenarios run.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Replay and transport",
+        "given": "A stale response arrives after timeout/expiry, or the same approval is tapped twice.",
+        "id": "PARITY-REPLAY-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "approval store",
+          "channel callbacks",
+          "API"
+        ],
+        "then": "The response is rejected without a second persistence or audit ambiguity; timeout remains a declined no-save outcome and cannot later authorize the job.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:23-24,97; /Users/macbook/LEO/leo/security/permissions.py:582-642",
+        "when": "Post-timeout and concurrent duplicate resolutions are injected.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Deny reason transport",
+        "given": "A user denies with a reason through legacy TUI/gateway paths.",
+        "id": "PARITY-REPLAY-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "legacy TUI",
+          "gateway response",
+          "tool result"
+        ],
+        "then": "The typed reason reaches approval resolution and the model-visible schedule result; denial remains a normal user answer and leaves the store unchanged.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:125-134; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:16,158",
+        "when": "Both legacy server-request and approval.respond paths are tested.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Prompt and tool surface",
+        "given": "The scheduling tool schema and system prompt are built.",
+        "id": "PARITY-PROMPT-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "tool schema",
+          "system prompt"
+        ],
+        "then": "The schema stays neutral and teaches bounded one-shot/few-run use, self-contained fresh-session prompts, least useful cadence, update-existing preference, no retry after decline, and no autonomous send/buy/submit; imperative proactivity appears only in gated prompt guidance.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:15; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:7; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1153-1168",
+        "when": "Tool-description and prompt snapshots are inspected.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Prompt and tool surface",
+        "given": "The scheduling tool is direct, deferred behind tool search, or reachable through a tool-call bridge.",
+        "id": "PARITY-PROMPT-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "tool registry",
+          "prompt builder",
+          "safe worker"
+        ],
+        "then": "Guidance appears only when the tool is actually reachable and answerable; reachability uses cached selection/check_fn results and never builds schemas, imports plugins, or reads forbidden files.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-04.md:113-117; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:35; /tmp/upstream-pr-158289.UY9bvi/source/agent/system_prompt.py:317-341",
+        "when": "Direct, deferred, bridge, unavailable-tool, and safe-mode prompt cases run.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Prompt and tool surface",
+        "given": "The port changes prompts, tool descriptions, contracts, locales, or docs.",
+        "id": "PARITY-PROMPT-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "prompt snapshots",
+          "tool-search snapshots",
+          "docs",
+          "contracts"
+        ],
+        "then": "LEO's own token/count deltas are measured and reviewed, cron/unattended prompts stay unchanged, all artifacts are coherent, and upstream token counts are not claimed as LEO verification.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:21,186; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:19,25,35",
+        "when": "Snapshot, generation, and documentation suites run.",
+        "core_gate": true
+      }
+    ],
+    "LEO Adaptations": [
+      {
+        "area": "Parity / Approval eligibility",
+        "given": "A live cron_create/session/permanent create grant exists.",
+        "id": "PARITY-ELIG-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "grant store",
+          "model tool",
+          "prompt"
+        ],
+        "then": "Future creates save without a card and proactive create guidance is withheld; every semantic edit still asks through cron_update/schedule_edit.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:21-22; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:14; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:255-264",
+        "when": "A create and then an edit are requested in the same session.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Edit lifecycle",
+        "given": "The model pauses, resumes, runs, or removes a job.",
+        "id": "PARITY-EDIT-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "model tool",
+          "operator safeguards"
+        ],
+        "then": "These lifecycle actions stay outside the new schedule_edit gate as upstream intends, while LEO's pre-existing stronger automation-operator delete/trigger approvals are not weakened.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:19,29; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1039-1056",
+        "when": "Lifecycle actions are invoked from model and operator paths.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Delivery recipients",
+        "given": "A create/update targets bot-chat, room, or another machine-local destination.",
+        "id": "PARITY-DELIV-05",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "validation",
+          "delivery resolver",
+          "approval card"
+        ],
+        "then": "Unsupported or invalid machine-local targets fail before asking; valid targets are named truthfully using the same resolver as execution.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:40,44; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:701-706",
+        "when": "Bot-chat/room and invalid destination cases are dispatched.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Rendering",
+        "given": "The port adds schedule/schedule_edit copy and protocol fields.",
+        "id": "PARITY-RENDER-10",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "locale catalogs",
+          "API/event contracts",
+          "UI types",
+          "docs"
+        ],
+        "then": "Centralized English copy plus DTO, event, API and UI contract tests replace source-project locale assumptions; LEO has no locale subsystem.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:31; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:19,25-26,102",
+        "when": "Locale/key parity, contract generation, and docs-truthfulness checks run.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Every channel surface",
+        "given": "Each registered LEO adapter is exercised with an injected transport: Telegram, Discord, WhatsApp Cloud, Slack, Mattermost, LINE, Google Chat, Teams, DingTalk, Feishu, QQ Bot, WeCom, Weixin, SMS, BlueBubbles, Signal, Relay, Email, Matrix, IRC, ntfy, and A2A.",
+        "id": "PARITY-SURF-01",
+        "priority": "P0 - LEO surface parity",
+        "surfaces": [
+          "TUI",
+          "web",
+          "Electron",
+          "Telegram",
+          "all other LEO adapters"
+        ],
+        "then": "Only TUI, web/Electron stream and Telegram with native callbacks may receive cards; every other adapter remains incapable and produces approval_required.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:67-68; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:76,99; /Users/macbook/LEO/leo/integrations/channels/__init__.py:35-79; /Users/macbook/LEO/leo/integrations/channels/specs.py:194-306",
+        "when": "A parameterized adapter contract suite renders schedule and schedule_edit proposals.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Telegram surface",
+        "given": "Telegram inline approval buttons are used, including a long approval id requiring a locator.",
+        "id": "PARITY-SURF-02",
+        "priority": "P0 - LEO surface parity",
+        "surfaces": [
+          "Telegram",
+          "gateway callbacks"
+        ],
+        "then": "Callback data stays within 64 bytes, kind and decision round-trip, locator resolves only among owned pending ids, immutable sender authorization is enforced, edit exposes no grant buttons, and resolved/expired text retains schedule kind.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:70; /Users/macbook/LEO/leo/security/approval_buttons.py:38-160; /Users/macbook/LEO/leo/gateway/callbacks.py:210-324",
+        "when": "Valid, forged, oversized, wrong-sender, double-tap, and expired callbacks are injected.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Text-only and blind surfaces",
+        "given": "A channel supports only text/typed approval, or has no inbound answer path.",
+        "id": "PARITY-SURF-03",
+        "priority": "P0 - LEO surface parity",
+        "surfaces": [
+          "Discord",
+          "Slack",
+          "Teams",
+          "Feishu",
+          "Matrix",
+          "WhatsApp Cloud",
+          "Relay",
+          "Mattermost",
+          "LINE",
+          "Google Chat",
+          "DingTalk",
+          "QQ Bot",
+          "WeCom",
+          "Weixin",
+          "SMS",
+          "BlueBubbles",
+          "Signal",
+          "Email",
+          "IRC",
+          "ntfy",
+          "WhatsApp Web",
+          "A2A"
+        ],
+        "then": "Typed decisions work only on a planned answerable surface; send-only, notifier-blind and unverified adapters never receive a card.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:24,85; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:76,99; /Users/macbook/LEO/leo/integrations/whatsapp_msg.py:197-250; /Users/macbook/LEO/leo/integrations/channels/a2a.py:91-115",
+        "when": "Typed decisions and no-answer transports are exercised per adapter.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Deferred eval and monitor semantics",
+        "given": "LEO later adopts deterministic export comparison or monitor-based checks.",
+        "id": "HARD-QUAL-10",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "read-only comparison",
+          "monitor runtime",
+          "scheduler"
+        ],
+        "then": "Native URL/script monitors preserve a good baseline on failure, suppress unchanged output and wake on exact-byte change; export comparison remains deferred.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:18; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:20,83,156; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:49,182",
+        "when": "The deferred comparison and monitor acceptance scenarios are implemented.",
+        "core_gate": true
+      },
+      {
+        "id": "LEO-ADAPT-01",
+        "area": "Native durable authority",
+        "priority": "P0 - LEO adaptation",
+        "given": "The native port is exercised.",
+        "when": "The corresponding LEO contract tests run.",
+        "then": "Schedules, proposals, tombstones, approvals and grants use LEO's existing SQLite store; no parallel schedule or approval authority exists.",
+        "surfaces": [
+          "LEO native implementation"
+        ],
+        "core_gate": true
+      },
+      {
+        "id": "LEO-ADAPT-02",
+        "area": "Native tool roster",
+        "priority": "P0 - LEO adaptation",
+        "given": "The native port is exercised.",
+        "when": "The corresponding LEO contract tests run.",
+        "then": "LEO exposes schedule_create/list/get/update/delete/run_now/cancel; upstream has no get action, so schedule_get is a documented native addition.",
+        "surfaces": [
+          "LEO native implementation"
+        ],
+        "core_gate": true
+      },
+      {
+        "id": "LEO-ADAPT-03",
+        "area": "Operator-provisioned scripts",
+        "priority": "P0 - LEO adaptation",
+        "given": "The native port is exercised.",
+        "when": "The corresponding LEO contract tests run.",
+        "then": "Scheduled scripts are opt-in executable paths under an allowlisted root, with args arrays, no shell, minimal environment, timeout/byte caps and real run evidence.",
+        "surfaces": [
+          "LEO native implementation"
+        ],
+        "core_gate": true
+      },
+      {
+        "id": "LEO-ADAPT-04",
+        "area": "Native monitors",
+        "priority": "P0 - LEO adaptation",
+        "given": "The native port is exercised.",
+        "when": "The corresponding LEO contract tests run.",
+        "then": "URL monitors use the existing public-address egress client and script monitors use the restricted runner; authenticated headers, private targets and browser rendering are rejected.",
+        "surfaces": [
+          "LEO native implementation"
+        ],
+        "core_gate": true
+      },
+      {
+        "id": "LEO-ADAPT-05",
+        "area": "Native local destinations",
+        "priority": "P0 - LEO adaptation",
+        "given": "The native port is exercised.",
+        "when": "The corresponding LEO contract tests run.",
+        "then": "bot-chat/profile map to durable local conversations; local:<id> and validated objects are native extensions; room requires a capable adapter and configured default channel.",
+        "surfaces": [
+          "LEO native implementation"
+        ],
+        "core_gate": true
+      },
+      {
+        "id": "LEO-ADAPT-06",
+        "area": "Honest unsupported fields",
+        "priority": "P0 - LEO adaptation",
+        "given": "The native port is exercised.",
+        "when": "The corresponding LEO contract tests run.",
+        "then": "Every surviving field has a runtime consumer or an explicit rejection; unknown fields and removed intermediate scope never persist.",
+        "surfaces": [
+          "LEO native implementation"
+        ],
+        "core_gate": true
+      },
+      {
+        "id": "LEO-ADAPT-07",
+        "area": "Surface capability default",
+        "priority": "P0 - LEO adaptation",
+        "given": "The native port is exercised.",
+        "when": "The corresponding LEO contract tests run.",
+        "then": "Unknown, send-only, notifier-blind and ambiguous surfaces default incapable; only verified full-text, inbound-identity, terminal-rewrite surfaces receive cards.",
+        "surfaces": [
+          "LEO native implementation"
+        ],
+        "core_gate": true
+      },
+      {
+        "id": "LEO-ADAPT-08",
+        "area": "LEO grammar compatibility",
+        "priority": "P0 - LEO adaptation",
+        "given": "The native port is exercised.",
+        "when": "The corresponding LEO contract tests run.",
+        "then": "Existing @every schedules remain readable; any new @every compatibility is labeled LEO-native because final head rejects it.",
+        "surfaces": [
+          "LEO native implementation"
+        ],
+        "core_gate": true
+      }
+    ],
+    "LEO Hardening": [
+      {
+        "area": "Parity / Proactive quality",
+        "given": "A schedule was approved and later runs.",
+        "id": "PARITY-QUALITY-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "scheduled run",
+          "tool permissions",
+          "outbound actions"
+        ],
+        "then": "Creation consent never authorizes future sends, purchases, submissions, script execution, or plugin actions; each run uses normal runtime authority checks and the job prompt is self-contained for a fresh session.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:18,30,44; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:29-30",
+        "when": "Approved jobs attempt gated and ungated per-run actions.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Verification",
+        "given": "LEO implementation and tests are ready for acceptance.",
+        "id": "PARITY-VERIFY-01",
+        "priority": "P0 - release gate",
+        "surfaces": [
+          "pytest",
+          "UI tests",
+          "contract generation",
+          "docs checks"
+        ],
+        "then": "Relevant LEO suites run in an isolated clean environment with temporary home/DB, optional test dependencies installed, failures compared with unpatched main, and no upstream test result represented as LEO evidence.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:74,186-187; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:106",
+        "when": "The final LEO verification pass runs.",
+        "core_gate": true
+      },
+      {
+        "area": "Parity / Verification",
+        "given": "Credentials and clients permit live checks.",
+        "id": "PARITY-VERIFY-02",
+        "priority": "P0 - release gate",
+        "surfaces": [
+          "real CLI/TUI",
+          "static web/Electron",
+          "live messaging clients",
+          "live model"
+        ],
+        "then": "At least one live LEO gateway/model flow verifies create, deny, timeout, reconnect, callback authorization, rendering, and persistence; unsupported/unverified clients are recorded honestly rather than inferred from string tests.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:68; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:64,159; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:75-76",
+        "when": "Live smoke tests run after unit/integration acceptance.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Recipient identity",
+        "given": "An explicit destination is another thread/topic in the same chat as the origin.",
+        "id": "HARD-SEC-01",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "delivery resolver",
+          "create/edit cards",
+          "Telegram topics"
+        ],
+        "then": "The card compares normalized platform, chat_id, and thread/topic identity and shows the explicit destination, never this chat; both same-topic and cross-topic regressions pass.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:20,74; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:23,89; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1343-1351",
+        "when": "Origin topic 10 is compared with explicit topic 20 and with a chat-only target that adopts topic 10.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Consent completeness",
+        "given": "A recurring create has repeat=1 or repeat omitted.",
+        "id": "HARD-SEC-02",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "create card",
+          "scheduler"
+        ],
+        "then": "The card always states one run, N runs, or forever, and the wording matches stored semantics; paused cards retain the run-limit information without claiming a first run.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:21,73; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:24,88",
+        "when": "repeat=1, repeat>1, omitted recurring repeat, one-shot default, and paused cards are rendered.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Deny reason contract",
+        "given": "A canonical API/Desktop approval response includes deny_reason.",
+        "id": "HARD-SEC-03",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "canonical API",
+          "static web",
+          "Electron",
+          "tool result"
+        ],
+        "then": "The server accepts and validates an optional reason and forwards it to the model-visible result, or the UI/contract omits it consistently; no client sends a field the server rejects.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:21-22,62,98; /Users/macbook/LEO/leo/interfaces/api.py:1137-1159",
+        "when": "Canonical reason-bearing deny and reason-less deny are exercised.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / No-card edit race",
+        "given": "An edit is saved without a card and the job changes concurrently.",
+        "id": "HARD-SEC-04",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "edit gate",
+          "scheduler transaction"
+        ],
+        "then": "The real shown boolean controls staleness; no-card model edits fail closed to approval_required, while trusted operator edits re-read and CAS under the write transaction.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:25; /tmp/upstream-pr-158289.UY9bvi/source/tools/cronjob_tools.py:1024-1032",
+        "when": "Approvals-off/no-notifier edits race with pause or another edit.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / No-answer policy",
+        "given": "A model tries to create/edit proactive work where no human can answer.",
+        "id": "HARD-SEC-05",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "unattended workers",
+          "API",
+          "side agents",
+          "policy config"
+        ],
+        "then": "LEO explicitly chooses and documents fail-closed or durable proposal queueing rather than silent save; the choice is enforced mechanically, audited, and tested separately from final-head compatibility mode.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:16,115; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:28,59",
+        "when": "No-card policy is enabled across every unattended context.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / API answerability",
+        "given": "An API client genuinely renders and answers approvals.",
+        "id": "HARD-SEC-06",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "API",
+          "streaming client",
+          "answerability predicate"
+        ],
+        "then": "A per-request/client capability allows that client to opt into answerable schedule cards, while stock or incapable clients remain no-card; platform name alone is not the discriminator.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:25,130; /tmp/upstream-pr-158289.UY9bvi/source/tools/approval.py:1189-1214",
+        "when": "Capable and incapable API clients submit identical creates.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Identity and idempotency",
+        "given": "Concurrent creates use the same name/key, or a client retries after a lost response.",
+        "id": "HARD-SEC-07",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "scheduler store",
+          "approval queue",
+          "API"
+        ],
+        "then": "Same-key/same-args returns the original job/card state without re-anchor or duplicate card; same-key/different-args conflicts; same-name model create cannot silently overwrite/re-enable; lock degradation fails closed.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:34,38,118; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:62,176; /Users/macbook/LEO/leo/tasks/scheduler.py:246-268",
+        "when": "Concurrent same-name and same-idempotency-key creates are injected.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Timezone correctness",
+        "given": "A naive ISO one-shot is supplied with an IANA job zone, or a paused recurring job has a non-profile zone.",
+        "id": "HARD-SEC-08",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "schedule parser",
+          "create/edit cards",
+          "scheduler"
+        ],
+        "then": "Naive input either honors the job zone or is rejected before asking with offset guidance; aware input remains absolute; paused recurring cards still show the effective zone; DST and cross-zone cases are covered.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:11,67,106; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:25,77,160; /Users/macbook/LEO/leo/tasks/scheduler.py:61-71",
+        "when": "Sydney profile + Lisbon zone, offset-bearing ISO, DST transitions, and paused Tokyo-zone jobs are tested.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Deadline truthfulness",
+        "given": "The shown first run occurs before the configured approval timeout.",
+        "id": "HARD-SEC-09",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "all approval surfaces",
+          "locale catalogs"
+        ],
+        "then": "The displayed deadline equals min(approval timeout, shown first run), or the earlier cutoff is explicitly documented; every locale derives the same effective window.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:26; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:66,178",
+        "when": "One-minute, every-minute, and normal-timeout cards are rendered.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Durable kind",
+        "given": "The process restarts or adapter-local preview state is evicted while a card is pending.",
+        "id": "HARD-SEC-10",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "approval store",
+          "all adapters",
+          "replay",
+          "typed confirmations"
+        ],
+        "then": "Kind and full proposal survive in the durable approval row/event, so resolved/expired/restarted cards retain schedule wording on every adapter and typed path.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-01.md:43; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:24,85; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:76,78",
+        "when": "Restart, cache eviction, Feishu/Matrix/WhatsApp Cloud/Relay/typed-confirmation, and Teams-restart paths run.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Client interaction",
+        "given": "A terminal shrinks while a card is open or a keyboard key repeats over queued cards.",
+        "id": "HARD-SEC-11",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "CLI",
+          "TUI",
+          "static web",
+          "Electron"
+        ],
+        "then": "Printed-above claims remain true after resize or are withdrawn/reprinted; held Enter cannot approve a schedule/edit card before it is visibly presented.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:26-27,57,59,87; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:77,113",
+        "when": "100x40 shrinks to 100x18 and key-repeat queued-card tests run.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Rolling deployment",
+        "given": "New workers/gateways deploy while old versions still run.",
+        "id": "HARD-SEC-12",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "gateway worker",
+          "protocol contracts",
+          "deployment"
+        ],
+        "then": "Version negotiation/draining/restart prevents closed-frame rejection or kind loss; old-version failure is detected and handled rather than silently degrading to command.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:36,88; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:78,97",
+        "when": "Same-version and mixed-version frame tests run.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Preview robustness",
+        "given": "Delivery resolution raises, or a capped adapter cannot send a full body containing triple backticks.",
+        "id": "HARD-SEC-13",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "delivery resolver",
+          "no-card create",
+          "capped messaging"
+        ],
+        "then": "A preview failure does not break an otherwise valid no-card create; capped surfaces use the shared adaptive fence to send full text where possible instead of unnecessarily becoming Deny-only.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:76,85; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:37,91; /tmp/upstream-pr-158289.UY9bvi/source/gateway/platforms/base_exec_approval.py:351-355",
+        "when": "Resolver exceptions and fenced long-body sends are injected.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Lifecycle bypass",
+        "given": "A create grant exists and the model removes then recreates a job, or resumes a paused job.",
+        "id": "HARD-SEC-14",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "lifecycle actions",
+          "grant store",
+          "automation operator"
+        ],
+        "then": "LEO prevents remove-and-replace from bypassing semantic edit consent and does not infer consent to resume from a create grant; stronger existing operator gates remain.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:29,92; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:73",
+        "when": "Remove/create replacement and resume are attempted under a create grant.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Prompt truthfulness",
+        "given": "A cached prompt line was emitted before a grant, yolo/off change, notifier detach, or finite resume.",
+        "id": "HARD-SEC-15",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "prompt builder",
+          "live gate"
+        ],
+        "then": "Prompt wording remains conditionally true or a narrow live capability hint corrects it without rebuilding the whole system prompt or defeating caching; live authorization remains authoritative.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:27; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:10,84; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:67",
+        "when": "Mid-session policy and notifier changes are tested.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Grant lifetime",
+        "given": "The user selects always allow new jobs.",
+        "id": "HARD-SEC-16",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "grant store",
+          "settings",
+          "docs"
+        ],
+        "then": "LEO documents and tests a dedicated create-only grant lifetime; if it uses bounded/revocable grants instead of upstream permanent profile scope, the difference is explicit, audited, and never mapped to blanket tool/workspace trust.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:36; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:15,71,83; /Users/macbook/LEO/leo/security/permissions.py:475-580",
+        "when": "Grant creation, expiry, revocation, cross-session scope, and edit isolation are tested.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Secret-safe consent",
+        "given": "A proposal contains credentials, tokens, private keys, hidden Unicode, or bidi controls.",
+        "id": "HARD-SEC-17",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "all approval surfaces",
+          "logs",
+          "tool results"
+        ],
+        "then": "Secrets and control characters are redacted/sanitized before display without changing the approved underlying job; urgent secret-bearing reminders are refused or handled non-persistently.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-05.md:60,94; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:69,96,147; /Users/macbook/LEO/leo/config.py:201-223",
+        "when": "Secret patterns, zero-width/bidi text, and bank-code urgency probes run.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Proactive negative quality",
+        "given": "Held-out conversations contain duplicates, deferrals, opt-outs, past events, third-party plans, completed tasks, existing routines, renewals, or hypothetical trips.",
+        "id": "HARD-QUAL-01",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "model evaluation",
+          "schedule store"
+        ],
+        "then": "Unwanted-create and missed-opportunity rates are reported separately with raw cases; duplicate dentist, passport/tax/insurance/garage deferral, own routine, third-party flight, completed task, renewal, and hypothetical trip controls create no unwanted job.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:29,65; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:68,127-130,162",
+        "when": "Negative evals run with real tool dispatch and store assertions.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Provenance",
+        "given": "A date or scheduling instruction appears only in email, web content, attachment, or tool output.",
+        "id": "HARD-QUAL-02",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "prompt/data plane",
+          "schedule tool",
+          "event sources"
+        ],
+        "then": "Untrusted content cannot initiate a schedule card or save under a grant; only trusted user intent or an explicitly approved event-source policy may trigger proactive scheduling.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:27,82,128; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:27,162",
+        "when": "Email/web/tool-output dates and instructions are injected.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Durable dedupe",
+        "given": "Active, paused, denied, dismissed, removed, or plugin-owned jobs already cover the same subject.",
+        "id": "HARD-QUAL-03",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "schedule store",
+          "proposal history",
+          "approval cards"
+        ],
+        "then": "A list-first lookup and canonical when/what/who fingerprint prevent duplicate cards/jobs; near-matches offer update; denial/removal suppression survives job deletion; mentioning a paused job does not resume or replace it.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:34-37,78-80; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:26-28,166-167",
+        "when": "Seeded active/paused/denied/dismissed/deleted/plugin-owned states are proposed again.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Confirmation and freshness",
+        "given": "A create is denied, invalid, timed out, or succeeds, and a monitored fact may become stale before delivery.",
+        "id": "HARD-QUAL-07",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "tool result",
+          "model output",
+          "delivery layer"
+        ],
+        "then": "The one-line scheduled confirmation is generated from persisted tool state, never model prose; pre-delivery freshness/done-condition checks suppress resolved or stale alerts and distinguish false from read failure.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:39,42,58; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:73,185",
+        "when": "Failed/declined creates and stale/resolved/source-failure deliveries are exercised.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Run and delivery truth",
+        "given": "A scheduled run is silent, fails, completes without delivery, or a source is unavailable.",
+        "id": "HARD-QUAL-08",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "scheduler receipts",
+          "task history",
+          "delivery",
+          "operator notices"
+        ],
+        "then": "Every occurrence has a runner-authored receipt; missing receipt means not run; unchanged silence differs from failure; rejected/partial delivery is visible and sticky in continuity; source unavailable differs from checked-empty.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:46,49-52,90-92; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:36-38,99-102,171-172",
+        "when": "Silent success, crash, rejected Telegram HTML, partial delivery, and source outage cases run.",
+        "core_gate": true
+      },
+      {
+        "area": "Hardening / Runtime action gate",
+        "given": "A scheduled job calls a plugin or outbound action that needs human authority.",
+        "id": "HARD-QUAL-09",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "cron runtime",
+          "plugin hooks",
+          "outbound tools",
+          "operator notices"
+        ],
+        "then": "Creation consent is not reused as action consent; the per-call gate resolves by explicit unattended policy and produces a durable actionable needs-you notice rather than silent default-deny or model prose.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:30; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:63,98,177",
+        "when": "Plugin approve/deny and outbound send/buy/submit attempts occur inside a scheduled run.",
+        "core_gate": true
+      },
+      {
+        "id": "LEO-HARD-REPEAT-CAP",
+        "area": "Hardening / bounded recurrence",
+        "priority": "P1 - LEO hardening",
+        "given": "automation.max_repeat_runs is configured.",
+        "when": "A model creates a recurring schedule.",
+        "then": "The cap applies only to model-created schedules, is disclosed on the card, and omitted repeat remains forever when no cap is configured.",
+        "surfaces": [
+          "compiler",
+          "card",
+          "scheduler"
+        ],
+        "core_gate": true
+      },
+      {
+        "id": "LEO-HARD-PROPOSAL-MODE",
+        "area": "Hardening / proposal mode",
+        "priority": "P1 - LEO hardening",
+        "given": "automation.proactive_mode is off or offer.",
+        "when": "A turn evaluates scheduling guidance.",
+        "then": "Off disables guidance only; offer uses the normal card path; neither mode bypasses consent or create grants.",
+        "surfaces": [
+          "prompt",
+          "tool",
+          "policy"
+        ],
+        "core_gate": true
+      }
+    ],
+    "Deferred": [
+      {
+        "area": "Parity / Approval eligibility",
+        "given": "Approval mode is off or yolo is active, even if interactive flags are set.",
+        "id": "PARITY-ELIG-02",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "all model surfaces"
+        ],
+        "then": "No proactive line and no card appear; the valid create saves as before, and an INFO log names approvals-off/yolo as the reason.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:26,62; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:47; /tmp/upstream-pr-158289.UY9bvi/source/tools/approval.py:1223-1244",
+        "when": "A model create or edit is dispatched.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "area": "Parity / Approval eligibility",
+        "given": "The context has no UI, is a finite/-q turn, or is a resumed session now running finitely.",
+        "id": "PARITY-ELIG-04",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "library embed",
+          "finite CLI/API",
+          "resumed session"
+        ],
+        "then": "No card is created or awaited, explicit valid requests retain save-as-before behavior, and no static guidance promises a card where none can be shown.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:47,67-70; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-09.md:39; /tmp/upstream-pr-158289.UY9bvi/source/tools/approval.py:1182-1214",
+        "when": "The answerability predicate and live gate evaluate the turn.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "area": "Parity / Approval eligibility",
+        "given": "The turn originates from cron/scheduler, kanban/one-shot worker, batch runner, or a side/background agent.",
+        "id": "PARITY-ELIG-05",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "cron run",
+          "kanban worker",
+          "one-shot worker",
+          "batch",
+          "side agent"
+        ],
+        "then": "Proactive guidance is absent; no schedule card is shown; any explicitly requested valid create/edit follows the logged no-card compatibility path without parking an invisible approval.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:6-7,42; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:7,84-85; /tmp/upstream-pr-158289.UY9bvi/source/agent/system_prompt.py:317-341",
+        "when": "Each unattended worker context is simulated through the real registry.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "area": "Parity / Approval eligibility",
+        "given": "An API/webhook turn is unattended, notifier-blind, or ask-mode chat has no bound notifier.",
+        "id": "PARITY-ELIG-06",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "API",
+          "webhook",
+          "gateway background",
+          "notifier-less chat"
+        ],
+        "then": "No card or proactive line appears; the requested valid operation saves as before and logs the real no-answer reason, with no false decline or pending row.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-02.md:27,62; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:7,84; /tmp/upstream-pr-158289.UY9bvi/source/tests/tools/test_cronjob_create_approval.py:418-429",
+        "when": "The live gate checks notifier/client capability.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "area": "Parity / Prompt and tool surface",
+        "given": "A prompt was cached before a grant/mode/notifier change.",
+        "id": "PARITY-PROMPT-03",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "cached prompt",
+          "live gate"
+        ],
+        "then": "The live gate still evaluates current approval state immediately before persistence; cached guidance is never treated as authorization and a present user's live no still prevents save.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-07.md:10,68-70; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:23,67",
+        "when": "Mid-session grant/yolo/off changes and interactive-to-finite resume are exercised.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "area": "Parity / Proactive quality",
+        "given": "The model sees eligible proactive guidance.",
+        "id": "PARITY-QUALITY-01",
+        "priority": "P0 - final-head parity",
+        "surfaces": [
+          "model evaluation",
+          "tool registry",
+          "approval card"
+        ],
+        "then": "For dentist, flight check-in/airport/arrival, Lisbon arrival, owed Slack reply, deadline, water habit, and site re-check scenarios, the model invokes the tool rather than merely offering, proposes bounded useful cadence, and the card/store reflect the intended job.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-03.md:66; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:163-164",
+        "when": "Held-out positive evals run through real LEO tool dispatch with store assertions.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "area": "Hardening / Model evaluation",
+        "given": "Proactive scheduling is considered for default enablement.",
+        "id": "HARD-QUAL-04",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "evaluation harness",
+          "multiple providers/models"
+        ],
+        "then": "Per-model, held-out, multi-turn evals run with fresh homes, real dispatch, n>=3, provider-timeout accounting, small/local and frontier models, raw JSONL, latency/tool-cost measurement, and no aggregate-only reliability claim.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:57,132,155; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:68,164",
+        "when": "The proactive-quality evaluation campaign runs.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "area": "Hardening / Product controls",
+        "given": "The user wants to stop proactive suggestions without disabling explicit scheduling or weakening approval protection.",
+        "id": "HARD-QUAL-05",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "config",
+          "prompt",
+          "schedule tool",
+          "delivery"
+        ],
+        "then": "Independent create|offer|off controls, quiet hours, urgent override, interruption budget, and bounded snooze are deterministic; off stops proposals but not explicit jobs or already approved runs; snooze moves one notification, not recurrence.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:23-24,29-30; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:30-34,168,181",
+        "when": "Config/card precedence, overnight deferral, urgent override, and snooze tests run.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "area": "Hardening / Cost and card load",
+        "given": "A recurring job or one user moment could create several jobs/cards.",
+        "id": "HARD-QUAL-06",
+        "priority": "P1 - LEO hardening",
+        "surfaces": [
+          "schedule payload",
+          "model router",
+          "approval UI",
+          "scheduler"
+        ],
+        "then": "Cards show resolved model and enforced run/token/cost ceilings; over-cap work is refused before wake; jobs-per-helpful-run and multi-card rate are measured, with grouping or one-job-per-moment behavior available.",
+        "trace": "/tmp/upstream-pr-158289.UY9bvi/corpus-results/result-06.md:31,89; /tmp/upstream-pr-158289.UY9bvi/corpus-results/result-08.md:33-34,42,165,180",
+        "when": "Budget exhaustion, cheap-tier routing, and multi-card scenarios run.",
+        "disposition": "removed from the core gate or explicitly deferred by the revised plan",
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-01",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Quiet hours, urgent override, snooze, presence routing, calendar deferral, interruption budgets and deliver-where-you-are routing.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-02",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Combined multi-job cards, daily batching, per-kind trust ladders, broad dismissal learning and plugin tracked-subject hooks.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-03",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Event-triggered job cards, kanban wake-ups, commitment lifecycle, done conditions, freshness/source-health lifecycle and condition-based snooze.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-04",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Reply-to-delivered-reminder cancellation and a full public Inbox UI; only minimal authenticated operator proposal recovery ships.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-05",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Off-host scheduler heartbeat, tamper-evident receipts, output digest/schema verification, dispatch-acceptance scoring and native mobile controls.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-06",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Token or cost ceilings beyond the optional repeat cap, external-memory retention controls and hardened silent-marker parsing.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-07",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Public proposal list/resolve/dismiss APIs beyond the minimum needed to make approval_required meaningful; the dashboard/TUI operator recovery path is the v1 surface.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-08",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Native approval controls for all 22 LEO adapters; TUI, web/Electron stream and Telegram are the initial card surfaces, and all others remain incapable.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-09",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "The multi-model held-out evaluation campaign as a release gate; it gates autonomous create mode only, not the consent plumbing.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-10",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Semantic near-match subject dedupe; exact canonical dedupe, duplicate-name conflict and request idempotency ship instead.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-11",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Locale-catalog parity and prompt-cache invalidation; both are not applicable to LEO as architected and are replaced by contract tests.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-12",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "External scheduler-registration hooks and scheduler_registered result fields; LEO's durable schedule row is already the scheduler input.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-13",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "A separate schedule_occurrences receipt store or UI; existing task metadata task.delivery remains authoritative.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-14",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Additional Bot Chat/Room connectors beyond durable local conversations and room-capable adapters; unsupported room tokens are rejected at validation.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-PLAN-15",
+        "area": "Deferred / revised plan",
+        "priority": "Deferred",
+        "given": "A deferred capability is requested.",
+        "when": "Release scope is evaluated.",
+        "then": "Reply-to-delivered-reminder conversation continuation beyond the attach_to_session brief; full two-way job chat is future scope.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-REGISTRATION",
+        "area": "Deferred / dead registration result",
+        "priority": "Deferred",
+        "given": "A durable schedule row is the scheduler input.",
+        "when": "Registration result fields are requested.",
+        "then": "No scheduler_registered result field or external registration hook is shipped; LEO's durable row is already the scheduler input.",
+        "surfaces": [
+          "tool result"
+        ],
+        "core_gate": false
+      },
+      {
+        "id": "DEFERRED-EXPORT-COMPARISON",
+        "area": "Deferred / monitor export comparison",
+        "priority": "Deferred",
+        "given": "A future monitor compares exports.",
+        "when": "Export comparison is requested.",
+        "then": "Read-only export comparison is follow-up scope; native monitor baseline/change/failure semantics remain in the core gate.",
+        "surfaces": [
+          "not shipped"
+        ],
+        "core_gate": false
+      }
+    ]
+  },
+  "core_gate_sections": [
+    "Final-Head Parity",
+    "LEO Adaptations",
+    "LEO Hardening"
+  ],
+  "deferred_is_not_core_gate": true,
+  "removed_from_core_gate": [
+    "HARD-QUAL-04",
+    "HARD-QUAL-05",
+    "HARD-QUAL-06",
+    "PARITY-ELIG-02",
+    "PARITY-ELIG-04",
+    "PARITY-ELIG-05",
+    "PARITY-ELIG-06",
+    "PARITY-PROMPT-03",
+    "PARITY-QUALITY-01"
+  ],
+  "source_scenario_count": 93
+}

@@ -1,0 +1,433 @@
+{
+  "schema_version": 1,
+  "oracle_commit": "7cf9e92cd6277b327b36a51fb897cdc8403902d6",
+  "card_allowed_keys": [
+    "case_id",
+    "kind",
+    "job",
+    "shown_at",
+    "shown_first_run",
+    "body",
+    "header",
+    "choices",
+    "choice_labels",
+    "deadline",
+    "timeout_notice",
+    "cli_header",
+    "cli_menu",
+    "source"
+  ],
+  "card_job_allowed_fields": [
+    "attach_to_session",
+    "catch_up",
+    "completed",
+    "context_from",
+    "deliver",
+    "enabled",
+    "enabled_toolsets",
+    "failure_deliver",
+    "grace_minutes",
+    "id",
+    "kind",
+    "model",
+    "monitor",
+    "monitor_script",
+    "monitor_url",
+    "name",
+    "next_run_at",
+    "no_agent",
+    "prompt",
+    "repeat",
+    "run_at",
+    "schedule",
+    "schedule_display",
+    "script",
+    "skills",
+    "times",
+    "timezone",
+    "workdir"
+  ],
+  "card_repeat_allowed_keys": [
+    "times",
+    "completed"
+  ],
+  "cases": [
+    {
+      "case_id": "create-recurring-three-runs",
+      "kind": "schedule",
+      "job": {
+        "name": "Water",
+        "schedule_display": "every day at 8am",
+        "next_run_at": "2026-11-25T08:00:00+00:00",
+        "repeat": {
+          "times": 3
+        },
+        "prompt": "Remind the user to drink a glass of water.",
+        "deliver": "local"
+      },
+      "shown_at": "2026-11-25T07:00:00+00:00",
+      "shown_first_run": "2026-11-25T08:00:00+00:00",
+      "body": "Schedule \"Water\" (every day at 8am, first run Wed Nov 25 08:00 UTC, 3 runs): Remind the user to drink a glass of water.; results go to nowhere (saved to the job's history only)",
+      "header": "Upstream wants to schedule a job",
+      "choices": [
+        "once",
+        "session",
+        "always",
+        "deny"
+      ],
+      "choice_labels": [
+        "Allow",
+        "Allow for this chat",
+        "Always allow new jobs",
+        "Deny"
+      ],
+      "deadline": "If you don't answer within 5 minutes the job will NOT be created.",
+      "timeout_notice": "⌛ Approval timed out after 5 minutes — the job was not created. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "cli_header": "⏰  Schedule this job? Schedule \"Water\" (every day at 8am, first run Wed Nov 25 08:00 UTC, 3 runs): Remind the user to drink a glass of water.; results go to nowhere (saved to the job's history only)",
+      "cli_menu": "      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny",
+      "source": "tools/cronjob_tools.py:_approval_task/_approval_when/_approve_new_job/_approve_job_edit; locales/en.yaml"
+    },
+    {
+      "case_id": "create-script-only",
+      "kind": "schedule",
+      "job": {
+        "name": "Check",
+        "schedule_display": "every 2h",
+        "next_run_at": "2026-11-25T09:00:00+00:00",
+        "repeat": {
+          "times": null
+        },
+        "prompt": "",
+        "script": "check.py",
+        "no_agent": true,
+        "deliver": "local"
+      },
+      "shown_at": "2026-11-25T07:00:00+00:00",
+      "shown_first_run": "2026-11-25T09:00:00+00:00",
+      "body": "Schedule \"Check\" (every 2h, first run Wed Nov 25 09:00 UTC): runs script check.py; results go to nowhere (saved to the job's history only)",
+      "header": "Upstream wants to schedule a job",
+      "choices": [
+        "once",
+        "session",
+        "always",
+        "deny"
+      ],
+      "choice_labels": [
+        "Allow",
+        "Allow for this chat",
+        "Always allow new jobs",
+        "Deny"
+      ],
+      "deadline": "If you don't answer within 5 minutes the job will NOT be created.",
+      "timeout_notice": "⌛ Approval timed out after 5 minutes — the job was not created. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "cli_header": "⏰  Schedule this job? Schedule \"Check\" (every 2h, first run Wed Nov 25 09:00 UTC): runs script check.py; results go to nowhere (saved to the job's history only)",
+      "cli_menu": "      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny",
+      "source": "tools/cronjob_tools.py:_approval_task/_approval_when/_approve_new_job/_approve_job_edit; locales/en.yaml"
+    },
+    {
+      "case_id": "create-paused",
+      "kind": "schedule",
+      "job": {
+        "name": "Water",
+        "schedule_display": "every day at 8am",
+        "next_run_at": null,
+        "repeat": {
+          "times": 3
+        },
+        "prompt": "Remind the user to drink a glass of water.",
+        "deliver": "local",
+        "enabled": false
+      },
+      "shown_at": "2026-11-25T07:00:00+00:00",
+      "shown_first_run": null,
+      "body": "Schedule \"Water\" (every day at 8am, created paused: it will not run until resumed, 3 runs): Remind the user to drink a glass of water.; results go to nowhere (saved to the job's history only)",
+      "header": "Upstream wants to schedule a job",
+      "choices": [
+        "once",
+        "session",
+        "always",
+        "deny"
+      ],
+      "choice_labels": [
+        "Allow",
+        "Allow for this chat",
+        "Always allow new jobs",
+        "Deny"
+      ],
+      "deadline": "If you don't answer within 5 minutes the job will NOT be created.",
+      "timeout_notice": "⌛ Approval timed out after 5 minutes — the job was not created. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "cli_header": "⏰  Schedule this job? Schedule \"Water\" (every day at 8am, created paused: it will not run until resumed, 3 runs): Remind the user to drink a glass of water.; results go to nowhere (saved to the job's history only)",
+      "cli_menu": "      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny",
+      "source": "tools/cronjob_tools.py:_approval_task/_approval_when/_approve_new_job/_approve_job_edit; locales/en.yaml"
+    },
+    {
+      "case_id": "create-one-shot",
+      "kind": "schedule",
+      "job": {
+        "name": "Dentist",
+        "schedule_display": "once at 2026-11-27 09:00",
+        "schedule": {
+          "kind": "once",
+          "run_at": "2026-11-27T09:00:00+00:00"
+        },
+        "next_run_at": "2026-11-27T09:00:00+00:00",
+        "repeat": {
+          "times": 1
+        },
+        "prompt": "Call the dentist.",
+        "deliver": "telegram:12345"
+      },
+      "shown_at": "2026-11-25T07:00:00+00:00",
+      "shown_first_run": "2026-11-27T09:00:00+00:00",
+      "body": "Schedule \"Dentist\" (once, Fri Nov 27 09:00 UTC): Call the dentist.; results go to telegram:12345",
+      "header": "Upstream wants to schedule a job",
+      "choices": [
+        "once",
+        "session",
+        "always",
+        "deny"
+      ],
+      "choice_labels": [
+        "Allow",
+        "Allow for this chat",
+        "Always allow new jobs",
+        "Deny"
+      ],
+      "deadline": "If you don't answer within 5 minutes the job will NOT be created.",
+      "timeout_notice": "⌛ Approval timed out after 5 minutes — the job was not created. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "cli_header": "⏰  Schedule this job? Schedule \"Dentist\" (once, Fri Nov 27 09:00 UTC): Call the dentist.; results go to telegram:12345",
+      "cli_menu": "      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny",
+      "source": "tools/cronjob_tools.py:_approval_task/_approval_when/_approve_new_job/_approve_job_edit; locales/en.yaml"
+    },
+    {
+      "case_id": "create-execution-extras",
+      "kind": "schedule",
+      "job": {
+        "name": "Brief",
+        "schedule_display": "every day at 8am",
+        "next_run_at": "2026-11-25T08:00:00+00:00",
+        "repeat": {
+          "times": null
+        },
+        "prompt": "Summarize updates.",
+        "skills": [
+          "maps"
+        ],
+        "script": "collect.py",
+        "monitor_url": "https://example.com/price",
+        "workdir": "/workspace/brief",
+        "context_from": [
+          "source-job"
+        ],
+        "enabled_toolsets": [],
+        "attach_to_session": true,
+        "deliver": "local",
+        "failure_deliver": "telegram"
+      },
+      "shown_at": "2026-11-25T07:00:00+00:00",
+      "shown_first_run": "2026-11-25T08:00:00+00:00",
+      "body": "Schedule \"Brief\" (every day at 8am, first run Wed Nov 25 08:00 UTC): Summarize updates. (skills: maps) (after running script collect.py); checks URL https://example.com/price first each run; runs in /workspace/brief; reads output of source-job; toolsets: none; copied into the chat's history; results go to nowhere (saved to the job's history only); failure notices go to nowhere (telegram has no destination configured; saved to the job's history only)",
+      "header": "Upstream wants to schedule a job",
+      "choices": [
+        "once",
+        "session",
+        "always",
+        "deny"
+      ],
+      "choice_labels": [
+        "Allow",
+        "Allow for this chat",
+        "Always allow new jobs",
+        "Deny"
+      ],
+      "deadline": "If you don't answer within 5 minutes the job will NOT be created.",
+      "timeout_notice": "⌛ Approval timed out after 5 minutes — the job was not created. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "cli_header": "⏰  Schedule this job? Schedule \"Brief\" (every day at 8am, first run Wed Nov 25 08:00 UTC): Summarize updates. (skills: maps) (after running script collect.py); checks URL https://example.com/price first each run; runs in /workspace/brief; reads output of source-job; toolsets: none; copied into the chat's history; results go to nowhere (saved to the job's history only); failure notices go to nowhere (telegram has no destination configured; saved to the job's history only)",
+      "cli_menu": "      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny",
+      "source": "tools/cronjob_tools.py:_approval_task/_approval_when/_approve_new_job/_approve_job_edit; locales/en.yaml"
+    },
+    {
+      "case_id": "edit-prompt",
+      "kind": "schedule_edit",
+      "job": {
+        "name": "Water",
+        "prompt": "Remind the user to drink a glass of water."
+      },
+      "shown_at": "2026-11-25T07:00:00+00:00",
+      "shown_first_run": null,
+      "body": "Change \"Water\": prompt: Remind the user to drink a glass of water. -> Drink tea instead.",
+      "header": "Upstream wants to change a scheduled job",
+      "choices": [
+        "once",
+        "deny"
+      ],
+      "choice_labels": [
+        "Allow",
+        "Deny"
+      ],
+      "deadline": "If you don't answer within 5 minutes the job will NOT be changed.",
+      "timeout_notice": "⌛ Approval timed out after 5 minutes — the job was not changed. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "cli_header": "⏰  Change this job? Change \"Water\": prompt: Remind the user to drink a glass of water. -> Drink tea instead.",
+      "cli_menu": "      [o]nce  |  [s]ession  |  [d]eny",
+      "source": "tools/cronjob_tools.py:_approval_task/_approval_when/_approve_new_job/_approve_job_edit; locales/en.yaml"
+    },
+    {
+      "case_id": "edit-execution-mode",
+      "kind": "schedule_edit",
+      "job": {
+        "name": "Water",
+        "no_agent": false,
+        "script": null
+      },
+      "shown_at": "2026-11-25T07:00:00+00:00",
+      "shown_first_run": null,
+      "body": "Change \"Water\": what runs: agent task -> script only; script: (none) -> check.py",
+      "header": "Upstream wants to change a scheduled job",
+      "choices": [
+        "once",
+        "deny"
+      ],
+      "choice_labels": [
+        "Allow",
+        "Deny"
+      ],
+      "deadline": "If you don't answer within 5 minutes the job will NOT be changed.",
+      "timeout_notice": "⌛ Approval timed out after 5 minutes — the job was not changed. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "cli_header": "⏰  Change this job? Change \"Water\": what runs: agent task -> script only; script: (none) -> check.py",
+      "cli_menu": "      [o]nce  |  [s]ession  |  [d]eny",
+      "source": "tools/cronjob_tools.py:_approval_task/_approval_when/_approve_new_job/_approve_job_edit; locales/en.yaml"
+    },
+    {
+      "case_id": "edit-delivery",
+      "kind": "schedule_edit",
+      "job": {
+        "name": "Water",
+        "deliver": "local"
+      },
+      "shown_at": "2026-11-25T07:00:00+00:00",
+      "shown_first_run": null,
+      "body": "Change \"Water\": delivers to: local (nowhere (saved to the job's history only)) -> telegram (nowhere (telegram has no destination configured; saved to the job's history only))",
+      "header": "Upstream wants to change a scheduled job",
+      "choices": [
+        "once",
+        "deny"
+      ],
+      "choice_labels": [
+        "Allow",
+        "Deny"
+      ],
+      "deadline": "If you don't answer within 5 minutes the job will NOT be changed.",
+      "timeout_notice": "⌛ Approval timed out after 5 minutes — the job was not changed. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "cli_header": "⏰  Change this job? Change \"Water\": delivers to: local (nowhere (saved to the job's history only)) -> telegram (nowhere (telegram has no destination configured; saved to the job's history only))",
+      "cli_menu": "      [o]nce  |  [s]ession  |  [d]eny",
+      "source": "tools/cronjob_tools.py:_approval_task/_approval_when/_approve_new_job/_approve_job_edit; locales/en.yaml"
+    }
+  ],
+  "copy": {
+    "gateway": {
+      "action_deny": "Deny",
+      "text_choice_deny": "`{prefix}deny` to cancel",
+      "text_choice_joiner": ", ",
+      "text_choice_last": ", or {choice}.\n",
+      "schedule_header": "Upstream wants to schedule a job",
+      "schedule_edit_header": "Upstream wants to change a scheduled job",
+      "schedule_action_once": "Allow",
+      "schedule_action_session": "Allow for this chat",
+      "schedule_action_always": "Always allow new jobs",
+      "schedule_deadline": "If you don't answer within {window} the job will NOT be created.",
+      "schedule_edit_deadline": "If you don't answer within {window} the job will NOT be changed.",
+      "schedule_timed_out_notice": "⌛ Approval timed out after {window} — the job was not created. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "schedule_edit_timed_out_notice": "⌛ Approval timed out after {window} — the job was not changed. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+      "schedule_text_choice_once": "Reply `{prefix}approve` to create it",
+      "schedule_edit_text_choice_once": "Reply `{prefix}approve` to change it",
+      "schedule_text_choice_session": "`{prefix}approve session` to allow new jobs for the rest of this chat",
+      "schedule_text_choice_always": "`{prefix}approve always` to always allow new jobs",
+      "schedule_truncated_full_above": "Preview shortened: the full job ({total} characters) is in the message above.",
+      "schedule_truncated_deny_only": "Preview shortened ({total} characters) and the full job could not be shown here, so only Deny is offered. Review it in the CLI or Desktop app.",
+      "schedule_timed_out_card_body": "{notice}\n```\n{command}\n```",
+      "schedule_text_body": "{heading}\n```\n{command}\n```\n\n"
+    },
+    "cli": {
+      "schedule_header": "⏰  Schedule this job? {description}",
+      "schedule_edit_header": "⏰  Change this job? {description}",
+      "choose_long": "      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny",
+      "choose_short": "      [o]nce  |  [s]ession  |  [d]eny",
+      "prompt_long": "      Choice [o/s/a/D]: ",
+      "prompt_short": "      Choice [o/s/D]: ",
+      "allowed_once": "      ✓ Allowed once",
+      "allowed_session": "      ✓ Allowed for this session",
+      "allowed_always": "      ✓ Added to permanent allowlist",
+      "denied": "      ✗ Denied",
+      "cancelled": "      ✗ Cancelled",
+      "timeout": "      ⏱ No answer in {waited} — the command was not run. Ask again to retry, or raise the limit: config set approvals.timeout {suggested}"
+    },
+    "tui": {
+      "approval_title_schedule": "⏰  Schedule this job?",
+      "approval_title_schedule_edit": "⏰  Change this job?",
+      "approval_schedule_once": "Allow",
+      "approval_schedule_session": "Allow for this chat",
+      "approval_schedule_always": "Always allow new jobs",
+      "approval_deny": "Deny",
+      "approval_schedule_truncated": "… (full job printed above)"
+    },
+    "classic_outcomes": {
+      "schedule_label": "Schedule",
+      "schedule_timeout": "⏱ Timeout — the job was not created.",
+      "schedule_edit_timeout": "⏱ Timeout — the job was not changed.",
+      "schedule_outcome_deny": "denied — the job was not created",
+      "schedule_edit_outcome_deny": "denied — the job was not changed"
+    }
+  },
+  "decline_messages": {
+    "denied": "The user declined this on the schedule card; nothing was saved. Tell them in one line what you wanted to schedule, and do not retry it.",
+    "timeout": "The user did not answer the schedule card in time; nothing was saved. Do not retry it.",
+    "other": "The schedule card was not approved; nothing was saved. Do not retry it.",
+    "stale_create": "The schedule card was answered after the first run it showed had passed; nothing was saved. Offer the job again with a later time if it is still wanted.",
+    "stale_edit": "The change card was answered after the new run time it showed had passed; nothing was saved. Offer the change again with a later time if it is still wanted."
+  },
+  "source_functions": {
+    "_approval_when": {
+      "name": "_approval_when",
+      "line_start": 1299,
+      "line_end": 1312,
+      "sha256": "6fefc7f38f24be75b9e7e1594c57488bd81c5a756f9caa4f23c185b62ddf4289"
+    },
+    "_approval_task": {
+      "name": "_approval_task",
+      "line_start": 1315,
+      "line_end": 1337,
+      "sha256": "91891dce1f6cb14ac5f9527ca41cc219136587770bcbede40f55c18335ffea2d"
+    },
+    "_audience": {
+      "name": "_audience",
+      "line_start": 1366,
+      "line_end": 1370,
+      "sha256": "fbedd7bb6e3e3adeeee574bcb2f8ad6926a82d9a0e100c00661c37f15f1ca6e5"
+    },
+    "_ask_schedule_card": {
+      "name": "_ask_schedule_card",
+      "line_start": 1379,
+      "line_end": 1412,
+      "sha256": "89fe47d981f77529f3cbe1b6c12ec205a05ffa72b836a736220e5aa80d056c8d"
+    },
+    "_approve_new_job": {
+      "name": "_approve_new_job",
+      "line_start": 1415,
+      "line_end": 1433,
+      "sha256": "25c235b164b53fdabb5a752512e2c115db04746eb2e4f29839f86277dbdf6e09"
+    },
+    "_edit_fingerprint": {
+      "name": "_edit_fingerprint",
+      "line_start": 1484,
+      "line_end": 1489,
+      "sha256": "7f29cd8f73becb20ae580b7744d81dd3c3f439bfcc04bd8f2849fed5cde9a29c"
+    },
+    "_approve_job_edit": {
+      "name": "_approve_job_edit",
+      "line_start": 1505,
+      "line_end": 1531,
+      "sha256": "570dedb91fa93f4466a8834501d2fc76271d808e7ab9152620da31f8e3ec8eb2"
+    }
+  },
+  "leo_divergence": "No answerable surface means durable approval_required with no schedule write and no approval row; operator resolution revalidates and commits."
+}

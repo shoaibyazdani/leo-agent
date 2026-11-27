@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import sys
 import threading
@@ -21,6 +22,14 @@ from typing import Any, Callable
 
 from rich.console import Console
 from rich.text import Text
+
+from ..contracts import TurnContext, surface_capabilities
+from ..security.approval_cards import (
+    card_from_row,
+    is_schedule_kind,
+    paginate_text,
+    schedule_terminal_text,
+)
 
 HELP = """\
 [bold]LEO terminal chat[/bold]
@@ -36,8 +45,9 @@ HELP = """\
   /tools             registered tools
   /agents            registered specialist agents
   /approvals         pending high-risk approvals
-  /approve <id>      approve a pending gate (operator principal)
-  /deny <id>         deny a pending gate
+  /approve <id> [once|session|always]   decide a pending gate (operator)
+  /deny <id> [reason]                  deny a pending gate
+  Both work while a turn is still waiting for a schedule card.
   /stop              stop the turn that is running now
   /quit or /exit     leave the chat
 """
@@ -83,6 +93,7 @@ class ChatTUI:
         self._thinking_open = False
         self._turning = False
         self._eof = False
+        self._terminal_printed: set[str] = set()
 
     # ------------------------------------------------------------------ run
     async def run(self) -> int:
@@ -90,8 +101,8 @@ class ChatTUI:
 
         Input is read by a persistent worker while a turn streams, so ``/stop``
         (and Ctrl+C) reach the turn that is running. Any other line typed
-        mid-turn is queued for the next turn — the same busy policy Hermes's
-        input loop implements with ``interrupt_then_dispatch``.
+        mid-turn is queued for the next turn, except for the commands that
+        must act on the live turn (``/stop`` and card decisions).
         """
         await self.app.initialize()
         interactive = sys.stdin.isatty() and self._input is input
@@ -193,6 +204,14 @@ class ChatTUI:
                         parsed = parse_command(line)
                         if parsed is not None and parsed[0] in {"stop", "cancel"}:
                             await self._request_stop()
+                        elif (
+                            parsed is not None
+                            and parsed[0] in {"approve", "deny"}
+                            and parsed[1]
+                        ):
+                            # A schedule card can be decided while the turn is
+                            # still running; ordinary input stays queued.
+                            await self.run_command(parsed[0], parsed[1])
                         else:
                             self._queued.append(line)
                             self.console.print(Text("  (queued for the next turn)", style="dim"))
@@ -232,8 +251,26 @@ class ChatTUI:
         started = time.monotonic()
         final: dict[str, Any] = {}
         error: dict[str, Any] | None = None
-        async for event in self.app.ask_stream(
-            text, "cli", None, self.conversation_id
+        # The terminal is a card-capable surface even though the transport
+        # channel is named "cli". Never let the channel name downgrade it.
+        turn = TurnContext(
+            principal="chat", channel="cli", conversation_id=self.conversation_id,
+            surface="tui", capabilities=surface_capabilities("tui"),
+            origin="tui", source="chat",
+        )
+        ask = self.app.ask_stream
+        try:
+            params = inspect.signature(ask).parameters.values()
+            accepts_turn = any(
+                param.name == "turn"
+                or param.kind is inspect.Parameter.VAR_KEYWORD
+                for param in params
+            )
+        except (TypeError, ValueError):
+            accepts_turn = False
+        kwargs = {"turn": turn} if accepts_turn else {}
+        async for event in self._card_event_stream(
+            ask(text, "cli", None, self.conversation_id, **kwargs)
         ):
             kind = event.get("type")
             if kind == "run.started":
@@ -275,6 +312,8 @@ class ChatTUI:
                     f"    /approve {event.get('approval_id')}   or   /deny {event.get('approval_id')}",
                     style="yellow dim",
                 ))
+            elif kind in {"approval.presented", "schedule.approval_required"}:
+                self._print_approval_card(event)
             elif kind == "message.finished":
                 final = event
                 if self._thinking_open:
@@ -299,6 +338,172 @@ class ChatTUI:
             final.setdefault("status", status)
             return final
         return error or {"status": status}
+
+    # ------------------------------------------------------------- approvals
+    async def _card_event_stream(self, stream: Any) -> Any:
+        """Surface schedule cards emitted on the event bus into this turn.
+
+        The approval row is still the authority. This is only a live view: it
+        prints the literal card when the server records presentation, and the
+        kind-preserving terminal text when the card is decided elsewhere.
+        """
+        events = getattr(self.app, "events", None)
+        if events is None:
+            async for event in stream:
+                yield event
+            return
+
+        async def on_presented(event: Any) -> None:
+            payload = event.payload if hasattr(event, "payload") else {}
+            if str(payload.get("presented_surface") or "") != "tui":
+                return
+            if self.conversation_id and payload.get("conversation_id") not in (
+                None, self.conversation_id
+            ):
+                return
+            self._print_approval_card(payload)
+            approval_id = str(payload.get("approval_id") or "")
+            if approval_id:
+                # Acknowledgement is receipt, not a decision: shown_at is
+                # already recorded by present_schedule_card.
+                with contextlib.suppress(Exception):
+                    await self.app.permissions.acknowledge_schedule_card(
+                        approval_id, surface="tui"
+                    )
+
+        async def on_resolved(event: Any) -> None:
+            payload = event.payload if hasattr(event, "payload") else {}
+            if not is_schedule_kind(str(payload.get("kind") or "")):
+                return
+            if str(payload.get("presented_surface") or "") != "tui":
+                return
+            approval_id = str(payload.get("approval_id") or "")
+            if not approval_id or approval_id in self._terminal_printed:
+                return
+            card = await self.app.permissions.get_schedule_card(approval_id)
+            if card is None:
+                return
+            self._terminal_printed.add(approval_id)
+            self._print_terminal(card, str(payload.get("status") or ""))
+
+        for topic, handler in (
+            ("approval.presented", on_presented),
+            ("approval.resolved", on_resolved),
+        ):
+            events.subscribe(topic, handler)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            for topic, handler in (
+                ("approval.presented", on_presented),
+                ("approval.resolved", on_resolved),
+            ):
+                events.unsubscribe(topic, handler)
+
+    def _print_terminal(self, card: Any, status: str) -> None:
+        text = schedule_terminal_text(card, status=status or str(card.status or ""))
+        for line in text.splitlines():
+            self.console.print(Text(line), markup=False)
+
+    def _print_approval_card(self, card: Any) -> None:
+        """Render the full literal card plus every offered choice.
+
+        This is a projection only: it neither records presentation nor decides
+        anything. /approvals calls present_schedule_card first when the TUI is
+        the surface that actually showed the card.
+        """
+        payload = card.model_dump(mode="json") if hasattr(card, "model_dump") else dict(card or {})
+        title = str(payload.get("title") or "Approval needed")
+        self.console.print(Text(f"  ⏰ {title}", style="yellow"))
+        body = str(payload.get("body") or "")
+        limit = surface_capabilities("tui").max_card_chars
+        pages = paginate_text(body, limit)
+        if len(pages) == 1:
+            for line in body.splitlines() or [""]:
+                self.console.print(Text("    " + line), markup=False)
+        else:
+            for index, page in enumerate(pages):
+                self.console.print(Text(
+                    f"    [page {index + 1}/{len(pages)}]", style="dim"
+                ))
+                for line in page.splitlines() or [""]:
+                    self.console.print(Text("    " + line), markup=False)
+        choices = payload.get("choices") or []
+        labels = payload.get("choice_labels") or []
+        rendered = []
+        for index, item in enumerate(choices):
+            if isinstance(item, dict):
+                value = str(item.get("value") or "")
+                label = str(item.get("label") or value)
+            else:
+                value = str(item)
+                label = str(labels[index]) if index < len(labels) else value
+            rendered.append(f"{label} [{value}]")
+        if rendered:
+            self.console.print(Text("    choices: " + "  |  ".join(rendered), style="yellow dim"))
+        deadline = str(payload.get("deadline") or "").strip()
+        if deadline:
+            self.console.print(Text("    " + deadline, style="dim"))
+        self.console.print(Text(
+            f"    /approve {payload.get('approval_id')} <choice>   or   "
+            f"/deny {payload.get('approval_id')}",
+            style="yellow dim",
+        ))
+
+    async def _resolve_schedule_card_tui(
+        self, approval_id: str, *, approved: bool, choice: str,
+        deny_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Present-on-display then decide a schedule card as the operator CLI."""
+        from .. import db
+        from ..security.approval_cards import normalize_choice
+
+        row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (approval_id,))
+        if row is None:
+            return {"success": False, "error": "approval not found"}
+        card = card_from_row(row)
+        canonical = normalize_choice("deny" if not approved else choice, card.kind)
+        if canonical is None:
+            return {
+                "success": False,
+                "error": f"choice must be one of: {', '.join(card.choices)}",
+            }
+        if not row["shown_at"]:
+            try:
+                await self.app.permissions.present_schedule_card(
+                    approval_id, surface="tui"
+                )
+            except Exception as exc:  # noqa: BLE001 - report, never crash the REPL
+                return {"success": False, "error": str(exc)}
+        with contextlib.suppress(Exception):
+            await self.app.permissions.acknowledge_schedule_card(
+                approval_id, surface="tui"
+            )
+        try:
+            resolution = await self.app.permissions.resolve_schedule_card(
+                approval_id,
+                choice=canonical,
+                resolver="operator:cli",
+                confirm_proposal_digest=str(row["digest"] or ""),
+                deny_reason=deny_reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - report, never crash the REPL
+            return {"success": False, "error": str(exc)}
+        self._terminal_printed.add(approval_id)
+        updated = await self.app.permissions.get_schedule_card(approval_id)
+        if updated is not None:
+            self._print_terminal(updated, resolution.status)
+        return {
+            "success": resolution.status == "approved",
+            "status": resolution.status,
+            "outcome": resolution.outcome,
+            "grant_id": resolution.grant_id,
+            "error": (
+                None if resolution.status == "approved"
+                else resolution.outcome or resolution.reason
+            ),
+        }
 
     # ------------------------------------------------------------- commands
     async def run_command(self, name: str, args: list[str]) -> bool:
@@ -329,6 +534,24 @@ class ChatTUI:
             if not pending:
                 self.console.print(Text("no pending approvals", style="dim"))
             for row in pending:
+                if is_schedule_kind(row.get("kind")):
+                    # Listing the full card on this capable surface is the
+                    # presentation event; the decision still needs a choice.
+                    try:
+                        await self.app.permissions.present_schedule_card(
+                            str(row.get("id")), surface="tui"
+                        )
+                    except Exception:  # noqa: BLE001 - listing must still show the row
+                        pass
+                    try:
+                        self._print_approval_card(card_from_row(row))
+                    except ValueError:
+                        self.console.print(Text(
+                            f"{row.get('id')}  {row.get('action')}  "
+                            f"risk={row.get('risk')}  (card body unavailable)",
+                            style="red",
+                        ))
+                    continue
                 self.console.print(Text(
                     f"{row.get('id')}  {row.get('action')}  risk={row.get('risk')}  "
                     f"requested_by={row.get('requested_by')}",
@@ -341,11 +564,28 @@ class ChatTUI:
             await self._request_stop()
         elif name in {"approve", "deny"}:
             if not args:
-                self.console.print(Text(f"usage: /{name} <approval_id>", style="yellow"))
+                self.console.print(Text(f"usage: /{name} <approval_id> [choice]", style="yellow"))
                 return True
-            result = await self.app.operator_resolve_approval(
-                args[0], name == "approve", actor="operator:cli"
-            )
+            from .. import db
+
+            row = await db.fetchone("SELECT kind FROM approvals WHERE id=?", (args[0],))
+            if row is not None and is_schedule_kind(row["kind"]):
+                # Optional choice: once|session|always on create, once on edit.
+                # A denial may carry a short reason; it is never a choice.
+                if name == "deny":
+                    choice = "deny"
+                    reason = " ".join(args[1:]).strip() or None
+                else:
+                    choice = args[1].strip().lower() if len(args) > 1 else "once"
+                    reason = None
+                result = await self._resolve_schedule_card_tui(
+                    args[0], approved=(name == "approve"), choice=choice,
+                    deny_reason=reason,
+                )
+            else:
+                result = await self.app.operator_resolve_approval(
+                    args[0], name == "approve", actor="operator:cli"
+                )
             if result.get("success", True) is False:
                 self.console.print(Text(f"failed: {result.get('error')}", style="red"))
             else:

@@ -75,20 +75,18 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 # Explicit reviewed allowlist. Keys are "path:line", "path:start-end", or
 # an open-ended range written as "start-". Each entry MUST carry a reason.
-# A reason prefixed "only=<label>:" restricts the exception to that single
-# pattern family; whole-file ranges are used ONLY for hash-only manifests and
-# research notes documenting upstream SHAs, never for provider-key prefixes.
+# A reason prefixed "only=<label>[|<label>]:" restricts the exception to those
+# pattern families (a synthetic fixture can match more than one family);
+# whole-file ranges are used ONLY for hash-only manifests and research notes
+# documenting upstream SHAs, never for provider-key prefixes.
 REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "uv.lock": {"1-": "only=long hex: lockfile integrity hashes, not credentials"},
     "tests/test_harden_config.py": {
-        "185": "synthetic sk-ant fixture",
-        "196": "synthetic sk fixture",
         "280-281": "synthetic invalid-token parameter",
-        "313-334": "synthetic multi-provider fixtures",
         "430-458": "synthetic provider fixtures and hex fixture",
     },
     "tests/channels/test_bluebubbles.py": {"23": "test fixture", "25": "test fixture"},
-    "tests/channels/test_credential_enrollment.py": {"70": "test fixture", "153": "test fixture"},
+    "tests/channels/test_credential_enrollment.py": {"70": "test fixture"},
     "tests/channels/test_dingtalk.py": {
         "26": "test fixture", "28": "test fixture", "29": "test fixture",
     },
@@ -99,41 +97,135 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "tests/channels/test_signal.py": {"30": "test fixture", "32": "test fixture"},
     "tests/channels/test_slack.py": {"21": "test fixture", "83": "test fixture"},
     "tests/channels/test_teams.py": {"32": "test fixture"},
-    "tests/test_agents_automation_operator.py": {"33": "test fixture"},
+    "tests/test_agents_automation_operator.py": {
+        "40": "test fixture",
+        "42": "only=assigned secret: synthetic fixture in an earlier revision",
+        "43": "only=assigned secret: synthetic fixture at its current line",
+        "41": "only=assigned secret: synthetic fixture in an earlier revision",
+        "33": "only=assigned secret: synthetic fixture in an earlier revision",
+    },
     "tests/test_agents_reviewer.py": {"143": "test fixture"},
-    "tests/test_commands.py": {"514": "test fixture"},
+    "tests/test_commands.py": {
+        "514": "test fixture",
+        # Two credential-shaped pattern families match these synthetic fixtures.
+        "498": "synthetic secret fixture in an earlier revision",
+        "499": "synthetic secret fixture in an earlier revision",
+    },
+    # Every entry is restricted to the exact pattern families its fixture
+    # matches, at both current and historical line numbers; a future real
+    # credential on one of these lines is still reported by the gate.
     "tests/test_tools_http.py": {
-        "108": "synthetic fixture", "123": "synthetic fixture",
-        "643": "synthetic fixture", "660": "synthetic fixture",
-        "710": "redaction assertion", "788": "synthetic fixture",
-        "805": "redaction assertion", "866": "synthetic fixture",
-        "937": "synthetic fixture", "980": "synthetic fixture",
-        "990": "synthetic fixture", "1021": "synthetic fixture",
-        "1260": "synthetic fixture", "1347": "synthetic fixture",
+        "108": "only=openai key: synthetic fixture",
+        "123": "only=openai key: synthetic fixture",
+        "643": "only=assigned secret: synthetic fixture",
+        "660": "only=openai key|assigned secret: synthetic fixture",
+        "710": "only=openai key: redaction assertion",
+        "788": "only=openai key|assigned secret: synthetic fixture",
+        "805": "only=openai key: redaction assertion",
+        "866": "only=openai key|assigned secret: synthetic fixture",
+        "937": "only=openai key|assigned secret: synthetic fixture",
+        "980": "only=openai key|assigned secret: synthetic fixture",
+        "990": "only=openai key|assigned secret: synthetic fixture",
+        "1021": "only=openai key|assigned secret: synthetic fixture",
+        "1260": "only=openai key|assigned secret: synthetic fixture",
+        "1347": "only=openai key|assigned secret: synthetic fixture",
+        # The same fixtures after later test insertions; the older line
+        # numbers stay for historical blobs.
+        "669": "only=assigned secret: synthetic fixture at its current line",
+        "686": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "736": "only=openai key: redaction assertion at its current line",
+        "814": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "831": "only=openai key: redaction assertion at its current line",
+        "892": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "963": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1006": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1016": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1047": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1286": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1373": "only=openai key|assigned secret: synthetic fixture at its current line",
     },
     "tests/test_tools_webhook.py": {"33": "test fixture"},
-    "tests/test_integrations.py": {"209": "test fixture", "270": "test fixture", "306": "test fixture"},
     "tests/channels/test_a2a.py": {"42": "test fixture"},
     "tests/channels/test_wechat_crypto.py": {"61": "only=long hex: synthetic hex fixture"},
-    "tests/test_enrollment.py": {"35": "test fixture", "203": "test fixture"},
+    "tests/test_enrollment.py": {"35": "test fixture"},
     "tests/test_agent_activity_dashboard.py": {"95": "test fixture", "151": "test fixture"},
-    "tests/test_tools_context.py": {"88-89": "test fixture"},
-    "tests/test_tools_run.py": {"156": "test fixture", "202": "test fixture", "213": "test fixture", "232": "test fixture"},
-    "tests/test_harden_events.py": {"236": "test fixture", "243": "test fixture"},
-    "tests/test_tool_agent_integration.py": {"387": "test fixture"},
+    "tests/test_tools_run.py": {"156": "test fixture", "202": "test fixture"},
     "leo/integrations/whatsapp_bridge/manager.py": {
         "84": "only=long hex: SHA-256 integrity pin of the shipped bridge.js",
     },
     "scripts/leo_conversation_observer.py": {
         "1607": "synthetic leak-token fixture used to verify redaction on disk",
+        "728": "synthetic bearer fixture in an earlier revision (two pattern families)",
     },
-    "tests/test_api.py": {"241": "test fixture", "452": "test fixture", "489": "test fixture"},
-    "tests/test_chat_tools.py": {"1298": "test fixture"},
+    "tests/test_api.py": {
+        "241": "test fixture", "345": "synthetic failure-message fixture",
+        "346": "only=assigned secret: synthetic failure-message fixture at its current line",
+        "452": "test fixture", "489": "test fixture",
+        "556": "synthetic secret fixture", "593": "synthetic secret fixture",
+        "557": "only=assigned secret: synthetic secret fixture at its current line",
+        "594": "only=assigned secret: synthetic secret fixture at its current line",
+        "257": "only=assigned secret: synthetic failure-message fixture in an earlier revision",
+        "468": "only=assigned secret: synthetic secret fixture in an earlier revision",
+        "505": "only=assigned secret: synthetic secret fixture in an earlier revision",
+    },
+    # Pinned commits and SHA-256 evidence in the scheduling parity corpus are
+    # integrity metadata, never credentials.
+    "docs/SCHEDULES.md": {"1-": "only=long hex: pinned commit identifiers"},
+    "scripts/release/evidence/junit.xml": {
+        "1": "synthetic parametrized test-case names from existing redaction fixtures, not live credentials",
+    },
+    "scripts/release/evidence/receipt.json": {
+        "1-": "only=long hex: JUnit SHA-256 evidence hash",
+    },
+    "scripts/schedule_parity/extract_fixtures.py": {
+        "19": "only=long hex: pinned oracle commit",
+    },
+    "scripts/schedule_parity/run_baseline.py": {
+        "18-19": "only=long hex: pinned baseline commit and lock hash",
+    },
+    "tests/fixtures/schedule_parity/acceptance_matrix.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/cancel.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/create.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/list.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/pause.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/remove.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/resume.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/run.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/actions/update.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/baseline/receipt.json": {"1-": "only=long hex: pinned baseline and evidence hashes"},
+    "tests/fixtures/schedule_parity/baseline_failures.json": {"1-": "only=long hex: pinned baseline commit"},
+    "tests/fixtures/schedule_parity/consent_cards.json": {"1-": "only=long hex: pinned commit and source hashes"},
+    "tests/fixtures/schedule_parity/delivery_tokens.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/fields.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/grammar.json": {"1-": "only=long hex: pinned commit and source hashes"},
+    "tests/fixtures/schedule_parity/oracle_manifest.json": {"1-": "only=long hex: pinned oracle and fixture hashes"},
+    "tests/fixtures/schedule_parity/repeat.json": {"1-": "only=long hex: pinned oracle commit"},
+    "tests/fixtures/schedule_parity/tool_schema.json": {"1-": "only=long hex: pinned commit and schema hashes"},
+    "tests/test_schedule_safety.py": {
+        "71-139": "synthetic secret and control-character fixtures exercising the scanner and redactor",
+    },
+    "tests/test_schedule_security.py": {
+        "28": "synthetic unsafe-prompt fixture",
+        "110": "assertion that the synthetic token is absent in an earlier revision",
+        "204": "only=openai key: assertion that the synthetic token is absent",
+    },
+    "tests/test_secret_sinks.py": {
+        "290": "synthetic PEM fixture used to verify redaction",
+    },
+    "tests/test_chat_tools.py": {
+        "1298": "test fixture",
+        "1147": "only=assigned secret: synthetic key fixture in an earlier revision",
+        "1315": "only=assigned secret: synthetic key fixture in an earlier revision",
+    },
     "tests/test_conversation_observer.py": {
         "92-103": "synthetic tokens exercising the redactor",
         "154": "test fixture",
         "179": "test fixture",
         "222": "test fixture",
+        "91": "synthetic bearer fixture in an earlier revision (two pattern families)",
+        "153": "only=assigned secret: synthetic leak fixture in an earlier revision",
+        "172": "synthetic secret fixture in an earlier revision (two pattern families)",
+        "215": "only=openai key: redaction assertion in an earlier revision",
     },
     "tests/test_learning_engine.py": {
         "138": "synthetic token in a redaction test",
@@ -142,18 +234,75 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "186": "synthetic token in a note-draft test",
         "464": "synthetic token in an error-redaction test",
         "474": "assertion that the secret is absent",
+        # Same fixtures at their current and earlier line numbers. Restricted to
+        # one pattern family so a future credential in this file still fails.
+        "126": "synthetic redaction fixture (two pattern families)",
+        "140": "synthetic redaction fixture (two pattern families)",
+        "150": "only=openai key: redaction assertion",
+        "164": "only=openai key: redaction assertion",
+        "167": "synthetic capture fixture (two pattern families)",
+        "174": "synthetic draft fixture (two pattern families)",
+        "181": "synthetic capture fixture (two pattern families)",
+        "188": "synthetic draft fixture (two pattern families)",
+        "431": "synthetic error-redaction fixture (two pattern families)",
+        "441": "only=openai key: redaction assertion",
+        "495": "synthetic error-redaction fixture (two pattern families)",
+        "505": "only=openai key: redaction assertion",
+    },
+    "tests/test_model_presets.py": {
+        "64": "only=openai project key: synthetic provider preset fixture",
     },
     "tests/test_onboarding.py": {"37": "synthetic fixture"},
     "tests/test_self_evolution_integration.py": {
         "146": "synthetic token", "257": "synthetic token", "305": "synthetic token",
     },
-    "tests/test_selfheal.py": {"633": "test fixture"},
-    "tests/test_tools.py": {"216": "test placeholder", "358": "test fixture"},
+    "tests/test_selfheal.py": {
+        "633": "test fixture",
+        "535": "only=assigned secret: synthetic provider-error fixture in an earlier revision",
+    },
+    "tests/test_tools.py": {
+        "216": "test placeholder", "358": "test fixture",
+        "334": "synthetic secret fixture in an earlier revision (two pattern families)",
+    },
     "tests/test_tools_conversation.py": {
         "36": "synthetic token", "855": "synthetic stripe-shaped fixture", "956": "test fixture",
+        "29": "synthetic token fixture in an earlier revision (two pattern families)",
+        "903": "only=stripe live key: synthetic token fixture",
+        "1004": "only=stripe live key: synthetic audit-id fixture",
     },
-    "tests/test_tools_preview.py": {"815": "test fixture"},
-    "tests/test_whatsapp_bridge.py": {"1419": "test fixture"},
+    "tests/test_tools_preview.py": {
+        "815": "test fixture",
+        "778": "only=bearer token: synthetic header fixture in an earlier revision",
+    },
+    "tests/test_whatsapp_bridge.py": {
+        "1419": "test fixture",
+        "524": "only=bearer token: synthetic header fixture in an earlier revision",
+        "1389": "only=bearer token: synthetic header fixture in an earlier revision",
+    },
+    # Historical research notes pin upstream commit SHAs; long-hex matches
+    # there are integrity metadata, never provider credentials. A trailing
+    # slash is a reviewed path-prefix key, so the scanner need not repeat
+    # historical product names in a public allowlist.
+    "research/deep-2026-11-18/": {
+        "1-": "only=long hex: pinned upstream commit identifiers in historical notes",
+    },
+    "research/deep-2026-11-18/leo-e2e.md": {
+        "197": "only=assigned secret: documented synthetic leak fixture",
+        "205": "only=assigned secret: documented synthetic leak fixture",
+        "447": "only=assigned secret: documented synthetic leak fixture",
+    },
+    # A cherry-pick's source SHA in a commit message is structural metadata.
+    "object:commit:1d0cba3cf52c:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:27c6073db5ec:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:42cfe0c03ae7:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:69dc4e16432c:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:85e13e4f748f:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:898982bbbf67:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:959be04d514b:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:a2f3a03cadcd:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:d076edd6b417:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:e43c509136ad:msg": {"1-": "only=long hex: cherry-picked commit reference"},
+    "object:commit:f99b540085d9:msg": {"1-": "only=long hex: cherry-picked commit reference"},
 }
 
 
@@ -242,18 +391,26 @@ def display(path: Path) -> str:
 
 
 def is_reviewed(path_key: str, line: int, label: str) -> bool:
-    for spec, reason in REVIEWED_ALLOWLIST.get(path_key, {}).items():
-        only = reason.split(":", 1)[0] if reason.startswith("only=") else None
-        if only is not None and only != f"only={label}":
-            continue
-        if spec == "*":
-            return True
-        if "-" in spec:
-            start, _, end = spec.partition("-")
-            if int(start) <= line and (not end or line <= int(end)):
+    keys = [path_key]
+    keys.extend(
+        key for key in REVIEWED_ALLOWLIST if key.endswith("/") and path_key.startswith(key)
+    )
+    for key in keys:
+        for spec, reason in REVIEWED_ALLOWLIST.get(key, {}).items():
+            only = (
+                set(reason.split(":", 1)[0][len("only="):].split("|"))
+                if reason.startswith("only=") else None
+            )
+            if only is not None and label not in only:
+                continue
+            if spec == "*":
                 return True
-        elif spec.isdigit() and int(spec) == line:
-            return True
+            if "-" in spec:
+                start, _, end = spec.partition("-")
+                if int(start) <= line and (not end or line <= int(end)):
+                    return True
+            elif spec.isdigit() and int(spec) == line:
+                return True
     return False
 
 
@@ -326,7 +483,9 @@ def scan_objects(oids: list[str], unreachable: list[str]) -> int:
             # message body is scanned separately so no commit text is exempt.
             header, _, message = text.partition("\n\n")
             findings += scan_lines(header, source, f"object:{oid}", allow_hex=False)
-            findings += scan_lines(message, f"{source}:msg", f"object:{oid}:msg")
+            # Keep the allowlist key identical to the displayed source so a
+            # reviewed cherry-pick SHA can be admitted by its short object id.
+            findings += scan_lines(message, f"{source}:msg", f"{source}:msg")
     return findings
 
 

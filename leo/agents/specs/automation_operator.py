@@ -45,11 +45,17 @@ from __future__ import annotations
 import hmac
 import json
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timezone
 from typing import Any
 
 from ... import db
 from ...contracts import RiskLevel, TaskStatus, ToolCall
+from ...schedules.clock import Clock, SystemClock
+from ...schedules.service import (
+    ScheduleServiceError,
+    approval_within_window,
+    claim_is_active,
+    claim_mutation_authorization,
+)
 from ...security.permissions import arguments_digest
 from ..verification import digest as evidence_digest
 
@@ -63,8 +69,13 @@ APPROVAL_RISK = RiskLevel.HIGH
 TOOL_GRANTS: tuple[str, ...] = (
     "schedule_create",
     "schedule_list",
+    "schedule_get",
+    "schedule_update",
+    "schedule_pause",
+    "schedule_resume",
     "schedule_delete",
     "schedule_run_now",
+    "schedule_cancel",
     "task_create",
     "task_status",
     "task_result",
@@ -104,12 +115,24 @@ SEED: dict[str, Any] = {
     },
 }
 
-# action -> (tool used, needs a durable approval)
+# action -> (tool used, needs the specialist's durable automation:mutate gate)
+#
+# create/update/pause/resume are deliberately ungated here: they converge on
+# the same canonical ScheduleService proposal/edit card as a direct model call.
+# Doubling the gate would require a human to approve an automation:mutate row
+# *and* then the schedule card. Delete/trigger/cancel/enqueue keep the exact
+# existing gate because they are lifecycle/execution mutations with no schedule
+# card of their own, and the declared grant must match the enforced policy.
 _ACTIONS: dict[str, tuple[str, bool]] = {
     "list_schedules": ("schedule_list", False),
-    "create_schedule": ("schedule_create", True),
+    "get_schedule": ("schedule_get", False),
+    "create_schedule": ("schedule_create", False),
+    "update_schedule": ("schedule_update", False),
+    "pause_schedule": ("schedule_pause", False),
+    "resume_schedule": ("schedule_resume", False),
     "delete_schedule": ("schedule_delete", True),
     "trigger_schedule": ("schedule_run_now", True),
+    "cancel_schedule": ("schedule_cancel", True),
     "enqueue_task": ("task_create", True),
     "task_status": ("task_status", False),
     "task_result": ("task_result", False),
@@ -120,13 +143,24 @@ _ACTIONS: dict[str, tuple[str, bool]] = {
 _ALIASES: dict[str, str] = {
     "list": "list_schedules",
     "schedule_list": "list_schedules",
+    "get": "get_schedule",
+    "schedule_get": "get_schedule",
     "create": "create_schedule",
     "schedule_create": "create_schedule",
+    "update": "update_schedule",
+    "schedule_update": "update_schedule",
+    "pause": "pause_schedule",
+    "schedule_pause": "pause_schedule",
+    "resume": "resume_schedule",
+    "schedule_resume": "resume_schedule",
     "delete": "delete_schedule",
+    "remove": "delete_schedule",
     "schedule_delete": "delete_schedule",
     "trigger": "trigger_schedule",
     "run_now": "trigger_schedule",
     "schedule_run_now": "trigger_schedule",
+    "cancel": "cancel_schedule",
+    "schedule_cancel": "cancel_schedule",
     "enqueue": "enqueue_task",
     "task_create": "enqueue_task",
     "status": "task_status",
@@ -138,10 +172,19 @@ _ALIASES: dict[str, str] = {
     "webhook_deliveries": "delivery_status",
 }
 _REQUEST_KEYS: tuple[str, ...] = (
-    "action", "name", "expression", "objective", "task_objective", "payload",
-    "enabled_only", "run_at", "task_id", "headers", "body", "delivery_id",
-    "limit", "offset", "channel", "approval_id", "idempotency_key",
+    "action", "name", "schedule", "expression", "prompt", "objective",
+    "task_objective", "payload", "repeat", "deliver", "failure_deliver",
+    "skills", "skill", "catch_up", "wrap_response", "script", "monitor",
+    "no_agent", "context_from", "continuity", "enabled_toolsets", "workdir",
+    "timezone", "attach_to_session", "pinned", "paused", "paused_reason",
+    "schedule_id", "job_id", "config_revision", "request_key",
+    "enabled_only", "include_paused", "run_at", "headers", "body",
+    "delivery_id", "limit", "offset", "channel", "approval_id",
+    "idempotency_key",
 )
+# ``task_id`` is deliberately absent above: the engine context carries the
+# specialist's OWN task id, which must never be mistaken for an automation
+# target. A real target task_id arrives in the objective JSON instead.
 # These are never authority. Their presence is reported, not honoured.
 _APPROVAL_FLAGS: tuple[str, ...] = (
     "approved", "approve", "confirm", "confirmed", "force", "allow",
@@ -201,6 +244,17 @@ def _service(services: Mapping[str, Any], *names: str) -> Any:
     return None
 
 
+def _approval_clock(services: Mapping[str, Any]) -> Clock:
+    """One injected clock for approval expiry and lease creation/validation."""
+    for candidate in (
+        services.get("clock"),
+        getattr(_service(services, "schedule_service"), "clock", None),
+    ):
+        if candidate is not None and hasattr(candidate, "now"):
+            return candidate
+    return SystemClock()
+
+
 def _parse_request(objective: Any, context: Mapping[str, Any]) -> dict[str, Any]:
     request: dict[str, Any] = {}
     if isinstance(objective, Mapping):
@@ -239,31 +293,77 @@ def _required(request: Mapping[str, Any], key: str) -> Any:
     return value
 
 
+_SCHEDULE_ARG_KEYS: tuple[str, ...] = (
+    "schedule", "prompt", "name", "repeat", "deliver", "failure_deliver",
+    "skills", "skill", "catch_up", "wrap_response", "script", "monitor",
+    "no_agent", "context_from", "continuity", "enabled_toolsets", "workdir",
+    "timezone", "attach_to_session", "pinned", "paused", "paused_reason",
+    "config_revision", "request_key",
+)
+
+
+def _target_args(request: Mapping[str, Any]) -> dict[str, Any]:
+    if request.get("schedule_id") is not None:
+        return {"schedule_id": str(request["schedule_id"])}
+    if request.get("job_id") is not None:
+        return {"schedule_id": str(request["job_id"])}
+    return {"name": str(_required(request, "name"))}
+
+
 def _tool_arguments(action: str, request: Mapping[str, Any]) -> dict[str, Any]:
     """Build exact ToolSpec arguments; unknown request keys are never forwarded."""
     if action == "list_schedules":
-        return {"enabled_only": bool(request.get("enabled_only", False))}
-    if action == "create_schedule":
-        objective = request.get("objective") or request.get("task_objective")
-        if objective is None or not str(objective).strip():
-            raise ValueError("requires 'objective'")
-        args = {
-            "name": str(_required(request, "name")),
-            "expression": _required(request, "expression"),
-            "objective": str(objective),
-        }
-        payload = request.get("payload")
-        if payload is not None:
-            if not isinstance(payload, Mapping):
-                raise ValueError("payload must be an object")
-            args["payload"] = dict(payload)
+        args = {"enabled_only": bool(request.get("enabled_only", False))}
+        if request.get("include_paused") is not None:
+            args["include_paused"] = bool(request["include_paused"])
+        return args
+    if action == "get_schedule":
+        return _target_args(request)
+    if action in ("create_schedule", "update_schedule"):
+        schedule = request.get("schedule", request.get("expression"))
+        prompt = request.get("prompt", request.get("objective"))
+        if action == "create_schedule":
+            if schedule is None or not str(schedule).strip():
+                raise ValueError("requires 'schedule'")
+            if prompt is None or not str(prompt).strip():
+                raise ValueError("requires 'prompt'")
+        args: dict[str, Any] = {}
+        for key in _SCHEDULE_ARG_KEYS:
+            if key in request and request[key] is not None:
+                args[key] = request[key]
+        if schedule is not None:
+            args["schedule"] = schedule
+        if prompt is not None:
+            args["prompt"] = prompt
+        if action == "update_schedule":
+            # The specialist identifies the job by id/name; it does not use the
+            # field as an implicit rename. Renaming stays a direct card edit.
+            args.pop("name", None)
+            args.update(_target_args(request))
+        return args
+    if action in ("pause_schedule", "resume_schedule"):
+        args = _target_args(request)
+        for key in ("config_revision", "request_key"):
+            if request.get(key) is not None:
+                args[key] = request[key]
+        if action == "pause_schedule" and request.get("paused_reason") is not None:
+            args["paused_reason"] = request["paused_reason"]
         return args
     if action == "delete_schedule":
-        return {"name": str(_required(request, "name"))}
+        return _target_args(request)
     if action == "trigger_schedule":
-        args = {"name": str(_required(request, "name"))}
+        args = _target_args(request)
         if request.get("run_at") is not None:
             args["run_at"] = request["run_at"]
+        if request.get("prompt") is not None:
+            args["prompt"] = request["prompt"]
+        if request.get("request_key") is not None:
+            args["request_key"] = request["request_key"]
+        return args
+    if action == "cancel_schedule":
+        args = _target_args(request)
+        if request.get("task_id") is not None:
+            args["task_id"] = request["task_id"]
         return args
     if action == "enqueue_task":
         objective = request.get("objective") or request.get("task_objective")
@@ -319,7 +419,12 @@ def _tool_value(result: Any) -> Any:
 
 
 async def _call(
-    tool_view: Any, name: str, arguments: Mapping[str, Any], context: Mapping[str, Any]
+    tool_view: Any,
+    name: str,
+    arguments: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    authorization: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Execute one scoped tool call and return its output plus an audit anchor.
 
@@ -332,6 +437,7 @@ async def _call(
         arguments=dict(arguments),
         actor=AGENT_ID,
         correlation_id=context.get("correlation_id"),
+        authorization=authorization,
     )
     result = await tool_view.execute(call)
     output = _tool_value(result)
@@ -463,6 +569,27 @@ async def _verify_approval(
     if row["status"] != "approved":
         return deny(f"approval {approval_id} is {row['status']}, not approved")
 
+    metadata: Mapping[str, Any] = {}
+    try:
+        decoded = json.loads(row["metadata"] or "{}")
+    except (TypeError, ValueError):
+        decoded = {}
+    if isinstance(decoded, Mapping):
+        metadata = decoded
+    # Trust boundary: never read settings from request context or from a
+    # caller-supplied tool object; an attacker could otherwise disable expiry.
+    settings = _service(services, "settings")
+    if settings is None:
+        return deny("settings service unavailable for approval expiry verification")
+    # The same injected clock drives this check and the service's lease writes.
+    now = _approval_clock(services).now()
+    # Consumed and still-live leases are refused; a provably stale lease left by
+    # a crashed worker can be reclaimed by the shared conditional claim below.
+    if metadata.get("live_authorization_used_at"):
+        return deny(f"approval {approval_id} was already used for a live action")
+    if claim_is_active(metadata.get("live_authorization_claim"), now):
+        return deny(f"approval {approval_id} is already in use for a live action")
+
     for field in ("action", "resource", "risk", "actor"):
         expected = {
             "action": target["action"],
@@ -473,37 +600,17 @@ async def _verify_approval(
         if str(row[field]) != str(expected):
             return deny(f"approval binding mismatch on {field}")
 
-    metadata: Mapping[str, Any] = {}
-    try:
-        decoded = json.loads(row["metadata"] or "{}")
-    except (TypeError, ValueError):
-        decoded = {}
-    if isinstance(decoded, Mapping):
-        metadata = decoded
+    # No in-repo writer mints an automation:mutate card without an arguments
+    # digest, so a digest-less card is malformed, not a legacy shape to accept.
     expected_digest = metadata.get("arguments_digest")
-    if expected_digest and not hmac.compare_digest(
+    if not expected_digest:
+        return deny(f"approval {approval_id} has no arguments digest")
+    if not hmac.compare_digest(
         str(expected_digest), str(target["arguments_digest"])
     ):
         return deny("approval arguments digest does not match this mutation")
 
-    # Trust boundary: never read settings from request context or from a
-    # caller-supplied tool object; an attacker could otherwise disable expiry.
-    settings = _service(services, "settings")
-    if settings is None:
-        return deny("settings service unavailable for approval expiry verification")
-    security = getattr(settings, "security", None)
-    try:
-        timeout = int(getattr(security, "approval_timeout_seconds", 900))
-    except (TypeError, ValueError):
-        timeout = 900
-    try:
-        created = datetime.fromisoformat(str(row["created_at"]))
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        expired = (datetime.now(timezone.utc) - created).total_seconds() > timeout
-    except (TypeError, ValueError):
-        expired = True
-    if expired:
+    if not approval_within_window(row, now, settings):
         return deny(f"approval {approval_id} has expired")
 
     # Trust boundary: only the injected PermissionManager can verify and audit
@@ -556,19 +663,68 @@ async def _shape(
         "source": tool_name,
     }
 
-    if action in ("create_schedule", "delete_schedule"):
-        schedules, list_anchor = await _call(
-            tool_view, "schedule_list", {"enabled_only": False}, context
-        )
-        anchors.append(list_anchor)
-        rows = [s for s in (_mapping(item) for item in _mapping(schedules).get("schedules") or [])
-                if s.get("name") == arguments.get("name")]
-        applied = bool(rows) if action == "create_schedule" else not rows
-        status = "applied" if applied else "unverified"
-        result["schedule"] = rows[0] if rows else None
-        result["verified_by"] = "schedule_list"
-        result["schedule_readback"] = {"name": arguments.get("name"), "present": bool(rows)}
-        delivery["outcome"] = "applied" if applied else "unverified"
+    if action in (
+        "create_schedule", "update_schedule", "delete_schedule", "get_schedule",
+        "pause_schedule", "resume_schedule",
+    ):
+        # The canonical ScheduleService owns consent: a model create/update may
+        # be waiting on a card and must never be shaped as applied. Only durable
+        # read-back after the service reports success can do that.
+        reported = str(data.get("status") or "")
+        if action == "get_schedule":
+            result["schedule"] = data.get("schedule")
+            result["verified_by"] = "schedule_get"
+            status = "observed" if data.get("schedule") else "unverified"
+            delivery["outcome"] = status
+        elif reported == "approval_required":
+            status = "approval_required"
+            applied = False
+            result.update({
+                "approval_id": data.get("approval_id"),
+                "proposal_id": data.get("proposal_id"),
+                "schedule_id": data.get("schedule_id"),
+                "name": data.get("name"),
+                "card": data.get("card"),
+                "verified_by": "schedule_service",
+            })
+            delivery.update({
+                "outcome": status,
+                "acknowledged": bool(data.get("approval_id") or data.get("proposal_id")),
+                "note": "A card or durable proposal is waiting; nothing was saved.",
+            })
+        elif action == "update_schedule" and data.get("status") == "no_change":
+            status = "no_change"
+            result["verified_by"] = "schedule_service"
+            delivery["outcome"] = status
+        else:
+            target_name = data.get("name") or arguments.get("name")
+            schedules, list_anchor = await _call(
+                tool_view, "schedule_list", {"enabled_only": False}, context
+            )
+            anchors.append(list_anchor)
+            rows = [
+                s for s in (
+                    _mapping(item)
+                    for item in _mapping(schedules).get("schedules") or []
+                )
+                if s.get("name") == target_name
+            ]
+            if action == "delete_schedule":
+                applied = not rows and reported in ("removed", "deleted")
+            elif action in ("pause_schedule", "resume_schedule"):
+                # Pause/resume must be proven by the durable enabled state, not
+                # by the tool's own wording.
+                expected_enabled = action == "resume_schedule"
+                applied = bool(rows) and bool(rows[0].get("enabled")) is expected_enabled
+            else:
+                applied = bool(rows) and reported in ("created", "updated")
+            status = "applied" if applied else "unverified"
+            result["schedule"] = rows[0] if rows else None
+            result["verified_by"] = "schedule_list"
+            result["schedule_readback"] = {
+                "name": target_name, "present": bool(rows)
+            }
+            delivery["outcome"] = "applied" if applied else "unverified"
 
     elif action in ("trigger_schedule", "enqueue_task"):
         task_id = data.get("task_id")
@@ -585,10 +741,11 @@ async def _shape(
         executed = False
         completed = str(task_status) == TaskStatus.COMPLETED.value
         result.update({
-            "schedule": data.get("schedule"),
+            "schedule": data.get("schedule") or data.get("name"),
             "task_id": task_id,
             "task_status": task_status,
             "triggered": bool(data.get("triggered", True)),
+            "manual_run": bool(data.get("manual_run", action == "trigger_schedule")),
             "task_count": data.get("task_count"),
             "next_run_at": data.get("next_run_at"),
             "last_run_at": data.get("last_run_at"),
@@ -601,6 +758,29 @@ async def _shape(
             "executed": False,
             "completed": completed,
             "note": "Durable task created; no worker execution is claimed.",
+        })
+
+    elif action == "cancel_schedule":
+        reported = str(data.get("status") or "")
+        cancelled = bool(data.get("cancelled"))
+        status = "cancelled" if cancelled else "no_live_run"
+        result.update({
+            "schedule_id": data.get("schedule_id"),
+            "name": data.get("name"),
+            "cancelled": cancelled,
+            "tasks": list(data.get("tasks") or []),
+            "schedule_deleted": bool(data.get("schedule_deleted")),
+            "verified_by": "schedule_cancel",
+        })
+        delivery.update({
+            "outcome": status,
+            "executed": False,
+            "completed": False,
+            "note": (
+                "Live tasks were stopped; the schedule itself was not deleted."
+                if cancelled
+                else "No live task was in flight."
+            ),
         })
 
     elif action == "task_status":
@@ -683,7 +863,9 @@ async def _shape(
             "note": "An accepted webhook event is not proof a worker executed.",
         })
 
-    success = status not in ("unverified", "not_queued", "failed")
+    success = status not in (
+        "unverified", "not_queued", "failed", "approval_required"
+    )
     final_output = {
         "agent_id": AGENT_ID,
         "action": action,
@@ -765,7 +947,19 @@ def make_handler(services: Any = None) -> Callable[..., Any]:
 
         approval: dict[str, Any] = {
             "required": bool(mutating), "approved": False, "granted": False,
-            "approval_id": None, "reason": "no approval required for read-only action",
+            "approval_id": None,
+            "actor": AGENT_ID,
+            "context_actor_ignored": bool(
+                ctx.get("actor") and str(ctx.get("actor")) != AGENT_ID
+            ),
+            "reason": (
+                "canonical schedule consent"
+                if action in (
+                    "create_schedule", "update_schedule", "pause_schedule",
+                    "resume_schedule",
+                )
+                else "no approval required for read-only action"
+            ),
         }
         if mutating:
             verified, approval = await _verify_approval(
@@ -774,10 +968,45 @@ def make_handler(services: Any = None) -> Callable[..., Any]:
             if not verified:
                 return _blocked(action, tool_name, approval)
 
+        # Enqueue has no schedule service of its own: claim its card here, on
+        # the same single-use, time-bounded path the service uses for run,
+        # cancel and delete. The service claims its own cards after this gate.
+        lease = None
+        if mutating and tool_name == "task_create":
+            resource = str(approval.get("resource") or "")
+            try:
+                lease = await claim_mutation_authorization(
+                    str(approval["approval_id"]),
+                    clock=_approval_clock(injected),
+                    settings=_service(injected, "settings"),
+                    allowed=lambda card, _meta: (
+                        str(card["action"]) == APPROVAL_ACTION
+                        and str(card["resource"] or "") == resource
+                    ),
+                )
+            except ScheduleServiceError as exc:
+                return _blocked(action, tool_name, {**approval, "reason": exc.message})
+
         try:
-            output, primary_anchor = await _call(tool_view, tool_name, arguments, ctx)
+            output, primary_anchor = await _call(
+                tool_view,
+                tool_name,
+                arguments,
+                ctx,
+                authorization=(
+                    approval.get("approval_id") if mutating else None
+                ),
+            )
         except Exception as exc:
+            if lease is not None:
+                await lease.settle(consumed=False)
             return _failed(action, tool_name, f"{type(exc).__name__}: {exc}", approval)
+        except BaseException:
+            if lease is not None:
+                await lease.settle(consumed=False)
+            raise
+        if lease is not None:
+            await lease.settle(consumed=True)
 
         try:
             return await _shape(

@@ -14,10 +14,29 @@ from typing import Any
 
 from .. import db
 from ..config import Settings
-from ..contracts import Decision, RiskLevel, new_id, utcnow
+from ..contracts import Decision, RiskLevel, new_id, surface_capabilities
 from ..logging import get_logger
 from ..events import Event, EventBus
+from ..schedules.clock import Clock, SystemClock
 from .approval_buttons import ALWAYS_ARG_SCOPED_ACTIONS
+from .approval_cards import (
+    APPROVAL_CARD_PROTOCOL_VERSION,
+    DECLINE_MESSAGES,
+    KIND_SCHEDULE_CREATE,
+    KIND_SCHEDULE_EDIT,
+    ScheduleResolution,
+    at_or_after,
+    card_fits_surface,
+    card_from_row,
+    choice_labels_for,
+    current_card_presenter,
+    deadline_text,
+    is_schedule_kind,
+    kind_config,
+    normalize_choice,
+    parse_instant,
+    proposal_digest_matches,
+)
 
 _LOG = get_logger("security")
 
@@ -25,6 +44,24 @@ _LOG = get_logger("security")
 def _grant_scope(action: str, arguments_digest: str) -> str:
     """Storage key for an "Always" grant scoped to one exact call payload."""
     return f"grant:{action}:{arguments_digest}"
+
+
+# A schedule create grant is its own authority. It never covers edits, remove,
+# run, cancel, a future tool, workspace trust or an ordinary tool call.
+SCHEDULE_CREATE_ACTION = "schedule:create"
+SCHEDULE_SESSION_GRANT_SECONDS = 8 * 60 * 60
+SCHEDULE_ALWAYS_GRANT_DAYS = 30
+_MAX_SCHEDULE_GRANT_DAYS = 365
+_MAX_DENY_REASON_CHARS = 500
+_SCHEDULE_ACTIONS: dict[str, str] = {
+    "schedule_create": "schedule:create",
+    "schedule_edit": "schedule:edit",
+}
+
+
+def _bounded_deny_reason(value: Any) -> str:
+    text = str(value or "").strip().replace("\x00", "")
+    return text[:_MAX_DENY_REASON_CHARS]
 
 
 # A workspace trust is for ordinary development commands. Destructive,
@@ -107,9 +144,17 @@ class PermissionManagerImpl:
     inside an allowed root when workspace_only is enabled.
     """
 
-    def __init__(self, settings: Settings, events: EventBus | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        events: EventBus | None = None,
+        clock: Clock | None = None,
+    ) -> None:
         self.settings = settings
         self.events = events
+        # Expiry checks and audit timestamps share the injected clock so a
+        # frozen clock can test deadlines without sleeping.
+        self.clock = clock or SystemClock()
         self._roots = [settings.root.resolve()]
         for p in settings.security.allowed_roots:
             self._roots.append(settings.resolve(p).resolve())
@@ -117,12 +162,34 @@ class PermissionManagerImpl:
         self._reviewer: Callable[..., Awaitable[tuple[str, str]]] | None = None
         # (action, command, workspace) -> (expires_at, verdict, note)
         self._review_cache: dict[tuple[str, str, str], tuple[float, str, str]] = {}
+        # Phase 5 registers the one ScheduleService commit callback here. It is
+        # invoked inside the same transaction as the decision + grant + audit,
+        # so a failed schedule write rolls the approval back with it.
+        self._schedule_committer: Callable[..., Awaitable[Any]] | None = None
+
+    def _now(self) -> datetime:
+        return self.clock.now()
+
+    def _now_iso(self) -> str:
+        return self._now().isoformat()
 
     def set_reviewer(
         self, reviewer: Callable[..., Awaitable[tuple[str, str]]] | None
     ) -> None:
         """Install the smart-mode auto-reviewer (or clear it with None)."""
         self._reviewer = reviewer
+
+    def set_schedule_committer(
+        self, committer: Callable[..., Awaitable[Any]] | None
+    ) -> None:
+        """Install the one schedule commit authority (``ScheduleService``).
+
+        The callback receives ``card``, ``choice`` and ``resolver`` keyword
+        arguments and runs inside the decision transaction. It must not open a
+        second transaction. Passing ``None`` removes it; a card then resolves
+        without a schedule write, which only Phase 4 wiring and tests do.
+        """
+        self._schedule_committer = committer
 
     def _path_violation(self, resource: str | None) -> str | None:
         if not self.settings.security.workspace_only or not resource:
@@ -173,7 +240,7 @@ class PermissionManagerImpl:
             created = datetime.fromisoformat(str(row["created_at"]))
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - created > timedelta(seconds=self.settings.security.approval_timeout_seconds):
+            if self._now() - created > timedelta(seconds=self.settings.security.approval_timeout_seconds):
                 return False
         except (TypeError, ValueError):
             return False
@@ -321,7 +388,7 @@ class PermissionManagerImpl:
             await db.execute(
                 "INSERT INTO approvals(id,created_at,status,actor,action,resource,risk,reason,requested_by,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    approval_id, utcnow(), "pending", actor, action, resource, risk.value,
+                    approval_id, self._now_iso(), "pending", actor, action, resource, risk.value,
                     "high-risk action requires explicit approval", actor,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
@@ -367,7 +434,7 @@ class PermissionManagerImpl:
         cursor = await db.execute(
             "UPDATE approvals SET status='consumed', resolved_at=? "
             "WHERE id=? AND status='approved'",
-            (utcnow(), approval_id),
+            (self._now_iso(), approval_id),
         )
         return cursor.rowcount == 1
 
@@ -446,7 +513,7 @@ class PermissionManagerImpl:
                     exact = await db.fetchone(
                         "SELECT id FROM approval_grants WHERE action=? AND resource=? "
                         "AND expires_at > ? LIMIT 1",
-                        (action, _grant_scope(action, digest), utcnow()),
+                        (action, _grant_scope(action, digest), self._now_iso()),
                     )
                     if exact is not None:
                         return True
@@ -455,7 +522,7 @@ class PermissionManagerImpl:
                 rows = await db.fetchall(
                     "SELECT resource FROM approval_grants WHERE action=? "
                     "AND scope='workspace' AND expires_at > ?",
-                    (action, utcnow()),
+                    (action, self._now_iso()),
                 )
                 for item in rows or []:
                     if self._workspace_contains(str(item["resource"]), resource):
@@ -466,7 +533,7 @@ class PermissionManagerImpl:
             row = await db.fetchone(
                 "SELECT id FROM approval_grants WHERE action=? AND resource IS ? "
                 "AND expires_at > ? LIMIT 1",
-                (action, resource, utcnow()),
+                (action, resource, self._now_iso()),
             )
             return row is not None
         except Exception:  # noqa: BLE001 - a grant lookup must never crash a decision
@@ -502,7 +569,7 @@ class PermissionManagerImpl:
             stored_resource = str(resource)
             digest = ""
         grant_id = new_id("grn")
-        created = utcnow()
+        created = self._now_iso()
         expires = (datetime.fromisoformat(created) + timedelta(seconds=max(60, int(seconds)))).isoformat()
         metadata = json.dumps({"arguments_digest": digest}) if digest else "{}"
         await db.execute(
@@ -536,7 +603,7 @@ class PermissionManagerImpl:
             Path(str(workspace or self.settings.root)).expanduser().resolve()
         )
         grant_id = new_id("grn")
-        created = utcnow()
+        created = self._now_iso()
         expires = (datetime.fromisoformat(created) + timedelta(seconds=max(60, int(seconds)))).isoformat()
         await db.execute(
             "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,granted_by,scope,metadata) "
@@ -559,7 +626,7 @@ class PermissionManagerImpl:
         params: tuple[Any, ...] = ()
         if not include_expired:
             sql += " WHERE expires_at > ?"
-            params = (utcnow(),)
+            params = (self._now_iso(),)
         sql += " ORDER BY created_at DESC"
         rows = await db.fetchall(sql, params)
         return [dict(row) for row in rows or []]
@@ -577,6 +644,748 @@ class PermissionManagerImpl:
                     allowed=True, reason="approval grant revoked", risk=RiskLevel.LOW,
                 ),
             )
+        return revoked
+
+    # -- durable schedule consent cards -----------------------------------
+    async def _schedule_row(self, approval_id: str) -> Any:
+        row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (approval_id,))
+        if row is None:
+            raise KeyError(f"unknown approval: {approval_id}")
+        if not is_schedule_kind(row["kind"]):
+            raise ValueError(f"approval {approval_id} is not a schedule card")
+        return row
+
+    async def create_schedule_card(
+        self,
+        *,
+        kind: str,
+        body: str,
+        proposal_digest: str,
+        proposal_id: str | None = None,
+        schedule_id: str | None = None,
+        config_revision: int | None = None,
+        card_revision: int = 1,
+        title: str | None = None,
+        choices: Iterable[str] | None = None,
+        deny_only: bool = False,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+        origin: str | None = None,
+        requested_by: str | None = None,
+        actor: str | None = None,
+        resource: str | None = None,
+        proposed_at: str | None = None,
+        expires_at: str | None = None,
+        shown_first_run: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        """Persist one pending schedule consent card.
+
+        No schedule row is written here. The only write is the durable
+        approval row (plus its audit entry); Phase 5 commits the proposal after
+        a human chooses, inside :meth:`resolve_schedule_card`'s transaction.
+        """
+        from .approval_cards import ApprovalCard  # local import: keep module load light
+
+        if not is_schedule_kind(kind):
+            raise ValueError(f"not a schedule card kind: {kind!r}")
+        text = str(body or "")
+        if not text.strip():
+            raise ValueError("a schedule card needs a literal body")
+        if "\x00" in text:
+            raise ValueError("a schedule card body cannot contain a NUL byte")
+        digest = str(proposal_digest or "").strip()
+        if not digest:
+            raise ValueError("a schedule card needs a proposal digest")
+        config = kind_config(kind)
+        canonical = [str(item).strip().lower() for item in (choices or config.choices)]
+        if deny_only:
+            canonical = ["deny"]
+        for choice in canonical:
+            if normalize_choice(choice, kind) is None:
+                raise ValueError(f"invalid schedule card choice: {choice!r}")
+        labels = choice_labels_for(kind, canonical)
+        now = self._now()
+        created = proposed_at or now.isoformat()
+        timeout = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else getattr(self.settings.security, "approval_timeout_seconds", 900)
+        )
+        expiry = now + timedelta(seconds=max(1.0, timeout))
+        bounded_first = parse_instant(shown_first_run)
+        first_text = bounded_first.isoformat() if bounded_first is not None else None
+        if bounded_first is not None:
+            expiry = min(expiry, bounded_first)
+        explicit_expiry = parse_instant(expires_at)
+        if explicit_expiry is not None:
+            expiry = min(expiry, explicit_expiry)
+        approval_id = new_id("apr")
+        requester = str(requested_by or actor or "schedule").strip() or "schedule"
+        card = ApprovalCard(
+            protocol_version=APPROVAL_CARD_PROTOCOL_VERSION,
+            approval_id=approval_id,
+            proposal_id=proposal_id,
+            kind=kind,
+            status="pending",
+            title=str(title or config.header),
+            body=text,
+            choices=canonical,
+            choice_labels=labels,
+            deny_only=bool(deny_only),
+            card_revision=max(1, int(card_revision)),
+            proposal_digest=digest,
+            schedule_id=schedule_id,
+            config_revision=config_revision,
+            proposed_at=created,
+            deadline=deadline_text(kind, timeout),
+            expires_at=expiry.isoformat(),
+            shown_first_run=first_text,
+            conversation_id=conversation_id,
+            run_id=run_id,
+            tool_call_id=tool_call_id,
+            origin=origin,
+            requested_by=requester,
+        )
+        metadata = {
+            "proposal_id": proposal_id,
+            "proposal_digest": digest,
+            "schedule_id": schedule_id,
+            "config_revision": config_revision,
+            "deny_only": bool(deny_only),
+            "origin": origin,
+            "conversation_id": conversation_id,
+            "run_id": run_id,
+            "tool_call_id": tool_call_id,
+        }
+        await db.execute(
+            "INSERT INTO approvals(id,created_at,status,actor,action,resource,risk,"
+            "reason,requested_by,metadata,kind,protocol_version,proposal_id,digest,"
+            "choices,expires_at,origin,conversation_id,run_id,tool_call_id,"
+            "card_revision,presented_surface,deny_reason,card) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                approval_id, created, "pending", requester,
+                _SCHEDULE_ACTIONS[kind], resource or schedule_id or requester,
+                RiskLevel.HIGH.value, "schedule consent required", requester,
+                json.dumps(metadata, ensure_ascii=False),
+                kind, APPROVAL_CARD_PROTOCOL_VERSION, proposal_id, digest,
+                json.dumps(canonical, ensure_ascii=False), expiry.isoformat(),
+                origin, conversation_id, run_id, tool_call_id,
+                max(1, int(card_revision)), None, None,
+                json.dumps(card.model_dump(mode="json"), ensure_ascii=False),
+            ),
+        )
+        await self._audit(
+            requester, "schedule.consent.request", resource or schedule_id,
+            RiskLevel.HIGH,
+            Decision(
+                allowed=False, reason="schedule consent card created",
+                risk=RiskLevel.HIGH, requires_approval=True,
+                approval_id=approval_id,
+            ),
+            metadata={"proposal_id": proposal_id, "digest": digest, "kind": kind},
+        )
+        if self.events:
+            await self.events.emit("approval.requested", **card.event_payload())
+        return card
+
+    async def get_schedule_card(self, approval_id: str) -> Any | None:
+        row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (approval_id,))
+        if row is None or not is_schedule_kind(row["kind"]):
+            return None
+        return card_from_row(row)
+
+    async def get_approval_card(self, approval_id: str) -> Any | None:
+        """Project any approval kind (schedule or legacy command)."""
+        row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (approval_id,))
+        if row is None:
+            return None
+        return card_from_row(row)
+
+    async def schedule_cards(
+        self, *, status: str | None = "pending", include_command: bool = False
+    ) -> list[Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if include_command:
+            clauses.append("(kind IN (?,?) OR kind IS NULL OR kind='' OR kind='command')")
+            params += [KIND_SCHEDULE_CREATE, KIND_SCHEDULE_EDIT]
+        else:
+            clauses.append("kind IN (?,?)")
+            params += [KIND_SCHEDULE_CREATE, KIND_SCHEDULE_EDIT]
+        if status and str(status) != "all":
+            clauses.append("status=?")
+            params.append(str(status))
+        rows = await db.fetchall(
+            "SELECT * FROM approvals WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at, id",
+            tuple(params),
+        )
+        cards: list[Any] = []
+        for row in rows or []:
+            try:
+                cards.append(card_from_row(row))
+            except ValueError:
+                continue
+        return cards
+
+    async def present_schedule_card(
+        self,
+        approval_id: str,
+        *,
+        surface: str,
+        capabilities: Any = None,
+    ) -> Any:
+        """Record that the full card reached a capable surface.
+
+        ``shown_at`` is set once, on the first real presentation. Resolution
+        before this point is refused, so a tap cannot decide a card no human
+        could have seen. An incapable surface may not present a card at all.
+        """
+        row = await self._schedule_row(approval_id)
+        if str(row["status"]) != "pending":
+            raise ValueError(f"approval already {row['status']}")
+        caps = capabilities if capabilities is not None else surface_capabilities(surface)
+        if not caps.can_present_card or not caps.full_text:
+            raise PermissionError(
+                f"surface {surface!r} cannot present a full approval card"
+            )
+        card = card_from_row(row)
+        if not card_fits_surface(card, surface):
+            raise PermissionError(
+                f"approval card does not fit the {surface!r} presentation budget"
+            )
+        presenter = current_card_presenter()
+        if presenter is not None:
+            # Split-gateway transport: do not record shown_at until the process
+            # holding the adapter confirms the full card reached the surface.
+            try:
+                delivered = await presenter(approval_id, str(surface))
+            except Exception as exc:  # noqa: BLE001 - no transport, no card
+                raise PermissionError(
+                    f"card presentation failed on {surface!r}: {type(exc).__name__}"
+                ) from exc
+            if not delivered:
+                raise PermissionError(f"card was not delivered on {surface!r}")
+        now = self._now_iso()
+        # Two presenters can race on one card. Claim shown_at with a CAS on the
+        # empty value instead of trusting the earlier read; a retry sees the
+        # winner's row and only updates the surface. This is idempotent: a card
+        # already shown keeps its original timestamp.
+        for _attempt in range(3):
+            current = await self._schedule_row(approval_id)
+            if str(current["status"]) != "pending":
+                break
+            if current["shown_at"]:
+                await db.execute(
+                    "UPDATE approvals SET presented_surface=? WHERE id=?",
+                    (str(surface), approval_id),
+                )
+                break
+            cursor = await db.execute(
+                "UPDATE approvals SET shown_at=?, presented_surface=? "
+                "WHERE id=? AND status='pending' AND (shown_at IS NULL OR shown_at='')",
+                (now, str(surface), approval_id),
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) > 0:
+                break
+        card = await self.get_schedule_card(approval_id)
+        if self.events and card is not None:
+            await self.events.emit(
+                "approval.presented", surface=str(surface), **card.event_payload()
+            )
+        return card
+
+    async def acknowledge_schedule_card(self, approval_id: str, *, surface: str) -> Any:
+        """Record that a client received and displayed the card.
+
+        An acknowledgement is not a decision. It doubles as the web client's
+        presentation event: it records ``shown_at`` when the card was not
+        already presented, so a subsequent resolve is bound to a card that
+        reached a capable surface. A notification never calls this.
+        """
+        row = await self._schedule_row(approval_id)
+        if str(row["status"]) != "pending":
+            raise ValueError(f"approval already {row['status']}")
+        now = self._now_iso()
+        if not row["shown_at"]:
+            await db.execute(
+                "UPDATE approvals SET shown_at=?, presented_surface=?, "
+                "metadata=json_set(COALESCE(metadata,'{}'),"
+                "'$.acknowledged_at',?, '$.acknowledged_surface',?) WHERE id=?",
+                (now, str(surface), now, str(surface), approval_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+                "'$.acknowledged_at',?, '$.acknowledged_surface',?) WHERE id=?",
+                (now, str(surface), approval_id),
+            )
+        card = await self.get_schedule_card(approval_id)
+        if self.events and card is not None:
+            await self.events.emit(
+                "approval.acknowledged", surface=str(surface), **card.event_payload()
+            )
+        return card
+
+    async def wait_for_schedule_card(
+        self, approval_id: str, *, timeout: float | None = None
+    ) -> Any:
+        """Wait (bounded, poll-based) until the card leaves ``pending``.
+
+        A card past its own ``expires_at`` is marked expired first, so the
+        terminal copy is durable even if the waiting turn is interrupted.
+        """
+        bounded = float(
+            timeout
+            if timeout is not None
+            else getattr(self.settings.security, "approval_timeout_seconds", 900)
+        )
+        poll = max(
+            0.05,
+            float(getattr(self.settings.security, "approval_poll_seconds", 2.0)),
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, bounded)
+        while True:
+            card = await self.get_schedule_card(approval_id)
+            if card is None:
+                raise KeyError(f"unknown approval: {approval_id}")
+            if card.status != "pending":
+                return card
+            if at_or_after(card.expires_at, self._now()):
+                return await self._expire_schedule_card(approval_id)
+            if loop.time() >= deadline:
+                raise TimeoutError(f"approval {approval_id} is still pending")
+            await asyncio.sleep(min(poll, max(0.01, deadline - loop.time())))
+
+    async def _expire_schedule_card(
+        self, approval_id: str, *, stale: bool = False,
+        decline_override: str | None = None,
+    ) -> Any:
+        row = await self._schedule_row(approval_id)
+        card = card_from_row(row)
+        if card.status != "pending":
+            return card
+        config = kind_config(card.kind)
+        outcome = config.stale_outcome if stale else config.timeout_outcome
+        decline = decline_override or (
+            DECLINE_MESSAGES["stale_create"]
+            if stale and card.kind == KIND_SCHEDULE_CREATE
+            else DECLINE_MESSAGES["stale_edit"]
+            if stale
+            else DECLINE_MESSAGES["timeout"]
+        )
+        now = self._now_iso()
+        await db.execute(
+            "UPDATE approvals SET status='expired', answered_at=?, "
+            "metadata=json_set(COALESCE(metadata,'{}'),'$.resolved_by',?,"
+            "'$.outcome',?,'$.decline_message',?) "
+            "WHERE id=? AND status='pending'",
+            (now, "system:expiry", outcome, decline, approval_id),
+        )
+        await self._settle_schedule_proposal(row, "expired")
+        risk = RiskLevel(str(row["risk"]))
+        await self._audit(
+            "system:expiry", str(row["action"]), row["resource"], risk,
+            Decision(
+                allowed=False, reason=outcome, risk=risk, approval_id=approval_id,
+            ),
+            metadata={"approval_id": approval_id, "outcome": outcome},
+        )
+        expired = await self.get_schedule_card(approval_id)
+        if self.events and expired is not None:
+            await self.events.emit(
+                "approval.resolved",
+                **{
+                    **expired.event_payload(),
+                    "status": "expired",
+                    "resolver": "system:expiry",
+                },
+            )
+            await self.events.emit(
+                "schedule.expired", approval_id=approval_id, kind=expired.kind,
+                outcome=outcome,
+            )
+        return expired
+
+    @staticmethod
+    def _identity_key(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if text.startswith("operator:"):
+            text = text[len("operator:"):]
+        return text
+
+    def _assert_resolver_not_requester(self, card: Any, resolver: str) -> None:
+        resolver_text = str(resolver or "").strip().lower()
+        if not resolver_text:
+            raise PermissionError("an approval decision needs a resolver identity")
+        if resolver_text.startswith("chat:"):
+            # A chat actor is the requesting principal, never the human gate.
+            raise PermissionError("chat actors cannot resolve approvals")
+        requester = str(getattr(card, "requested_by", "") or "").strip()
+        if requester and self._identity_key(resolver) == self._identity_key(requester):
+            raise PermissionError("the requester cannot resolve its own approval")
+
+    async def resolve_schedule_card(
+        self,
+        approval_id: str,
+        *,
+        choice: str,
+        resolver: str,
+        confirm_proposal_digest: str | None,
+        deny_reason: str | None = None,
+        commit: Callable[..., Awaitable[Any]] | None = None,
+    ) -> ScheduleResolution:
+        """Atomically decide one schedule card.
+
+        The decision, a create grant (when the choice grants one) and the
+        optional schedule commit share one write transaction. Any failure —
+        wrong choice, stale digest, expired/stale/shown state, commit error —
+        leaves the approval pending and writes no grant or schedule.
+        """
+        committer = commit if commit is not None else self._schedule_committer
+        async with db.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT * FROM approvals WHERE id=?", (approval_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(f"unknown approval: {approval_id}")
+            if not is_schedule_kind(row["kind"]):
+                raise ValueError(f"approval {approval_id} is not a schedule card")
+            protocol = int(row["protocol_version"] or 0)
+            if protocol != APPROVAL_CARD_PROTOCOL_VERSION:
+                raise ValueError(
+                    f"unsupported approval card protocol: {protocol or 'legacy'}"
+                )
+            status = str(row["status"] or "")
+            if status != "pending":
+                raise ValueError(f"approval already {status}")
+            card = card_from_row(row)
+            self._assert_resolver_not_requester(card, resolver)
+            if not proposal_digest_matches(row, confirm_proposal_digest):
+                raise ValueError("proposal digest mismatch")
+            if card.proposal_digest and str(row["digest"]) != str(card.proposal_digest):
+                raise ValueError("stored card digest does not match the approval row")
+            if not row["shown_at"]:
+                raise PermissionError("approval card has not been presented")
+            now = self._now()
+            first_run = parse_instant(card.shown_first_run)
+            expires = parse_instant(row["expires_at"])
+            # A passed first run is the honest reason when it is the effective
+            # deadline; a shorter timeout still reports as a timeout.
+            if (
+                first_run is not None
+                and now >= first_run
+                and (expires is None or first_run <= expires)
+            ):
+                expired = await self._expire_schedule_card(approval_id, stale=True)
+                decline = (
+                    DECLINE_MESSAGES["stale_create"]
+                    if card.kind == KIND_SCHEDULE_CREATE
+                    else DECLINE_MESSAGES["stale_edit"]
+                )
+                return ScheduleResolution(
+                    approval_id=approval_id, kind=expired.kind,
+                    status="expired", allowed=False,
+                    reason=str(expired.outcome or "stale"),
+                    outcome=expired.outcome, decline_message=decline,
+                )
+            if at_or_after(row["expires_at"], now):
+                expired = await self._expire_schedule_card(approval_id)
+                return ScheduleResolution(
+                    approval_id=approval_id, kind=expired.kind,
+                    status="expired", allowed=False,
+                    reason=str(expired.outcome or "expired"),
+                    outcome=expired.outcome,
+                    decline_message=DECLINE_MESSAGES["timeout"],
+                )
+            canonical = normalize_choice(choice, card.kind)
+            if canonical is None:
+                raise ValueError(
+                    f"invalid choice {str(choice or '')!r} for a {card.kind} card"
+                )
+            if card.deny_only and canonical != "deny":
+                raise ValueError("this card is deny-only")
+            if canonical not in card.choices:
+                raise ValueError(f"choice {canonical!r} is not offered on this card")
+            config = kind_config(card.kind)
+            now_text = now.isoformat()
+            if canonical == "deny":
+                reason = _bounded_deny_reason(deny_reason) or "denied by operator"
+                await conn.execute(
+                    "UPDATE approvals SET status='denied', answered_at=?, "
+                    "deny_reason=?, metadata=json_set(COALESCE(metadata,'{}'),"
+                    "'$.resolved_by',?,'$.choice',?,'$.outcome',?,"
+                    "'$.decline_message',?) WHERE id=? AND status='pending'",
+                    (
+                        now_text, reason, str(resolver), canonical,
+                        config.deny_outcome, DECLINE_MESSAGES["denied"], approval_id,
+                    ),
+                )
+                await self._audit(
+                    str(resolver), str(row["action"]), row["resource"],
+                    RiskLevel(str(row["risk"])),
+                    Decision(
+                        allowed=False,
+                        reason=f"schedule consent denied: {reason}",
+                        risk=RiskLevel(str(row["risk"])), approval_id=approval_id,
+                    ),
+                    metadata={
+                        "approval_id": approval_id, "resolver": str(resolver),
+                        "choice": canonical, "kind": card.kind,
+                    },
+                )
+                await self._settle_schedule_proposal(row, "denied")
+                resolved = await self.get_schedule_card(approval_id)
+                if self.events and resolved is not None:
+                    await self.events.emit(
+                        "approval.resolved",
+                        **{
+                            **resolved.event_payload(),
+                            "status": "denied",
+                            "resolver": str(resolver),
+                            "choice": canonical,
+                        },
+                    )
+                    await self.events.emit(
+                        "schedule.denied", approval_id=approval_id, kind=card.kind,
+                        choice=canonical,
+                    )
+                return ScheduleResolution(
+                    approval_id=approval_id, kind=card.kind, status="denied",
+                    allowed=False, reason=f"schedule consent denied: {reason}",
+                    choice=canonical, outcome=config.deny_outcome,
+                    decline_message=DECLINE_MESSAGES["denied"],
+                )
+
+            grant_id: str | None = None
+            if card.kind == KIND_SCHEDULE_CREATE and canonical in {"session", "always"}:
+                grant_id = await self._insert_schedule_create_grant(
+                    card, canonical=canonical, granted_by=str(resolver)
+                )
+            commit_result: Any = None
+            if committer is not None:
+                # Must run inside this transaction; a failure rolls the
+                # approval update, grant and audit back together.
+                try:
+                    commit_result = await committer(
+                        card=card, choice=canonical, resolver=str(resolver)
+                    )
+                except ValueError as exc:
+                    # A CAS loss/removal discovered at commit time is an expired
+                    # edit, never an exception with a pending card. A row that
+                    # is now paused/disabled gets its own honest decline instead
+                    # of being blamed on a passed run time.
+                    code = getattr(exc, "code", "")
+                    if (
+                        card.kind != KIND_SCHEDULE_EDIT
+                        or code not in {"stale_update", "unknown_schedule", "disabled_update"}
+                    ):
+                        raise
+                    decline = (
+                        DECLINE_MESSAGES["disabled_edit"]
+                        if code == "disabled_update"
+                        else DECLINE_MESSAGES["stale_edit"]
+                    )
+                    expired = await self._expire_schedule_card(
+                        approval_id, stale=True, decline_override=decline
+                    )
+                    return ScheduleResolution(
+                        approval_id=approval_id, kind=expired.kind,
+                        status="expired", allowed=False,
+                        reason=str(exc) or str(expired.outcome or "stale"),
+                        outcome=expired.outcome,
+                        decline_message=decline,
+                    )
+            committed_schedule = (
+                commit_result.get("schedule_id")
+                if isinstance(commit_result, Mapping)
+                else None
+            ) or card.schedule_id
+            await conn.execute(
+                "UPDATE approvals SET status='approved', answered_at=?, "
+                "metadata=json_set(COALESCE(metadata,'{}'),'$.resolved_by',?,"
+                "'$.choice',?,'$.outcome',?,'$.grant_id',?,"
+                "'$.schedule_id',?) WHERE id=? AND status='pending'",
+                (
+                    now_text, str(resolver), canonical, config.allow_outcome,
+                    grant_id, committed_schedule, approval_id,
+                ),
+            )
+            await self._audit(
+                str(resolver), str(row["action"]), row["resource"],
+                RiskLevel(str(row["risk"])),
+                Decision(
+                    allowed=True, reason=f"schedule consent approved: {canonical}",
+                    risk=RiskLevel(str(row["risk"])), approval_id=approval_id,
+                ),
+                metadata={
+                    "approval_id": approval_id, "resolver": str(resolver),
+                    "choice": canonical, "kind": card.kind,
+                    "grant_id": grant_id, "schedule_id": committed_schedule,
+                },
+            )
+            resolved = await self.get_schedule_card(approval_id)
+            if self.events and resolved is not None:
+                await self.events.emit(
+                    "approval.resolved",
+                    **{
+                        **resolved.event_payload(),
+                        "status": "approved",
+                        "resolver": str(resolver),
+                        "choice": canonical,
+                        "grant_id": grant_id,
+                    },
+                )
+                await self.events.emit(
+                    "schedule.approved", approval_id=approval_id, kind=card.kind,
+                    choice=canonical, schedule_id=committed_schedule,
+                )
+            return ScheduleResolution(
+                approval_id=approval_id, kind=card.kind, status="approved",
+                allowed=True, reason=f"schedule consent approved: {canonical}",
+                choice=canonical, outcome=config.allow_outcome,
+                grant_id=grant_id, schedule_id=committed_schedule,
+                commit_result=commit_result,
+            )
+
+    async def _insert_schedule_create_grant(
+        self, card: Any, *, canonical: str, granted_by: str
+    ) -> str:
+        """Insert/renew one conversation- or profile-scoped create grant.
+
+        Edit cards never reach this method: edits have no grant. The action is
+        ``schedule:create``, so this row can never satisfy an ordinary tool,
+        workspace trust or lifecycle check.
+        """
+        principal = str(getattr(card, "requested_by", "") or "").strip()
+        if not principal:
+            raise ValueError("a schedule create grant needs a requesting principal")
+        if canonical == "session":
+            conversation_id = str(getattr(card, "conversation_id", "") or "").strip()
+            if not conversation_id:
+                raise ValueError(
+                    "a session schedule grant needs the conversation it covers"
+                )
+            subject_type, subject_id = "conversation", conversation_id
+            seconds = SCHEDULE_SESSION_GRANT_SECONDS
+        else:
+            days = int(
+                getattr(
+                    self.settings.security,
+                    "schedule_always_grant_days",
+                    SCHEDULE_ALWAYS_GRANT_DAYS,
+                )
+                or SCHEDULE_ALWAYS_GRANT_DAYS
+            )
+            days = max(1, min(_MAX_SCHEDULE_GRANT_DAYS, days))
+            subject_type, subject_id = "profile", principal
+            seconds = days * 86400
+        created = self._now()
+        expires = (created + timedelta(seconds=seconds)).isoformat()
+        existing = await db.fetchone(
+            "SELECT id,expires_at FROM approval_grants WHERE principal=? "
+            "AND subject_type=? AND subject_id=? AND action=? "
+            "AND revoked_at IS NULL LIMIT 1",
+            (principal, subject_type, subject_id, SCHEDULE_CREATE_ACTION),
+        )
+        if existing is not None:
+            grant_id = str(existing["id"])
+            if str(existing["expires_at"]) < expires:
+                await db.execute(
+                    "UPDATE approval_grants SET expires_at=? WHERE id=?",
+                    (expires, grant_id),
+                )
+        else:
+            grant_id = new_id("grn")
+            resource = f"{subject_type}:{subject_id}"
+            await db.execute(
+                "INSERT INTO approval_grants(id,created_at,expires_at,action,"
+                "resource,granted_by,scope,metadata,principal,subject_type,"
+                "subject_id,conversation_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    grant_id, created.isoformat(), expires, SCHEDULE_CREATE_ACTION,
+                    resource, str(granted_by), subject_type,
+                    json.dumps(
+                        {"kind": KIND_SCHEDULE_CREATE, "choice": canonical},
+                        ensure_ascii=False,
+                    ),
+                    principal, subject_type, subject_id,
+                    str(getattr(card, "conversation_id", "") or "") or None,
+                ),
+            )
+        if self.events:
+            await self.events.emit(
+                "approval.granted", grant_id=grant_id, action=SCHEDULE_CREATE_ACTION,
+                resource=f"{subject_type}:{subject_id}",
+                granted_by=str(granted_by), scope=subject_type,
+                principal=principal, subject_id=subject_id,
+            )
+        return grant_id
+
+    async def has_live_schedule_create_grant(
+        self,
+        *,
+        principal: str,
+        conversation_id: str | None = None,
+        profile: str | None = None,
+    ) -> bool:
+        """True when a live create grant covers this principal/conversation.
+
+        Session grants are keyed by conversation; always grants by profile.
+        Manual approval mode ignores grants, like ordinary approvals do.
+        """
+        if str(getattr(self.settings.security, "approval_mode", "smart")) == "manual":
+            return False
+        principal_text = str(principal or "").strip()
+        if not principal_text:
+            return False
+        profile_text = str(profile or principal_text).strip()
+        try:
+            row = await db.fetchone(
+                "SELECT id FROM approval_grants WHERE action=? "
+                "AND principal=? AND revoked_at IS NULL AND expires_at > ? "
+                "AND ((subject_type='conversation' AND subject_id=?) "
+                "OR (subject_type='profile' AND subject_id=?)) LIMIT 1",
+                (
+                    SCHEDULE_CREATE_ACTION, principal_text, self._now_iso(),
+                    str(conversation_id or ""), profile_text,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - a grant lookup must never crash a decision
+            return False
+        return row is not None
+
+    async def revoke_schedule_grant(
+        self, grant_id: str, *, actor: str = "operator"
+    ) -> bool:
+        """Revoke one schedule create grant; the row and audit are retained."""
+        now = self._now_iso()
+        cursor = await db.execute(
+            "UPDATE approval_grants SET revoked_at=? WHERE id=? "
+            "AND action=? AND revoked_at IS NULL",
+            (now, grant_id, SCHEDULE_CREATE_ACTION),
+        )
+        revoked = bool(getattr(cursor, "rowcount", 0))
+        if revoked:
+            await self._audit(
+                str(actor), "approval.grant.revoke", grant_id, RiskLevel.LOW,
+                Decision(
+                    allowed=True, reason="schedule create grant revoked",
+                    risk=RiskLevel.LOW,
+                ),
+                metadata={"grant_id": grant_id, "action": SCHEDULE_CREATE_ACTION},
+            )
+            if self.events:
+                await self.events.emit(
+                    "approval.grant.revoke", grant_id=grant_id,
+                    action=SCHEDULE_CREATE_ACTION, revoked_by=str(actor),
+                )
         return revoked
 
     async def resolve_approval(self, approval_id: str, approved: bool, resolver: str = "user") -> Decision:
@@ -616,7 +1425,7 @@ class PermissionManagerImpl:
                 "UPDATE approvals SET status=?, resolved_at=?, "
                 "metadata=json_set(COALESCE(metadata,'{}'),'$.resolved_by',?) "
                 "WHERE id=? AND status='pending'",
-                (status, utcnow(), resolver_name, approval_id),
+                (status, self._now_iso(), resolver_name, approval_id),
             )
             if update.rowcount != 1:
                 raise ValueError(f"approval already {row['status']}")
@@ -676,9 +1485,9 @@ class PermissionManagerImpl:
         if source_name and source_name.startswith("chat:"):
             raise ValueError("cleanup cannot be scoped to a chat actor")
 
-        # utcnow() is an ISO string, so the cutoff stays the same shape and
+        # self._now_iso() is an ISO string, so the cutoff stays the same shape and
         # the SQL comparison stays lexicographic-safe.
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=older_than_hours)).isoformat()
+        cutoff = (self._now() - timedelta(hours=older_than_hours)).isoformat()
         where = "status='pending' AND created_at<=?"
         params: list[Any] = [cutoff]
         if source_name:
@@ -708,7 +1517,7 @@ class PermissionManagerImpl:
                     "UPDATE approvals SET status='expired', resolved_at=?, "
                     "metadata=json_set(COALESCE(metadata,'{}'),'$.resolved_by',?) "
                     "WHERE id=? AND status='pending'",
-                    (utcnow(), resolver_name, row["id"]),
+                    (self._now_iso(), resolver_name, row["id"]),
                 )
                 if cursor.rowcount != 1:
                     continue  # resolved concurrently; leave the row alone
@@ -741,5 +1550,35 @@ class PermissionManagerImpl:
     ) -> None:
         await db.execute(
             "INSERT INTO audit_log(ts,actor,action,resource,risk,decision,reason,metadata) VALUES(?,?,?,?,?,?,?,?)",
-            (utcnow(), actor, action, resource, risk.value, "allowed" if decision.allowed else ("pending" if decision.requires_approval else "denied"), decision.reason, json.dumps(metadata or {}, default=str)),
+            (self._now_iso(), actor, action, resource, risk.value, "allowed" if decision.allowed else ("pending" if decision.requires_approval else "denied"), decision.reason, json.dumps(metadata or {}, default=str)),
+        )
+
+    async def record_audit(
+        self, actor: str, action: str, resource: str | None, risk: RiskLevel,
+        decision: Decision, metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Public seam for the schedule authority's direct operator writes.
+
+        ScheduleService is the only writer of a direct/operator schedule
+        mutation; it still records every such write through this one audit
+        helper so the decision log has a single shape and timestamp source.
+        """
+        await self._audit(actor, action, resource, risk, decision, metadata)
+
+    async def _settle_schedule_proposal(self, row: Any, status: str) -> None:
+        """Release a proposal reservation after a deny/timeout.
+
+        A pending proposal holds an active schedule name through a partial
+        unique index. When a human denies or lets the card expire, the proposal
+        must leave ``pending`` in the same durable step or that name stays
+        blocked forever.
+        """
+        keys = row.keys() if hasattr(row, "keys") else ()
+        proposal_id = row["proposal_id"] if "proposal_id" in keys else None
+        if not proposal_id:
+            return
+        await db.execute(
+            "UPDATE schedule_proposals SET status=?, updated_at=? "
+            "WHERE id=? AND status='pending'",
+            (str(status), self._now_iso(), str(proposal_id)),
         )

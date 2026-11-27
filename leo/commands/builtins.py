@@ -2251,7 +2251,20 @@ async def approvals_command(ctx: CommandContext) -> CommandResult:
             "Approval modes are configured in leo.yaml; no runtime mode switch is implemented.",
         )
     pending = await ctx.app.permissions.pending_approvals()
-    return _summary(ctx, "approvals", f"{len(pending)} pending approvals", {"approvals": pending})
+    cards = []
+    try:
+        cards = [
+            card.model_dump(mode="json")
+            for card in await ctx.app.permissions.schedule_cards(
+                status="pending", include_command=False
+            )
+        ]
+    except Exception:  # noqa: BLE001 - the raw list is still truthful
+        cards = []
+    return _summary(
+        ctx, "approvals", f"{len(pending)} pending approvals",
+        {"approvals": pending, "cards": cards},
+    )
 
 
 async def _resolve(ctx: CommandContext, approved: bool) -> CommandResult:
@@ -2262,6 +2275,20 @@ async def _resolve(ctx: CommandContext, approved: bool) -> CommandResult:
             "chat actors can never resolve their own approvals.",
         )
     approval_id = ctx.require(0, "approval id")
+    # A schedule card needs a full-text surface that can present and rewrite
+    # it. The blocking CLI is intentionally incapable; refuse here instead of
+    # pretending the choice was shown. Ordinary command approvals are unchanged.
+    row = await db.fetchone("SELECT kind FROM approvals WHERE id=?", (approval_id,))
+    if row is not None and str(row["kind"] or "") in {
+        "schedule_create", "schedule_edit"
+    }:
+        return CommandResult.error(
+            "approve" if approved else "deny",
+            "Schedule cards must be decided on the TUI, desktop/web card view or "
+            "an answerable Telegram card; the CLI surface cannot present the full "
+            "job. Open /approvals in the TUI to decide it.",
+            code="schedule_card_requires_surface",
+        )
     result = await ctx.app.operator_resolve_approval(
         approval_id, approved, actor=f"operator:{ctx.principal}"
     )

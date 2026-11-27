@@ -29,7 +29,7 @@ class FakeAdapter:
         self.edits.append((str(message_id), text))
         return True
 
-    async def typing(self, target):
+    async def send_typing(self, target):
         return None
 
 

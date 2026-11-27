@@ -15,9 +15,18 @@ from typing import Any
 
 from .. import db
 from ..config import Settings
-from ..contracts import Decision, RiskLevel, ToolCall, ToolResult, new_id, utcnow
+from ..contracts import (
+    Decision,
+    RiskLevel,
+    ToolCall,
+    ToolResult,
+    current_turn_context,
+    new_id,
+    utcnow,
+)
 from ..events import Event, EventBus
 from ..logging import get_logger
+from ..schedules.scan import redact_secrets, scan_text
 from ..security.permissions import ApprovalRequired, PermissionManagerImpl, arguments_digest
 from ..security.risk_policy import assess_call
 from .registry import ToolRegistration, ToolRegistry, _validate_value
@@ -37,6 +46,46 @@ _CONFIGURED_TIMEOUTS: dict[str, str] = {
 }
 _RESOURCE_KEYS = ("path", "cwd", "resource", "file", "directory", "root", "target")
 
+# A turn that no human is watching cannot obtain a fresh approval, and schedule
+# consent never authorizes a future side effect. These sources are refused for
+# the side-effect classes below before PermissionManager can (invisibly) park
+# an approval the scheduled run could never answer.
+_UNATTENDED_SOURCES = frozenset({"scheduled", "schedule", "unattended"})
+_UNATTENDED_RISKS = frozenset({RiskLevel.MEDIUM, RiskLevel.HIGH})
+# INVARIANT: the unattended gate classifies side effects by CATEGORY first and
+# consults this allowlist only afterwards (see _unattended_denial). The name
+# list is not a blanket permission: it only exempts read-only inspection and
+# research fetches from the MEDIUM/HIGH rule. A LOW-tier outbound send is still
+# a side effect and must stay denied. Never reorder the check to "allowlist
+# first, category later" or add an outbound/browser/computer/plugin/shell tool
+# here: that is exactly the reply-to-origin bypass this gate was written to
+# close. Every new allowlist entry needs a test proving an unattended side
+# effect is still refused regardless of its risk tier.
+# The MEDIUM/HIGH calls an unattended turn may make: state inspection and
+# read-only research fetches. Everything else that writes, mutates memory,
+# creates tasks/schedules or edits files is refused even when its tool category
+# is uncategorized. Outbound sends are refused by category below, including a
+# reply into the originating conversation; scheduled results use the engine's
+# delivery lane, not this tool path.
+_UNATTENDED_ALLOWED_TOOLS = frozenset(
+    {
+        "read_file", "list_files", "search_files", "schedule_list",
+        "schedule_get", "task_list", "task_status", "metrics_snapshot",
+        "webhook_verify",
+        # Outbound send names (channel_send/gateway.send/send_message) are
+        # classified by name before this list is consulted, so they can never
+        # be allowlisted here - even at LOW risk or under a benign category.
+        # Read-only research fetches are the most natural scheduled network
+        # work. They are MEDIUM by registration but write no local state; the
+        # egress policy in their handlers remains the authority on destinations.
+        "http_get", "http_json", "http_json_paths",
+    }
+)
+_OUTBOUND_TOOLS = frozenset({"channel_send", "gateway.send", "send_message"})
+_OUTBOUND_CATEGORIES = frozenset(
+    {"outbound", "messaging", "channel", "channels", "integrations"}
+)
+
 # No-progress guard, tool side: after this many failures of the SAME class in
 # one turn, emit one consolidated hint telling the model to stop retrying
 # variants. This is advisory text only - no permission or quota decision is
@@ -46,6 +95,13 @@ _HINT_HISTORY_TTL_SECONDS = 300.0
 _HINT_HISTORY_MAX_KEYS = 128
 # An idle gap on the same conversation key means a new user turn began.
 _TURN_IDLE_SECONDS = 60.0
+# Operator notices are deduplicated per trusted turn id. The map is bounded in
+# size; legacy callers without a turn id still get the idle time window. A new
+# trusted turn always gets its own notice even when it shares a correlation id
+# or arrives milliseconds after the previous one. Denials themselves are never
+# dropped from tool_calls/audit_log.
+_NOTICE_HISTORY_MAX_KEYS = 128
+_NOTICE_WINDOW_SECONDS = _TURN_IDLE_SECONDS
 _ERROR_FIELD_RE = re.compile(r"field '([^']+)'")
 # A timeout on a binary payload is a tool-choice problem, not a reason to retry
 # the same command with a bigger timeout. The 30s deadline itself is untouched.
@@ -157,12 +213,17 @@ class _QuotaExceeded(Exception):
 
 
 def redact_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
-    """Recursively apply redaction patterns to strings in a tool result."""
+    """Recursively apply configured and intrinsic redaction to a string.
+
+    Sink redaction is the last line of defence for *any* tool, not only the
+    opt-in tools that refuse a secret before dispatch: a credential passed to
+    an ordinary tool must still not survive in tool_calls/audit/events/logs.
+    """
     if isinstance(value, str):
         text = value
         for pattern in patterns:
             text = pattern.sub("[REDACTED]", text)
-        return text
+        return redact_secrets(text)
     if isinstance(value, dict):
         return {redact_value(k, patterns): redact_value(v, patterns) for k, v in value.items()}
     if isinstance(value, list):
@@ -202,6 +263,9 @@ class ToolExecutorImpl:
         # Per-turn retry counters for advisory hints only (never a policy gate).
         self._failure_history: dict[tuple[str, str], dict[str, Any]] = {}
         self._history_lock = threading.Lock()
+        # Per-turn claims for operator-visible needs-you notices. This only
+        # suppresses duplicate notices; it never suppresses a denial or audit.
+        self._notice_history: dict[tuple[str, str], float] = {}
         # Quotas live in SQLite (tool_quotas), not in this process: restarts and
         # multiple workers see the same counters. Only actually dispatched
         # calls are charged; invalid, denied and dry-run calls stay free.
@@ -517,19 +581,42 @@ class ToolExecutorImpl:
             "correlation_id": call.correlation_id,
             "call_id": call.id,
             "dry_run": dry_run,
+            # Trusted internal proof only; never populated from tool arguments.
+            "authorization": getattr(call, "authorization", None),
         }
+        workdir = getattr(call, "workdir", None)
+        if isinstance(workdir, str) and workdir.strip():
+            # Trusted adapter-provided anchor. Path tools still call
+            # ``_safe_path`` so this can never widen the allowed roots.
+            ctx["workdir"] = workdir
+        turn = current_turn_context()
+        if turn is not None:
+            # The trusted, task-local turn facts are the authority. A tool sees
+            # the principal/source/surface that the entry point actually had,
+            # not a channel name guessed from the caller or a request body.
+            ctx["turn_context"] = turn.model_dump(mode="json")
+            ctx["principal"] = turn.principal
+            ctx["source"] = turn.source
+            ctx["surface"] = turn.surface
+            ctx["thread_id"] = turn.thread_id
+            ctx["origin_context"] = {
+                "channel": turn.channel,
+                "target": turn.target or "",
+                "conversation_id": turn.conversation_id or "",
+            }
         # Real service objects, never monkeypatched stand-ins: toolsets resolve
         # their dependencies from ``ctx['services']`` on every call. An empty
         # mapping is omitted so registration-time service injection still works.
         if self.services:
             ctx["services"] = dict(self.services)
-            # The origin chat of the turn in flight, when one is known: a
-            # background task created in this turn reports its progress there.
-            # Read once here so a tool can never mutate the app's copy.
-            app = self.services.get("app")
-            origin = getattr(app, "_turn_origin", None)
-            if isinstance(origin, dict) and origin:
-                ctx["origin_context"] = dict(origin)
+            if turn is None:
+                # Compatibility snapshot for legacy tools and direct executor
+                # callers. It is a read-only copy and never an authority: the
+                # app-global dict is racy across concurrent turns.
+                app = self.services.get("app")
+                origin = getattr(app, "_turn_origin", None)
+                if isinstance(origin, dict) and origin:
+                    ctx["origin_context"] = dict(origin)
         return ctx
 
     @staticmethod
@@ -556,14 +643,29 @@ class ToolExecutorImpl:
 
     @staticmethod
     def _turn_key(call: ToolCall) -> tuple[str, str]:
-        """Scope retry counters to one actor/turn without trusting the handler."""
-        turn = (
-            getattr(call, "turn_id", None)
-            or getattr(call, "task_id", None)
+        """Scope retry counters to one actor and one trusted turn.
+
+        ``turn_id`` is minted on TurnContext at the trusted entry point and
+        copied onto calls by ``tool_fields()``; it is never taken from tool
+        arguments. The first tuple item marks a trusted turn so notice dedupe
+        can skip the idle time window: two calls in the same turn dedupe forever
+        and two different turns never dedupe, even with the same correlation id.
+        Legacy callers with no turn id keep the bounded time-window fallback.
+        """
+        actor = str(getattr(call, "actor", None) or "anonymous")
+        trusted = str(getattr(call, "turn_id", "") or "").strip()
+        if not trusted:
+            turn = current_turn_context()
+            if turn is not None:
+                trusted = str(getattr(turn, "turn_id", "") or "").strip()
+        if trusted:
+            return ("turn", f"{actor}:{trusted}")
+        legacy = (
+            getattr(call, "task_id", None)
             or call.correlation_id
             or "default"
         )
-        return (str(getattr(call, "actor", None) or "anonymous"), str(turn))
+        return ("legacy", f"{actor}:{legacy}")
 
     def _policy_hint(
         self, call: ToolCall, decision: str, error: str
@@ -607,6 +709,159 @@ class ToolExecutorImpl:
         }
         return text, payload
 
+    @staticmethod
+    def _resolved_source(call: ToolCall, turn: Any) -> str:
+        """Trusted provenance: the call's own field, else the current turn."""
+        explicit = str(getattr(call, "source", "") or "").strip()
+        if explicit:
+            return explicit
+        if turn is not None:
+            return str(getattr(turn, "source", "") or "").strip()
+        return ""
+
+    @staticmethod
+    def _resolved_origin(call: ToolCall, turn: Any) -> str:
+        explicit = str(getattr(call, "origin", "") or "").strip()
+        if explicit:
+            return explicit
+        if turn is not None:
+            return str(getattr(turn, "origin", "") or "").strip()
+        return ""
+
+    @staticmethod
+    def _side_effect_category(registration: ToolRegistration) -> str | None:
+        """Classify a tool that can reach outside LEO's local state."""
+        spec = registration.spec
+        name = str(getattr(spec, "name", "") or "")
+        category = str(getattr(spec, "category", "") or "").strip().lower()
+        if name in _OUTBOUND_TOOLS or category in _OUTBOUND_CATEGORIES:
+            return "outbound"
+        if name.startswith("browser_") or category == "browser":
+            return "browser"
+        if name.startswith("computer_") or category == "computer":
+            return "computer"
+        if name.startswith("plugin_") or category in {"plugin", "plugins"}:
+            return "plugin"
+        if name in {"shell", "terminal"}:
+            return "shell"
+        return None
+
+    def _unattended_denial(
+        self,
+        registration: ToolRegistration,
+        risk: RiskLevel,
+        source: str,
+    ) -> str | None:
+        """Return the side-effect class for a refused unattended call."""
+        if source not in _UNATTENDED_SOURCES:
+            return None
+        # Category is authority over tier: a reply into the originating
+        # conversation is LOW for attended turns, but an unattended turn has no
+        # human on the other end. Every outbound/browser/computer/plugin/shell
+        # side effect is refused here. Scheduled results are delivered by the
+        # task engine's delivery lane, which never dispatches through this gate.
+        category = self._side_effect_category(registration)
+        if category is not None:
+            return category
+        if risk not in _UNATTENDED_RISKS:
+            return None
+        name = str(getattr(getattr(registration, "spec", None), "name", "") or "")
+        if name in _UNATTENDED_ALLOWED_TOOLS:
+            return None
+        return "side_effect"
+
+    def _secret_preflight(
+        self, call: ToolCall
+    ) -> tuple[str, str, str | None] | None:
+        """Scan every model-supplied string before it can reach a durable sink.
+
+        Returns ``(category, rule, digest)`` on refusal. The raw offending text
+        is intentionally not returned: callers persist only the digest and the
+        stable finding category/rule.
+        """
+        findings: list[tuple[str, str]] = []
+        for text in _iter_strings(call.arguments):
+            if not isinstance(text, str):
+                continue
+            report = scan_text(text, scope="prompt")
+            for finding in report.findings:
+                findings.append((finding.code, finding.rule))
+        if not findings:
+            return None
+        category, rule = findings[0]
+        return category, rule, arguments_digest(call.arguments)
+
+    async def _emit_needs_you(
+        self,
+        call: ToolCall,
+        risk: RiskLevel,
+        category: str,
+        source: str,
+        origin: str,
+        turn: Any,
+    ) -> None:
+        """Emit one durable operator-visible notice per unattended turn.
+
+        Repeated refusals in one turn share a single notice; every refusal is
+        still denied, audited and returned to the model separately. This is a
+        notice, never an approval: it carries no authority and no approval row
+        is created. EventBus persists it after any open write transaction
+        commits, so a rollback cannot expose a phantom notice.
+        """
+        key = self._turn_key(call)
+        now = time.monotonic()
+        with self._history_lock:
+            history = self._notice_history
+            if len(history) >= _NOTICE_HISTORY_MAX_KEYS:
+                for stale in [k for k, seen in history.items()
+                              if now - seen > _NOTICE_WINDOW_SECONDS]:
+                    history.pop(stale, None)
+                while len(history) >= _NOTICE_HISTORY_MAX_KEYS:
+                    oldest = min(history, key=lambda k: history[k])
+                    history.pop(oldest, None)
+            seen = history.get(key)
+            trusted_turn = key[0] == "turn"
+            if seen is not None and (
+                trusted_turn or now - seen <= _NOTICE_WINDOW_SECONDS
+            ):
+                return
+            history[key] = now
+        try:
+            await self.events.publish(
+                Event(
+                    topic="automation.needs_you",
+                    source="automation",
+                    payload=self._redact({
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "category": category,
+                        "risk": risk.value,
+                        "source": source,
+                        "origin": origin or None,
+                        "principal": getattr(turn, "principal", None)
+                        or getattr(call, "principal", None),
+                        "conversation_id": getattr(turn, "conversation_id", None)
+                        or getattr(call, "conversation_id", None),
+                        "thread_id": getattr(turn, "thread_id", None)
+                        or getattr(call, "thread_id", None),
+                        "reason": (
+                            "An unattended turn tried a side effect and was stopped. "
+                            "Approve or run it from an attended turn if it is intended."
+                        ),
+                    }),
+                    correlation_id=call.correlation_id,
+                    created_at=utcnow(),
+                )
+            )
+        except Exception:  # noqa: BLE001 - a notice failure must not change the denial
+            # Release the claim so a later refusal in the same turn can retry
+            # the notice instead of losing it entirely.
+            with self._history_lock:
+                if self._notice_history.get(key) == now:
+                    self._notice_history.pop(key, None)
+            _LOG.exception("failed to emit automation.needs_you notice",
+                           extra={"tool": call.name})
+
     async def execute(
         self,
         call: ToolCall,
@@ -617,6 +872,9 @@ class ToolExecutorImpl:
         granted_permissions: Any = None,
     ) -> ToolResult:
         started = time.perf_counter()
+        turn = current_turn_context()
+        source = self._resolved_source(call, turn)
+        origin = self._resolved_origin(call, turn)
         # Some callers attach the approval id to the call record instead of
         # passing it as an explicit argument; both forms are accepted.
         approval_id = approval_id or getattr(call, "approval_id", None)
@@ -633,6 +891,13 @@ class ToolExecutorImpl:
         error: str | None = None
         output: Any = None
         metadata: dict[str, Any] = {"risk_reason": risk_reason}
+        if source:
+            metadata["source"] = source
+        if origin:
+            metadata["origin"] = origin
+        # On a secret refusal only this sanitized projection may be persisted;
+        # the raw rejected arguments must never reach tool_calls/audit/events.
+        persist_arguments: Any | None = None
         success = False
         raised: BaseException | None = None
         resource: str | None = None
@@ -649,9 +914,31 @@ class ToolExecutorImpl:
                 error = f"tool {call.name!r} is outside the caller's declared tool scope"
             else:
                 errors = self.registry.validate(call.name, call.arguments)
+                secret_refusal = (
+                    self._secret_preflight(call)
+                    if not errors and getattr(registration.spec, "secret_scan", False)
+                    else None
+                )
                 if errors:
                     decision = "invalid_arguments"
                     error = "invalid arguments: " + "; ".join(errors)
+                elif secret_refusal is not None:
+                    # Pre-persistence safety: refuse before authorization,
+                    # quota charging, handler dispatch or any durable record.
+                    category, rule, digest = secret_refusal
+                    decision = "denied"
+                    error = (
+                        "tool call refused by secret preflight "
+                        f"({category}/{rule})"
+                    )
+                    metadata["secret_refusal"] = {
+                        "digest": digest, "category": category, "rule": rule,
+                    }
+                    persist_arguments = {
+                        "refused": category,
+                        "rule": rule,
+                        "digest": digest,
+                    }
                 elif (
                     policy_error := shell_preflight(
                         call.name, call.arguments, self.settings
@@ -662,6 +949,28 @@ class ToolExecutorImpl:
                     decision = "denied"
                     error = policy_error
                     metadata["policy"] = "shell"
+                elif (
+                    unattended_category := self._unattended_denial(
+                        registration, risk, source
+                    )
+                ) is not None:
+                    # An unattended turn cannot answer an approval and schedule
+                    # consent never authorizes a future side effect. Refuse
+                    # before PermissionManager so no invisible approval row is
+                    # created; leave one durable operator-visible notice.
+                    decision = "denied"
+                    error = (
+                        "unattended "
+                        f"{unattended_category} side effect denied before approval"
+                    )
+                    metadata["unattended_gate"] = {
+                        "source": source,
+                        "category": unattended_category,
+                        "risk": risk.value,
+                    }
+                    await self._emit_needs_you(
+                        call, risk, unattended_category, source, origin, turn,
+                    )
                 elif (
                     missing := self.permissions.missing_capabilities(
                         registration.spec.permissions, effective_grants
@@ -828,7 +1137,7 @@ class ToolExecutorImpl:
             error = self._redact(error)
         await self._record(
             call, risk.value, decision, success, duration_ms, error, output,
-            metadata, resource, task_key,
+            metadata, resource, task_key, persist_arguments=persist_arguments,
         )
         if raised is not None:
             raise raised
@@ -856,10 +1165,17 @@ class ToolExecutorImpl:
         metadata: dict[str, Any],
         resource: str | None,
         task_key: str,
+        *,
+        persist_arguments: Any | None = None,
     ) -> None:
         call_id = call.id or new_id("call")
+        # A secret refusal supplies a digest/category projection instead of the
+        # raw arguments, so the rejected credential can never reach a sink.
+        recorded_arguments = (
+            persist_arguments if persist_arguments is not None else call.arguments
+        )
         args_json = self._redact(
-            json.dumps(call.arguments, ensure_ascii=False, default=str)
+            json.dumps(recorded_arguments, ensure_ascii=False, default=str)
         )
         try:
             await db.execute(
@@ -881,8 +1197,8 @@ class ToolExecutorImpl:
             await db.execute(
                 "INSERT INTO audit_log(ts,actor,action,resource,risk,decision,reason,metadata,correlation_id) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
-                (utcnow(), call.actor, "tool.execute", resource, risk, decision,
-                 error, json.dumps(metadata, default=str)[:1000], task_key),
+                (utcnow(), call.actor, "tool.execute", self._redact(resource), risk, decision,
+                 error, self._redact(json.dumps(metadata, default=str))[:1000], task_key),
             )
         except Exception:
             _LOG.exception("failed to persist tool audit", extra={"tool": call.name})
@@ -899,6 +1215,11 @@ class ToolExecutorImpl:
             "duration_ms": duration_ms,
             "resource": self._redact(resource) if resource else None,
             "approval_id": metadata.get("approval_id"),
+            "source": metadata.get("source"),
+            "origin": metadata.get("origin"),
+            "principal": getattr(call, "principal", None),
+            "conversation_id": getattr(call, "conversation_id", None),
+            "thread_id": getattr(call, "thread_id", None),
         }
         if success:
             payload["output"] = output

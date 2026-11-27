@@ -40,9 +40,18 @@ CALLBACK_PREFIX = "tga1:"
 TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
 RESOLUTION_REF_LENGTH = 43
 
-APPROVAL_KIND_CODES: dict[str, str] = {"tool": "t", "learning": "l", "gateway": "g"}
+APPROVAL_KIND_CODES: dict[str, str] = {
+    "tool": "t", "learning": "l", "gateway": "g",
+    # Schedule consent is a first-class card kind, not a tool approval. The
+    # kind is preserved through the tap so the terminal rewrite cannot turn a
+    # schedule decision into a generic tool approval.
+    "schedule": "j", "schedule_edit": "e",
+}
 DECISION_CODES: dict[str, str] = {
     "approve": "a", "reject": "r", "session": "s", "trust": "w",
+    # Schedule card choices. "once" is allow-once; "always" is the profile
+    # grant; "deny" is the explicit no.
+    "once": "o", "always": "l", "deny": "d",
 }
 _KIND_BY_CODE = {code: kind for kind, code in APPROVAL_KIND_CODES.items()}
 _DECISION_BY_CODE = {code: decision for decision, code in DECISION_CODES.items()}
@@ -51,8 +60,12 @@ KIND_FOR_ACTION: dict[str, str] = {
     "tool:shell": "tool",
     "tool:file_write": "tool",
     "gateway.send": "gateway",
+    "schedule:create": "schedule",
+    "schedule:edit": "schedule_edit",
 }
 KIND_FOR_PREFIX: tuple[tuple[str, str], ...] = (
+    ("schedule:edit", "schedule_edit"),
+    ("schedule:", "schedule"),
     ("tool:", "tool"),
     ("learning:", "learning"),
     ("gateway.", "gateway"),
@@ -239,6 +252,47 @@ def build_keyboard(
         })
     if second:
         rows.append(second)
+    return {"inline_keyboard": rows}
+
+
+def build_schedule_keyboard(
+    approval_id: str,
+    *,
+    approval_kind: str,
+    choices: Iterable[str] | None,
+    choice_labels: Iterable[str] | None = None,
+    deny_only: bool = False,
+) -> dict[str, Any]:
+    """Buttons for one schedule card, preserving kind and every offered choice.
+
+    ``schedule_edit`` cards offer Allow/Deny only; create cards offer
+    once/session/always/deny. A deny-only card (for example because a surface
+    could not show the full body) offers only Deny. A choice we cannot encode
+    is dropped rather than turned into a different decision.
+    """
+    kind = "schedule_edit" if approval_kind == "schedule_edit" else "schedule"
+    values = [str(item).strip() for item in (choices or ()) if str(item).strip()]
+    labels = [str(item) for item in (choice_labels or ())]
+    if deny_only:
+        values = ["deny"]
+        labels = ["Deny"]
+    pairs: list[tuple[str, str]] = []
+    for index, value in enumerate(values):
+        if value not in DECISION_CODES:
+            continue
+        label = labels[index] if index < len(labels) else value
+        pairs.append((value, label))
+    rows: list[list[dict[str, str]]] = []
+    for index in range(0, len(pairs), 2):
+        row = [
+            {
+                "text": label,
+                "callback_data": build_callback_data(kind, decision, approval_id),
+            }
+            for decision, label in pairs[index:index + 2]
+        ]
+        if row:
+            rows.append(row)
     return {"inline_keyboard": rows}
 
 

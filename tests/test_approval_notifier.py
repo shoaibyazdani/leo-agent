@@ -271,8 +271,130 @@ def test_stop_unsubscribes() -> None:
     notifier.start()
     notifier.stop()
     assert bus._handlers["approval.requested"] == []
-    for topic in REVIEW_TOPICS:
-        assert bus._handlers.get(topic, []) == []
+
+
+# ---------------------------------------------------------------------------
+# schedule copy and notify-only mode
+
+
+class KeyboardAdapter(FakeAdapter):
+    """Records whether a decision keyboard was attached."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.markups: list[dict | None] = []
+
+    async def send(self, target: str, text: str, *, reply_markup=None) -> dict:
+        self.sent.append((target, text))
+        self.markups.append(reply_markup)
+        return {"message_id": "1"}
+
+
+async def _schedule_card(*, body: str = 'Schedule "Water": drink water.'):
+    from leo.security.permissions import PermissionManagerImpl
+
+    permissions = PermissionManagerImpl(_settings())
+    card = await permissions.create_schedule_card(
+        kind="schedule_create",
+        body=body,
+        proposal_digest="notify-digest",
+        requested_by="chat:web",
+        conversation_id="conv-a",
+        shown_first_run=None,
+    )
+    return permissions, card
+
+
+@pytest.mark.asyncio
+async def test_schedule_notification_renders_full_body_and_all_choices(monkeypatch) -> None:
+    from leo import db
+
+    monkeypatch.setenv("LEO_DB_PATH", str(db.get_db_path()))
+    bus = EventBus(persist=False)
+    adapter = KeyboardAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    assert notifier.start() is True
+
+    long_body = (
+        'Schedule "Brief" (every day at 8am, first run Wed Nov 25 08:00 UTC): '
+        + "Summarize updates. " * 40
+    )
+    _permissions, card = await _schedule_card(body=long_body)
+    await bus.emit("approval.requested", **card.event_payload())
+
+    assert len(adapter.sent) == 1
+    target, text = adapter.sent[0]
+    assert target == "525083981"
+    assert long_body in text, "schedule copy is never truncated"
+    assert "Tap a button below" in text
+    assert adapter.markups[0] is not None
+    buttons = [
+        button for row in adapter.markups[0]["inline_keyboard"] for button in row
+    ]
+    assert [button["text"] for button in buttons] == [
+        "Allow", "Allow for this chat", "Always allow new jobs", "Deny"
+    ]
+    assert notifier.stats()["notify_only"] is False
+    # Notification is not presentation: the row is still unshown.
+    row = await db.fetchone(
+        "SELECT shown_at FROM approvals WHERE id=?", (card.approval_id,)
+    )
+    assert row["shown_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_notify_only_sends_no_keyboard_and_never_marks_shown(monkeypatch) -> None:
+    from leo import db
+
+    monkeypatch.setenv("LEO_DB_PATH", str(db.get_db_path()))
+    bus = EventBus(persist=False)
+    adapter = KeyboardAdapter()
+    notifier = ApprovalNotifier(
+        FakeGateway(adapter, bus), _settings(), events=bus, notify_only=True
+    )
+    assert notifier.start() is True
+
+    _permissions, card = await _schedule_card()
+    await bus.emit("approval.requested", **card.event_payload())
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0][1]
+    assert card.body in text
+    assert "Notification only" in text
+    assert adapter.markups == [None], "a notification must never offer a decision"
+    assert notifier.stats()["notify_only"] is True
+    row = await db.fetchone(
+        "SELECT shown_at, presented_surface FROM approvals WHERE id=?",
+        (card.approval_id,),
+    )
+    assert row["shown_at"] is None and row["presented_surface"] is None
+
+
+def test_notify_only_is_distinct_from_an_operator_remote_answerable_target() -> None:
+    answerable = ApprovalNotifier(FakeGateway(), _settings())
+    notify_only = ApprovalNotifier(FakeGateway(), _settings(), notify_only=True)
+    assert answerable._answerable() is True
+    assert notify_only._answerable() is False
+    assert answerable.stats()["notify_only"] is False
+    assert notify_only.stats()["notify_only"] is True
+
+
+def test_schedule_message_has_deadline_and_id_but_no_secret() -> None:
+    notifier = ApprovalNotifier(FakeGateway(), _settings())
+    text = notifier._message({
+        "approval_id": "apr_sched",
+        "kind": "schedule_create",
+        "title": "LEO wants to schedule a job",
+        "body": 'Schedule "Water": drink water.',
+        "deadline": "If you don't answer within 15 minutes the job will NOT be created.",
+        "choices": ["once", "session", "always", "deny"],
+        "choice_labels": ["Allow", "Allow for this chat", "Always allow new jobs", "Deny"],
+    })
+    assert "apr_sched" in text
+    assert "15 minutes" in text
+    assert 'Schedule "Water": drink water.' in text
+    assert "token" not in text.lower()
+    assert "secret" not in text.lower()
 
 
 # ---------------------------------------------------------------------------

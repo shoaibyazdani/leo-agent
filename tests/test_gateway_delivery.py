@@ -589,3 +589,225 @@ async def test_interrupt_commands_are_handled_at_admission_not_in_the_outbox():
         (admitted["conversation_id"],),
     )
     assert row is not None and row["text"] == "/stop"
+
+
+# ------------------------------------------------- 7. Phase 8 local/none delivery
+
+
+async def test_local_note_delivery_needs_no_adapter() -> None:
+    """A ``local`` target is a durable assistant note, not an external send."""
+    from types import SimpleNamespace
+
+    from leo.core.app import LeoApp
+    from leo.schedules.domain import DeliveryTarget
+
+    app = object.__new__(LeoApp)
+
+    async def _terminal(*a, **k):
+        return None
+
+    app.task_reporting = SimpleNamespace(on_terminal=_terminal)
+    task = SimpleNamespace(
+        id="task-local", objective="local brief", status="completed",
+        metadata={"schedule_id": "sch_local", "schedule": "local brief"},
+    )
+    result = await app._channel_delivery(
+        task, "local", "local-conv",
+        {
+            "status": "completed",
+            "delivery_lane": "result",
+            "schedule_payload": {"name": "local brief", "text": "LOCAL-ONLY-NOTE"},
+            "delivery_target": DeliveryTarget(
+                kind="local", platform="local", chat_id="local-conv"
+            ).model_dump(mode="json"),
+        },
+    )
+    assert result == "local:note:local-conv"
+    row = await db.fetchone(
+        "SELECT content,metadata FROM messages WHERE conversation_id='local-conv'"
+    )
+    assert row is not None and "LOCAL-ONLY-NOTE" in row["content"]
+    metadata = json.loads(row["metadata"])
+    assert metadata["schedule_id"] == "sch_local"
+    assert metadata["schedule_note"] is True
+
+
+async def test_external_delivery_refuses_a_none_address() -> None:
+    """A corrupt target must fail before any adapter sees the string None."""
+    from types import SimpleNamespace
+
+    from leo.core.app import LeoApp
+
+    app = object.__new__(LeoApp)
+
+    async def _terminal(*a, **k):
+        return None
+
+    app.task_reporting = SimpleNamespace(on_terminal=_terminal)
+    task = SimpleNamespace(id="task-none", objective="x", status="completed", metadata={})
+    with pytest.raises(ValueError, match="no delivery address"):
+        await app._channel_delivery(
+            task, "telegram", None, {"status": "completed"}
+        )
+
+
+# ------------------------------------------------------- 8. threaded delivery
+
+
+class _ThreadedAdapter(MessagingAdapter):
+    channel = "telegram"
+    supports_threaded_text = True
+
+    def verify_webhook(self, payload, headers=None, *, raw_body=None) -> bool:
+        return True
+
+    def __init__(self, *, accepts_thread: bool = True) -> None:
+        super().__init__()
+        self.accepts_thread = accepts_thread
+        self.calls: list[tuple[str, str, dict]] = []
+
+    async def send(self, target, text, **kwargs):
+        self.calls.append((str(target), str(text), dict(kwargs)))
+        return {"channel": self.channel, "target": str(target), "success": True,
+                "message_id": "m-77"}
+
+
+class _NoThreadAdapter(_ThreadedAdapter):
+    supports_threaded_text = False
+
+    async def send(self, target: str, text: str) -> dict:
+        self.calls.append((str(target), str(text), {}))
+        return {"channel": self.channel, "target": str(target), "success": True,
+                "message_id": "m-root"}
+
+
+def _delivery_app(gateway):
+    from types import SimpleNamespace
+
+    from leo.core.app import LeoApp
+
+    app = object.__new__(LeoApp)
+
+    async def _terminal(*a, **k):
+        return None
+
+    app.task_reporting = SimpleNamespace(on_terminal=_terminal)
+    app.gateway = gateway
+    return app
+
+
+def _threaded_task():
+    from types import SimpleNamespace
+
+    from leo.schedules.domain import DeliveryTarget
+
+    task = SimpleNamespace(
+        id="task-thread", objective="topic brief", status="completed",
+        metadata={"schedule_id": "sch_thread"},
+    )
+    context = {
+        "status": "completed",
+        "delivery_lane": "result",
+        "delivery_text_override": "TOPIC-BRIEF",
+        "delivery_target": DeliveryTarget(
+            kind="external", platform="telegram", chat_id="555", thread_id="7",
+        ).model_dump(mode="json"),
+    }
+    return task, context
+
+
+async def test_threaded_target_reaches_the_adapter_and_the_receipt() -> None:
+    """A card aimed at topic 7 must be delivered to topic 7, not the group root."""
+    adapter = _ThreadedAdapter()
+    app = _delivery_app(make_gateway(adapters={"telegram": adapter}))
+    task, context = _threaded_task()
+
+    detail = await app._channel_delivery(task, "telegram", "555", context)
+
+    assert detail == "telegram:m-77"
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0][0] == "555"
+    assert adapter.calls[0][2]["thread_id"] == "7"
+    row = await db.fetchone(
+        "SELECT metadata FROM messages WHERE content='TOPIC-BRIEF' ORDER BY id DESC LIMIT 1"
+    )
+    assert row is not None
+    assert json.loads(row["metadata"])["thread_id"] == "7"
+
+
+async def test_delivery_fails_when_the_adapter_cannot_honour_the_thread() -> None:
+    """No adapter support means no send and certainly no 'sent' receipt."""
+    adapter = _NoThreadAdapter()
+    app = _delivery_app(make_gateway(adapters={"telegram": adapter}))
+    task, context = _threaded_task()
+
+    with pytest.raises(RuntimeError, match="cannot address a thread"):
+        await app._channel_delivery(task, "telegram", "555", context)
+
+    assert adapter.calls == []
+
+
+async def test_thread_capability_is_declared_not_guessed_from_a_signature() -> None:
+    """A **kwargs sink is not proof that a channel can address a topic."""
+
+    class _SinkSignature(_ThreadedAdapter):
+        supports_threaded_text = False  # no declaration, despite **kwargs
+
+    adapter = _SinkSignature()
+    gateway = make_gateway(adapters={"telegram": adapter})
+    result = await gateway.send("telegram", "555", "hello", thread_id="7")
+
+    assert result["success"] is False
+    assert "cannot address a thread" in result["error"]
+    assert adapter.calls == []
+    assert await db.fetchone(
+        "SELECT id FROM messages WHERE content='hello'"
+    ) is None
+
+    # The declaration, not the presence/absence of a **kwargs signature, grants
+    # the capability: a narrow send() with an explicit flag still carries it.
+    class _Declared(_ThreadedAdapter):
+        async def send(self, target, text, **kwargs):
+            self.calls.append((str(target), str(text), dict(kwargs)))
+            return {"channel": self.channel, "target": str(target), "success": True,
+                    "message_id": "m-topic"}
+
+    declared = _Declared()
+    gateway = make_gateway(adapters={"telegram": declared})
+    result = await gateway.send("telegram", "555", "hello", thread_id="7")
+    assert result["success"] is True
+    assert declared.calls[0][2] == {"thread_id": "7"}
+
+
+async def test_room_delivery_sends_on_the_resolved_channel() -> None:
+    """'room' is a routing target, never a registered adapter channel."""
+    from types import SimpleNamespace
+
+    from leo.schedules.domain import DeliveryTarget
+
+    class _RoomAdapter(_ThreadedAdapter):
+        channel = "matrix"
+        supports_rooms = True
+
+    adapter = _RoomAdapter()
+    app = _delivery_app(make_gateway(adapters={"matrix": adapter}))
+    app.settings = SimpleNamespace(
+        automation=SimpleNamespace(default_room_channel="matrix")
+    )
+    task = SimpleNamespace(
+        id="task-room", objective="room brief", status="completed", metadata={},
+    )
+    context = {
+        "status": "completed",
+        "delivery_text_override": "ROOM-BRIEF",
+        "delivery_target": DeliveryTarget(
+            kind="room", platform="room", chat_id="!room:server", room_id="!room:server",
+        ).model_dump(mode="json"),
+    }
+
+    detail = await app._channel_delivery(task, "room", "!room:server", context)
+
+    assert detail == "matrix:m-77"
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0][0] == "!room:server"
+    assert adapter.calls[0][1] == "ROOM-BRIEF"

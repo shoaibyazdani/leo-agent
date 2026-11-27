@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "oracle_commit": "7cf9e92cd6277b327b36a51fb897cdc8403902d6",
+  "tool_name": "cronjob_manage",
+  "action": "pause",
+  "aliases": [],
+  "description": "One of: create, list, update, pause, resume, remove, run, cancel. When action=create, the 'schedule' and 'prompt' fields are REQUIRED.",
+  "action_description": "'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs)",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "One of: create, list, update, pause, resume, remove, run, cancel. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+      },
+      "job_id": {
+        "type": "string",
+        "description": "Required for update/pause/resume/remove/run/cancel."
+      }
+    },
+    "required": [
+      "job_id"
+    ]
+  },
+  "effective_handler_fields": [
+    "job_id",
+    "reason"
+  ],
+  "fields_not_in_declared_schema": [
+    "reason"
+  ],
+  "result_keys": [
+    "success",
+    "job"
+  ],
+  "upstream_consent": null,
+  "schema_derivation": "derived from the shared schema plus the final-head handler; not an upstream per-action schema"
+}

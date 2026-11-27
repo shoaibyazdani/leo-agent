@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "oracle_commit": "7cf9e92cd6277b327b36a51fb897cdc8403902d6",
+  "oracle_role": "read-only behavioral source; never executed",
+  "source_checkout_clean": true,
+  "source_files": {
+    "tools/cronjob_tools.py": {
+      "sha256": "939298af24b09e07fd34030a863d11cc44a6492f38a246aab65d8815bd2fd1d9",
+      "bytes": 87153
+    },
+    "tools/approval.py": {
+      "sha256": "2b062fcb41531074803c328d1388572e9d4655117791747fc65e91d76fef8d1a",
+      "bytes": 86471
+    },
+    "tools/approval_prompt.py": {
+      "sha256": "c23c6e8c746e7e4560f037a47a312dcb189de7b8958291d6a9c2b76e172b09bb",
+      "bytes": 21102
+    },
+    "cron/jobs.py": {
+      "sha256": "31334e6897a00fed370d302283602bf800fefeceac1ea689f0be2ff6bf24d41a",
+      "bytes": 159505
+    },
+    "cron/job_args.py": {
+      "sha256": "cb17892b6a1aff7d1e3cae1443bbe9c6ba02ae8f146b23ee406af3049c7180a8",
+      "bytes": 26735
+    },
+    "cron/jobs_time.py": {
+      "sha256": "1951c272fb28e8c7372561c263f7db88b1de0d0ff940442f4d93bd38b7fbd677",
+      "bytes": 7430
+    },
+    "cron/jobs_tristate.py": {
+      "sha256": "db9e393b88b6975e2777ea2dfa962e198579b4578a4f2c7c4e2b4c608fdae9a8",
+      "bytes": 977
+    },
+    "cron/jobs_invariants.py": {
+      "sha256": "4d7fde62e6232f3832fc17e3dbe44b82b1845d8bae6a8140cdf9d00c647351d5",
+      "bytes": 3340
+    },
+    "cron/jobs_model_pin.py": {
+      "sha256": "075d4fa409294f5cb87bb8c7297c33912b2d85e1f78bdd94eb320c4859496e07",
+      "bytes": 1945
+    },
+    "cron/scheduler.py": {
+      "sha256": "111bb5768c9bf576d938535136eb37fd1f9074b37fea02e36a0b2c066380d285",
+      "bytes": 218133
+    },
+    "cron/scheduler_prompt.py": {
+      "sha256": "e197da507ecd3b5ff0de8294dcf7d5c409d974a4d524b14a58f1395f80d879ca",
+      "bytes": 22915
+    },
+    "cron/scheduler_delivery.py": {
+      "sha256": "592b39785a54edbb9cc41d9076c2b77777bacadb568a47a40f0b0c92fb0d6a7f",
+      "bytes": 100343
+    },
+    "cron/scheduler_delivery_room.py": {
+      "sha256": "2e282eaabb8d0ae861e50db3bcebdaee4797d6bfba401bf52b56e7e70825d757",
+      "bytes": 7160
+    },
+    "cron/monitor.py": {
+      "sha256": "4b2fa7813c9aba25874a6286c765f3dab40b941ebf7dfbd676683bbf5e7e0300",
+      "bytes": 8537
+    },
+    "gateway/platforms/base_exec_approval.py": {
+      "sha256": "ea24b097c851b11bfb05af4afb4b97e8a39a5935f3977d1b4f336d5550351287",
+      "bytes": 18986
+    },
+    "locales/en.yaml": {
+      "sha256": "89ccb59b402d713b855dcc2882baee8c2b2763ffbfc07fbb07ecbbc13b937062",
+      "bytes": 267485
+    },
+    "tests/tools/test_cronjob_create_approval.py": {
+      "sha256": "734a3db94be695ac3dcc4f3c683c6e3704a3450bc5de37c721458d6eee6eaf57",
+      "bytes": 23867
+    },
+    "tests/tools/test_cronjob_tools.py": {
+      "sha256": "af7a07372800f69c180cb8b18634154bc3868c51b448541f19afa02701d62f52",
+      "bytes": 35949
+    },
+    "tests/tools/test_approval_prompt_schedule.py": {
+      "sha256": "ae3708990218a2807ac730e02ff3c61281fb13c8697ed4c383ceb9ed1dd8c09e",
+      "bytes": 973
+    },
+    "tests/cron/test_jobs.py": {
+      "sha256": "972235e95871135ae8d9f2ffe9ff252970aff70caa285fbad7f515858cfc2c0e",
+      "bytes": 89275
+    },
+    "tests/cron/test_duration_dst.py": {
+      "sha256": "83fcfc7622b9742ac8bec1fc15bfd90ab56ef48be349aa1be576cadf80065374",
+      "bytes": 1665
+    },
+    "tests/cron/test_per_job_timezone.py": {
+      "sha256": "1bf5034ece09e186fc54347669408d5052e400fb9a10b485c3a173e4321e78cc",
+      "bytes": 15845
+    },
+    "tests/cron/test_job_args.py": {
+      "sha256": "6296d6e26c98d3af0b0d8984c247879625428a9a8e59bf69038c0d3a979f4943",
+      "bytes": 1679
+    }
+  },
+  "fixture_files": {
+    "acceptance_matrix.json": "4ce364a1229124c27027ba21a94c6e233863ae44f9655ccb08a60ed8622a51e7",
+    "actions/cancel.json": "a9c0dc8d1963b79b7286a7fefdd012b623d1e113438ce52d7d3dad428cdd509e",
+    "actions/create.json": "fed246a1ce9dae6f3620438cb6ce0357bcb7dbb0dff1ee77a716b171f8ad3b6d",
+    "actions/list.json": "e41cea7ac9859e43c5af24c3d16411896810562a6dc4fdda699b97f29c230e5d",
+    "actions/pause.json": "1818e2d243580246876c280edc40d77532c2a75b1695effb549da5f701dca275",
+    "actions/remove.json": "03222975c15c47ea8a3bdf5622f787eb7e0b036b637f0e25ab988a4f99f098b4",
+    "actions/resume.json": "c88a0b2f50bc78de55f8aeea94a725c679a8bc37d1a72394bb9446950833962c",
+    "actions/run.json": "a475252dd3e8547dc60c471aa3f6f691ac21aba85c5d5aad5a5a76dfd1b31878",
+    "actions/update.json": "9e69ed3d7817add5c6ccedf8af65b70d9439adffff13a793e298cfc7884be46e",
+    "consent_cards.json": "e3b7873b0fc03bad6c7b067e329626b3fc4336f629798f06ebefbc0f393a222d",
+    "delivery_tokens.json": "0068836bf739fa110ea0b14efb752afb1fe24138c157f68303bac36f3a9a3b10",
+    "fields.json": "7eb25a8183c6a67c10308601872f04341245128e1aadd405364d781371333a18",
+    "grammar.json": "6c2a7a5c8e88ef23e88df22c9d8eb9ffed5161df3bdff0fe13cefa83398ad37c",
+    "repeat.json": "300ab01df10e52184c4fa3a8f4670ab8ea7a5fcb190d3d710e959cf1b35067cd",
+    "tool_schema.json": "06a1320863181672a7a50d7d4b8025c800d8e4ac6d9bbc0584d0d3cc6c71c1e7"
+  },
+  "fixture_count": 15,
+  "brand_neutralization": "source-project names are neutralized in public text; source digests bind exact upstream bytes"
+}

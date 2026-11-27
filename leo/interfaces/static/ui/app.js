@@ -350,14 +350,81 @@
     $('tool-list').innerHTML = `<table class="table"><thead><tr><th>Tool</th><th>Category</th><th>Risk</th><th>Permissions</th><th></th></tr></thead><tbody>${shown.map((t) => `<tr><td><strong>${esc(t.name)}</strong></td><td>${esc(t.category)}</td><td>${badge(t.risk)}</td><td class="row__meta">${esc((t.permissions || []).join(', ') || '—')}</td><td><button class="btn btn--secondary btn--sm" data-tool="${esc(t.name)}">${ico('play', 'icon icon--sm')} Execute</button></td></tr>`).join('')}</tbody></table>`;
   }
 
+  const SCHEDULE_CARD_KINDS = new Set(['schedule_create', 'schedule_edit']);
+
+  // Approval cards are rendered by the one shared renderer. Every literal body
+  // goes in through textContent; this view never parses card text as HTML.
+  async function decideScheduleCard(view, choice, host) {
+    try {
+      const result = await window.LEO_APPROVALS.acknowledgeThenResolve(view, choice);
+      if (result?.card && host) {
+        window.LEO_APPROVALS.renderTerminal(host, result.card, result.status || 'approved');
+      }
+      toast('Decision recorded', 'success');
+      await refreshApprovals();
+    } catch (err) { toast(err.message || 'Decision failed', 'danger'); }
+  }
+
+  function scheduleCardHost(card) {
+    const host = document.createElement('div');
+    host.className = 'approval approval--card';
+    host.dataset.approvalId = card.approval_id;
+    window.LEO_APPROVALS.renderCard(host, card, {
+      onChoice: (view, choice) => decideScheduleCard(view, choice, host),
+    });
+    return host;
+  }
+
   function renderApprovals() {
     const pending = state.data.approvals?.approvals || [];
     const audit = state.data.audit?.audit || [];
     if (state.data.approvals?.__error) return errorState('approval-list', state.data.approvals.__error);
     $('approval-count').textContent = `${pending.length} pending`;
-    $('approval-list').innerHTML = pending.length ? pending.map((a) => `<div class="approval"><span><strong>${esc(a.action)}</strong><br/><span class="row__meta">${esc(a.id)} · ${esc(a.risk)} · ${esc(a.actor)}</span></span><span class="approval__actions"><button class="btn btn--danger btn--sm" data-resolve="${esc(a.id)}" data-action="${esc(a.action)}" data-decision="false">Deny</button><button class="btn btn--primary btn--sm" data-resolve="${esc(a.id)}" data-action="${esc(a.action)}" data-decision="true">Approve</button></span></div>`).join('') : '';
+    const list = $('approval-list');
+    list.replaceChildren();
+    const cards = new Map((state.data.approvals?.cards || []).map((c) => [c.approval_id, c]));
+    for (const item of pending) {
+      if (SCHEDULE_CARD_KINDS.has(item.kind)) {
+        const card = cards.get(item.id);
+        if (card && window.LEO_APPROVALS) list.appendChild(scheduleCardHost(card));
+        continue;
+      }
+      const row = document.createElement('div');
+      row.className = 'approval';
+      const info = document.createElement('span');
+      const label = document.createElement('strong');
+      label.textContent = item.action || '';
+      const meta = document.createElement('span');
+      meta.className = 'row__meta';
+      meta.textContent = `${item.id || ''} · ${item.risk || ''} · ${item.actor || ''}`;
+      info.append(label, document.createElement('br'), meta);
+      const actions = document.createElement('span');
+      actions.className = 'approval__actions';
+      const deny = document.createElement('button');
+      deny.className = 'btn btn--danger btn--sm';
+      deny.dataset.resolve = item.id;
+      deny.dataset.action = item.action || '';
+      deny.dataset.decision = 'false';
+      deny.textContent = 'Deny';
+      const allow = document.createElement('button');
+      allow.className = 'btn btn--primary btn--sm';
+      allow.dataset.resolve = item.id;
+      allow.dataset.action = item.action || '';
+      allow.dataset.decision = 'true';
+      allow.textContent = 'Approve';
+      actions.append(deny, allow);
+      row.append(info, actions);
+      list.appendChild(row);
+    }
     if (!pending.length) empty('approval-list', 'All clear', 'No high-risk actions are waiting for a human decision.', 'approvals');
     $('approval-audit').innerHTML = audit.length ? `<div class="list">${audit.slice(0, 8).map((a) => `<div class="row"><span class="row__icon">${ico('check')}</span><span><span class="row__title">${esc(a.action)}</span><br/><span class="row__meta">${esc(a.decision)} · ${esc(a.reason || '')}</span></span><span>${badge(a.decision)}</span></div>`).join('')}</div>` : '<p class="hint">No decisions recorded yet.</p>';
+  }
+
+  async function refreshApprovals() {
+    try { state.data.approvals = await api('/approvals'); }
+    catch (error) { state.data.approvals = { __error: error.message }; }
+    renderApprovals();
+    window.dispatchEvent(new CustomEvent('leo:data', { detail: state.data }));
   }
 
   // ---- runtime channel enrollment --------------------------------------
@@ -859,6 +926,18 @@
     state.eventItems.unshift(event);
     if (state.eventItems.length > EVENT_STREAM_LIMIT) state.eventItems.length = EVENT_STREAM_LIMIT;
     renderEvents();
+    if (event.topic === 'schedule.notification') {
+      // Shell banner only. Never acknowledge, present or resolve from a
+      // notification: delivery proves nothing about answerability.
+      const payload = event.payload || {};
+      if (window.leo && typeof window.leo.notify === 'function') {
+        window.leo.notify(payload.title || 'LEO', payload.body || '').catch(() => {});
+      }
+      return;
+    }
+    if (['approval.presented', 'approval.requested', 'approval.resolved'].includes(event.topic)) {
+      refreshApprovals();
+    }
   }
 
   function stopEventStream() {

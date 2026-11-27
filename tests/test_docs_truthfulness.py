@@ -281,6 +281,70 @@ def test_security_does_not_contradict_browser_startup_or_closed_gaps() -> None:
     assert "Deep-audit gaps that are now closed" in text
 
 
+def test_schedule_docs_match_the_shipped_capability_matrix() -> None:
+    """Phase 10 docs describe the code, not the old Phase 0 design snapshot."""
+    from leo.contracts import SURFACE_CAPABILITIES
+
+    text = (ROOT / "docs" / "SCHEDULES.md").read_text(encoding="utf-8")
+    assert "Phase 0 only" not in text
+    for heading in (
+        "## Supported grammar", "## Consent and the fail-closed divergence",
+        "## Delivery grammar", "## Native execution contract",
+        "## Surface capability matrix", "## Migration, rollback and replay",
+        "## Verification limits",
+    ):
+        assert heading in text, heading
+
+    def yn(value: bool) -> str:
+        return "yes" if value else "no"
+
+    for surface, capabilities in SURFACE_CAPABILITIES.items():
+        if not capabilities.can_present_card:
+            continue
+        row = (
+            f"| `{surface}` | {yn(capabilities.can_present_card)} | "
+            f"{yn(capabilities.can_wait_for_decision)} | {yn(capabilities.full_text)} | "
+            f"{yn(capabilities.can_rewrite)} | {capabilities.max_card_chars} |"
+        )
+        assert row in text, f"capability matrix row missing for {surface}"
+    for incapable in ("a2a", "whatsapp", "whatsapp_web", "agent", "scheduled", "chat"):
+        assert f"`{incapable}`" in text
+
+    lowered = text.lower()
+    for token in (
+        "automation.allow_scripts", "scripts_root", "room:<id>", "bot-chat:<profile>",
+        "no locale subsystem", "no system-prompt cache", "approval_required",
+        "api:<authenticated-principal>", "sec-fetch-site", "chrom",
+    ):
+        assert token in lowered, token
+    assert "upstream tests" not in lowered or "never executed" in lowered
+
+
+def test_schedule_docs_qualify_the_no_card_rule_and_legacy_approval_backfill() -> None:
+    text = (ROOT / "docs" / "SCHEDULES.md").read_text(encoding="utf-8")
+    lowered = " ".join(text.lower().split())
+    assert "only exception to the no-card rule" in lowered
+    assert "live schedule create grant" in lowered
+    assert "never covers edits, scheduled, unattended or delegated-agent" in lowered
+    migration = text.split("## Migration, rollback and replay", 1)[1].split("\n## ", 1)[0]
+    migration_lower = migration.lower()
+    assert "null `expires_at`" in migration_lower
+    assert "created_at + 15 minutes" in migration_lower
+    assert "more than 15 minutes" in migration_lower
+    assert "before" in migration_lower and "upgrading" in migration_lower
+
+
+def test_schedule_docs_do_not_claim_browser_or_live_surface_verification() -> None:
+    schedules = (ROOT / "docs" / "SCHEDULES.md").read_text(encoding="utf-8").lower()
+    testing = " ".join(TEST_REPORT.read_text(encoding="utf-8").lower().split())
+    assert "chromium is absent" in schedules
+    assert "no browser verification is claimed" in schedules
+    assert "no live telegram send" in schedules
+    assert "no live gateway smoke" in schedules
+    assert "skipped browser test is not browser verification" in testing
+    assert "not performed by the default suite" in testing
+
+
 def test_handoff_is_marked_historical() -> None:
     if not HANDOFF.exists():
         # The handoff note is personal and deliberately untracked; a clean

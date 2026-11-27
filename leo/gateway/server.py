@@ -17,27 +17,94 @@ import asyncio
 import base64
 import logging
 import os
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .. import db
+from ..contracts import surface_capabilities
 
 # One send attempt may not outlive this: a stuck platform call is a failed send,
 # and an unbounded one keeps the worker's lease (and its typing pulse) alive.
 DELIVERY_TIMEOUT_SECONDS = 45.0
 from ..integrations.channels import default_adapters, polling_channels
-from ..integrations.messaging import implements_polling
+from ..integrations.messaging import (
+    TELEGRAM_MAX_CHARS,
+    AdapterCapabilities,
+    implements_polling,
+)
 from ..integrations.secrets import credential
 from ..integrations.transcription import VOICE_UNAVAILABLE_NOTE
 from ..integrations.transport_state import TransportState
+from ..security.approval_buttons import build_schedule_keyboard
+from ..security.approval_cards import (
+    APPROVAL_CARD_PROTOCOL_VERSION,
+    card_fits_surface,
+    card_from_row,
+    is_schedule_kind,
+    proposal_digest_matches,
+    schedule_card_text,
+    schedule_terminal_text,
+)
 from .sessions import SessionStore
 from .store import GatewayStore
 
 _LOG = logging.getLogger(__name__)
 
 WORKER_IDLE_SLICE = 0.5
+
+# The worker only sends a schedule card through a gateway that advertises the
+# same card protocol and a channel with native inbound identity + terminal
+# rewrite. An older gateway advertises nothing: it receives no card at all.
+APPROVAL_RPC_PROTOCOL = APPROVAL_CARD_PROTOCOL_VERSION
+
+# A tap is handled in the gateway process, so it already rewrites its own card.
+# Marking it here prevents the worker's later lease-settle rewrite from editing
+# the same message twice. This is display state, not approval authority.
+_TERMINAL_REWRITES: set[str] = set()
+
+
+def mark_terminal_rewrite(approval_id: str) -> None:
+    _TERMINAL_REWRITES.add(str(approval_id))
+
+
+def terminal_rewrite_done(approval_id: str) -> bool:
+    return str(approval_id) in _TERMINAL_REWRITES
+
+
+_TERMINAL_STATUSES = frozenset({"approved", "denied", "expired"})
+
+
+async def _pointer_verdict(approval_id: str, text: str) -> str:
+    """Verdict line for a shortened card, from the decision actually recorded.
+
+    The worker's terminal text can carry a grant label or a note *after* its
+    verdict line, and a caller can send arbitrary text. Copying the last line
+    would present that trailer (or a hard-coded success) as the decision. The
+    durable approval row is the authority, exactly as on the tap path.
+    """
+    row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (str(approval_id),))
+    if row is not None and str(row["status"] or "") in _TERMINAL_STATUSES:
+        try:
+            card = card_from_row(row)
+        except (ValueError, TypeError, KeyError):
+            card = None
+        if card is not None:
+            lines = schedule_terminal_text(
+                card, status=str(row["status"] or "")
+            ).splitlines()
+            if lines:
+                return lines[-1].strip()
+    # Without a durable decision, show only a verdict the worker actually wrote.
+    for line in reversed(text.splitlines()):
+        value = line.strip()
+        lowered = value.lower()
+        if any(marker in lowered for marker in ("approved", "denied", "rejected", "expired")):
+            return value
+    return "decision recorded in the LEO dashboard"
 
 
 class ClaimRequest(BaseModel):
@@ -62,12 +129,80 @@ class CompleteRequest(BaseModel):
     # When set, replace this already-sent message (the tapped menu card) with
     # the answer instead of posting a duplicate below it.
     edit_message_id: str | None = None
+    # Identity the worker was admitted with. When supplied it must match the
+    # durable admission; delivery always uses the admission's own reply target,
+    # so a model or body cannot redirect the answer to another chat/thread.
+    principal: str | None = None
+    thread_id: str | None = None
+    reply_target: str | None = None
 
 
 class FailRequest(BaseModel):
     admission_id: str
     error: str = ""
     retry: bool = True
+
+
+class _StrictRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ApprovalPresentRequest(_StrictRequest):
+    admission_id: str
+    approval_id: str
+    confirm_proposal_digest: str
+    principal: str | None = None
+    thread_id: str | None = None
+
+
+class ApprovalAckRequest(_StrictRequest):
+    admission_id: str
+    approval_id: str
+
+
+class ApprovalUpdateRequest(_StrictRequest):
+    admission_id: str
+    approval_id: str
+    confirm_proposal_digest: str
+    text: str = Field(min_length=1)
+
+
+def gateway_approval_channels(health: Any) -> frozenset[str]:
+    """Channels a worker may use for schedule cards, from advertised health only.
+
+    Missing or mismatched protocol means an old gateway: no card, no guess.
+    """
+    if not isinstance(health, dict):
+        return frozenset()
+    if health.get("approval_protocol") != APPROVAL_RPC_PROTOCOL:
+        return frozenset()
+    advertised = health.get("approval_cards")
+    if not isinstance(advertised, dict):
+        return frozenset()
+    capable: set[str] = set()
+    for name, caps in advertised.items():
+        if not isinstance(caps, dict):
+            continue
+        if all(caps.get(key) is True for key in (
+            "can_present_card", "can_wait_for_decision", "full_text", "terminal_edit",
+        )):
+            capable.add(str(name))
+    return frozenset(capable)
+
+
+def approval_channel_capable(surface: str, adapter: Any) -> bool:
+    """Full manifest proof, not a platform-name guess."""
+    caps = surface_capabilities(surface)
+    adapter_caps = AdapterCapabilities.for_adapter(adapter)
+    return bool(
+        caps.can_present_card
+        and caps.can_wait_for_decision
+        and caps.full_text
+        and caps.can_rewrite
+        and adapter_caps.approval_card
+        and adapter_caps.full_text
+        and adapter_caps.terminal_edit
+    )
 
 
 def _presented(authorization: str | None) -> str:
@@ -84,6 +219,7 @@ def create_api(
     *,
     token: str,
     adapters: dict[str, Any] | None = None,
+    approval_protocol: int | None = APPROVAL_RPC_PROTOCOL,
 ) -> FastAPI:
     """Build the gateway's local API. Auth is required on every route."""
     api = FastAPI(title="LEO gateway", version="1")
@@ -91,8 +227,26 @@ def create_api(
 
     sessions = SessionStore()
     typing_tasks: dict[str, asyncio.Task[Any]] = {}
+    # Transport state of cards this gateway actually delivered. Not an approval
+    # authority: the shared approvals row stays the one durable authority.
+    presented_cards: dict[str, dict[str, Any]] = {}
 
-    async def _typing_until(adapter: Any, subject: str, interval: float = 4.0) -> None:
+    def _advertised_cards() -> dict[str, dict[str, Any]]:
+        if approval_protocol is None:
+            return {}
+        advertised: dict[str, dict[str, Any]] = {}
+        for name, adapter in channels.items():
+            if approval_channel_capable(name, adapter):
+                caps = surface_capabilities(name)
+                advertised[name] = {
+                    **caps.model_dump(mode="json"),
+                    "terminal_edit": True,
+                }
+        return advertised
+
+    async def _typing_until(
+        adapter: Any, subject: str, channel: str = "", interval: float = 4.0,
+    ) -> None:
         """Repeat the channel's typing action until the turn finishes.
 
         In the split the brain answers over the API, so nothing in the reply path
@@ -101,20 +255,23 @@ def create_api(
         """
         while True:
             try:
-                await adapter.typing(subject)
-            except Exception:  # cosmetic only: never fail a turn for a typing hint
-                pass
+                await adapter.send_typing(subject)
+            except Exception as exc:  # cosmetic only: never fail a turn for a hint
+                _LOG.warning("typing indicator failed", extra={
+                    "channel": channel, "target": subject,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
             await asyncio.sleep(interval)
 
     def _start_typing(admission_id: str, channel: str, subject: str) -> None:
         adapter = channels.get(channel)
-        if adapter is None or not hasattr(adapter, "typing"):
+        if adapter is None or not hasattr(adapter, "send_typing"):
             return
         previous = typing_tasks.pop(admission_id, None)
         if previous is not None:
             previous.cancel()
         typing_tasks[admission_id] = asyncio.create_task(
-            _typing_until(adapter, subject), name=f"typing-{admission_id}"
+            _typing_until(adapter, subject, channel), name=f"typing-{admission_id}"
         )
 
     def _stop_typing(admission_id: str) -> None:
@@ -136,8 +293,14 @@ def create_api(
     async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         await auth(authorization)
         stats = await store.stats()
-        return {"ok": True, "pid": os.getpid(), "channels": sorted(channels),
-                "sessions": await sessions.stats(), **stats}
+        body: dict[str, Any] = {
+            "ok": True, "pid": os.getpid(), "channels": sorted(channels),
+            "sessions": await sessions.stats(), **stats,
+        }
+        if approval_protocol is not None:
+            body["approval_protocol"] = approval_protocol
+            body["approval_cards"] = _advertised_cards()
+        return body
 
     @api.post("/v1/claim")
     async def claim(request: ClaimRequest,
@@ -177,7 +340,19 @@ def create_api(
         admission = await store.admission(request.admission_id)
         if admission is None:
             raise HTTPException(status_code=404, detail="unknown admission")
+        # Sender identity is the admission's immutable principal/thread, never
+        # the worker's body. An echoed mismatch means a different conversation
+        # (or a forged reply) is trying to answer this admission.
+        if request.principal and admission.get("principal") and (
+            request.principal != admission["principal"]
+        ):
+            raise HTTPException(status_code=409, detail="principal does not own this admission")
+        if request.thread_id and admission.get("thread_id") and (
+            str(request.thread_id) != str(admission["thread_id"])
+        ):
+            raise HTTPException(status_code=409, detail="thread does not match admission")
         delivered, error = True, ""
+        target = str(admission.get("reply_target") or admission["subject"])
         if request.answer.strip():
             adapter = channels.get(admission["channel"])
             if adapter is None:
@@ -193,7 +368,7 @@ def create_api(
                     try:
                         edited = bool(await asyncio.wait_for(
                             adapter.edit_message_text(
-                                admission["subject"], request.edit_message_id,
+                                target, request.edit_message_id,
                                 # The tap consumed the choice: keep the result
                                 # text, remove the buttons.
                                 request.answer, {"inline_keyboard": []},
@@ -215,7 +390,7 @@ def create_api(
                             else {}
                         )
                         await asyncio.wait_for(
-                            adapter.send(admission["subject"], request.answer, **extra),
+                            adapter.send(target, request.answer, **extra),
                             timeout=DELIVERY_TIMEOUT_SECONDS,
                         )
                     except asyncio.TimeoutError:
@@ -280,6 +455,158 @@ def create_api(
             raise HTTPException(status_code=401, detail="ticket is invalid, used or expired")
         return {"session_token": session_token}
 
+    def _verify_identity(
+        admission: Mapping[str, Any], principal: str | None, thread_id: str | None
+    ) -> None:
+        if principal and admission.get("principal") and principal != admission["principal"]:
+            raise HTTPException(409, "principal does not own this admission")
+        if thread_id and admission.get("thread_id") and str(thread_id) != str(admission["thread_id"]):
+            raise HTTPException(409, "thread does not match admission")
+
+    async def _card_for_transport(approval_id: str, digest: str, channel: str) -> Any:
+        row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (approval_id,))
+        if row is None:
+            raise HTTPException(404, "unknown approval")
+        if not is_schedule_kind(str(row["kind"] or "")):
+            raise HTTPException(409, "not a schedule approval card")
+        if str(row["status"] or "") != "pending":
+            raise HTTPException(409, f"approval already {row['status']}")
+        if not proposal_digest_matches(row, digest):
+            raise HTTPException(409, "proposal digest does not match the durable card")
+        try:
+            card = card_from_row(row)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not card_fits_surface(card, channel):
+            raise HTTPException(409, "card exceeds this channel's presentation budget")
+        return card
+
+    if approval_protocol is not None:
+
+        @api.post("/v1/approval/present")
+        async def approval_present(
+            request: ApprovalPresentRequest,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            """Send a full literal card to a capable channel the gateway owns."""
+            await auth(authorization)
+            admission = await store.admission(request.admission_id)
+            if admission is None:
+                raise HTTPException(404, "unknown admission")
+            _verify_identity(admission, request.principal, request.thread_id)
+            channel = str(admission.get("channel") or "")
+            adapter = channels.get(channel)
+            if adapter is None or not approval_channel_capable(channel, adapter):
+                raise HTTPException(409, "channel cannot present a schedule card")
+            card = await _card_for_transport(
+                request.approval_id, request.confirm_proposal_digest, channel
+            )
+            text = schedule_card_text(card)
+            if len(text) > (surface_capabilities(channel).max_card_chars or len(text)):
+                raise HTTPException(409, "card exceeds this channel's size limit")
+            keyboard = build_schedule_keyboard(
+                card.approval_id, approval_kind=card.kind, choices=card.choices,
+                choice_labels=card.choice_labels, deny_only=card.deny_only,
+            )
+            extra: dict[str, Any] = {"reply_markup": keyboard}
+            if channel == "telegram":
+                extra["plain_text"] = True
+            target = str(admission.get("reply_target") or admission.get("subject") or "")
+            try:
+                result = await asyncio.wait_for(
+                    adapter.send(target, text, **extra),
+                    timeout=DELIVERY_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:  # noqa: BLE001 - transport failure is fail-closed
+                raise HTTPException(502, f"card delivery failed: {type(exc).__name__}") from exc
+            message_id = ""
+            if isinstance(result, Mapping):
+                message_id = str(result.get("message_id") or "")
+            presented_cards[card.approval_id] = {
+                "admission_id": request.admission_id,
+                "message_id": message_id,
+                "channel": channel,
+                "target": target,
+                "digest": card.proposal_digest,
+                "acked_at": None,
+            }
+            return {
+                "presented": True, "approval_id": card.approval_id,
+                "message_id": message_id, "channel": channel,
+                "protocol": APPROVAL_RPC_PROTOCOL,
+            }
+
+        @api.post("/v1/approval/ack")
+        async def approval_ack(
+            request: ApprovalAckRequest,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            """Transport receipt of a presented card; not a decision or shown proof."""
+            await auth(authorization)
+            admission = await store.admission(request.admission_id)
+            if admission is None:
+                raise HTTPException(404, "unknown admission")
+            record = presented_cards.get(request.approval_id)
+            if record is None or record["admission_id"] != request.admission_id:
+                raise HTTPException(409, "this gateway did not present that card")
+            record["acked_at"] = datetime.now(timezone.utc).isoformat()
+            return {"acked": True, "approval_id": request.approval_id}
+
+        @api.post("/v1/approval/update")
+        async def approval_update(
+            request: ApprovalUpdateRequest,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            """Replace the tapped card with its kind-preserving terminal text."""
+            await auth(authorization)
+            admission = await store.admission(request.admission_id)
+            if admission is None:
+                raise HTTPException(404, "unknown admission")
+            record = presented_cards.get(request.approval_id)
+            if record is None or record["admission_id"] != request.admission_id:
+                raise HTTPException(409, "this gateway did not present that card")
+            if not record["acked_at"]:
+                raise HTTPException(409, "card was not acknowledged before rewrite")
+            if terminal_rewrite_done(request.approval_id):
+                _TERMINAL_REWRITES.discard(request.approval_id)
+                presented_cards.pop(request.approval_id, None)
+                return {"updated": False, "reason": "tap already rewrote this card",
+                        "approval_id": request.approval_id}
+            if not proposal_digest_matches({"digest": record["digest"]}, request.confirm_proposal_digest):
+                raise HTTPException(409, "proposal digest does not match the presented card")
+            text = str(request.text or "")
+            if (
+                str(record["channel"]) == "telegram"
+                and len(text) > TELEGRAM_MAX_CHARS
+            ):
+                # Mirror the tap path: never silently clip a frozen card body.
+                # The full terminal text remains in the durable approval row
+                # and the dashboard; this rewrite is only a short pointer.
+                lines = text.splitlines()
+                title = lines[0].strip() if lines else "⏰ Schedule approval"
+                verdict = await _pointer_verdict(request.approval_id, text)
+                text = "\n".join([
+                    title or "⏰ Schedule approval",
+                    f"id: {request.approval_id}",
+                    "Full approval text is in the LEO dashboard.",
+                    verdict,
+                ]).rstrip()
+            adapter = channels.get(str(record["channel"]))
+            edit = getattr(adapter, "edit_message_text", None)
+            if not callable(edit) or not str(record["message_id"]):
+                raise HTTPException(409, "channel cannot rewrite a presented card")
+            try:
+                updated = bool(await asyncio.wait_for(
+                    edit(record["target"], record["message_id"], text,
+                         {"inline_keyboard": []}),
+                    timeout=DELIVERY_TIMEOUT_SECONDS,
+                ))
+            except Exception as exc:  # noqa: BLE001 - a rewrite failure is reported
+                raise HTTPException(502, f"card rewrite failed: {type(exc).__name__}") from exc
+            if updated:
+                presented_cards.pop(request.approval_id, None)
+            return {"updated": updated, "approval_id": request.approval_id}
+
     @api.post("/v1/admit")
     async def admit(payload: dict[str, Any],
                     authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -288,9 +615,17 @@ def create_api(
         admission_id, created = await store.admit(
             channel=str(payload.get("channel") or "unknown"),
             subject=str(payload.get("subject") or ""),
-            principal=str(payload.get("principal") or ""),
+            principal=str(payload.get("principal") or payload.get("sender_id") or ""),
             payload=payload,
             request_id=str(payload.get("request_id") or ""),
+            thread_id=(
+                str(payload.get("thread_id") or payload.get("thread"))
+                if payload.get("thread_id") or payload.get("thread") else None
+            ),
+            reply_target=(
+                str(payload.get("reply_target"))
+                if payload.get("reply_target") else None
+            ),
         )
         return {"admission_id": admission_id, "created": created}
 
@@ -394,12 +729,16 @@ async def poll_loop(store: GatewayStore, adapters: dict[str, Any],
                 await store.admit(
                     channel=message.channel,
                     subject=message.conversation_ref or message.sender_id,
-                    principal=message.sender_id,
+                    principal=message.sender_id or "",
+                    thread_id=message.thread,
+                    reply_target=message.reply_target,
                     payload={
                         "text": turn_text,
                         "sender": message.sender,
                         "sender_id": message.sender_id,
                         "conversation_ref": message.conversation_ref,
+                        "thread": message.thread,
+                        "reply_target": message.reply_target,
                         "message_id": message.message_id,
                         "attachments": attachment_ids,
                     },
@@ -455,7 +794,7 @@ def run_gateway(host: str = "127.0.0.1", port: int = 8766) -> None:
                 payload["source_message_id"] = str(source_message_id)
             await store.admit(
                 channel=channel, subject=subject, payload=payload,
-                principal=subject, request_id=nonce,
+                principal=subject, request_id=nonce, reply_target=subject,
             )
 
         install_callbacks(_settings, _permissions, adapters, admit=_admit_command)
