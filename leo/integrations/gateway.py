@@ -15,13 +15,14 @@ import inspect
 import hashlib
 import json
 import time
+import weakref
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, NamedTuple
 
 from .. import db
-from ..config import Settings
+from ..config import DEFAULT_TURN_CONCURRENCY, Settings, bounded_turn_concurrency
 from ..contracts import IntegrationRecord, PermissionManager, RiskLevel, new_id, utcnow
 from ..events import Event, EventBus
 from ..logging import get_logger
@@ -206,6 +207,7 @@ class Gateway:
         admission: ChannelAdmission | None = None,
         webhook_replay_window: float | None = WEBHOOK_REPLAY_WINDOW_SECONDS,
         outbound_media_root: str | Path | None = None,
+        concurrency: int = DEFAULT_TURN_CONCURRENCY,
     ) -> None:
         self.adapters: dict[str, MessagingAdapter] = dict(adapters or {})
         self.attachment_sink: Callable[[str, dict[str, Any]], Awaitable[str | None]] | None = None
@@ -223,6 +225,12 @@ class Gateway:
         # lifetime. Every per-send argument is confined to it, so no caller can
         # widen the whitelist by naming a different root.
         self.outbound_media_root = outbound_media_root
+        # Bounded fan-out across conversations. One conversation still has at
+        # most one turn in flight (see _conversation_lock below).
+        self.concurrency = bounded_turn_concurrency(concurrency)
+        self._conversation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         # Optional app-level hook used by drain_outbox(). Set from the
         # composition root after the agent engine exists.
         self._reply_handler: OutboxHandler | None = None
@@ -903,6 +911,14 @@ class Gateway:
                 return
             await asyncio.sleep(self.TYPING_INTERVAL_SECONDS)
 
+    def _conversation_lock(self, conversation_id: str) -> asyncio.Lock:
+        """One FIFO lock per conversation; idle locks are garbage collected."""
+        lock = self._conversation_locks.get(conversation_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._conversation_locks[conversation_id] = lock
+        return lock
+
     async def drain_outbox(
         self,
         handler: OutboxHandler | None = None,
@@ -911,14 +927,18 @@ class Gateway:
         channel: str | None = None,
         max_attempts: int = 3,
         per_row_timeout: float = 1980.0,
+        concurrency: int | None = None,
     ) -> dict[str, int]:
         """Public draining API: run one reply turn per claimed outbox record.
 
         The handler receives the full admitted-message payload (including
         ``conversation_id``, ``reply_target`` and ``text``) and is responsible
-        for starting an agent turn and calling :meth:`send`. Failures keep the
-        record retryable with an error note; repeated failures dead-letter it
-        as ``failed``. No handler means no silent success.
+        for starting an agent turn and calling :meth:`send`. Rows are processed
+        concurrently, bounded by ``concurrency`` (the gateway default when
+        omitted), but only one turn per conversation runs at a time and rows of
+        one conversation keep their claim order. Failures keep the record
+        retryable with an error note; repeated failures dead-letter it as
+        ``failed``. No handler means no silent success.
         """
         await self._ensure_outbox()
         consumer = handler or self._reply_handler
@@ -928,15 +948,64 @@ class Gateway:
             )
         claimed = await self._claim_outbox(max(1, min(int(limit), 100)), channel)
         summary = {"claimed": len(claimed), "processed": 0, "suppressed": 0, "failed": 0, "remaining": 0}
-        for row in claimed:
-            outbox_id = str(row["id"])
-            try:
-                payload = json.loads(str(row["payload"]))
-            except (TypeError, ValueError):
-                payload = {}
-            # The outbox id is the end-to-end idempotency key: an app handler
-            # must forward it to gateway.send()/the adapter for real suppression.
-            payload["idempotency_key"] = outbox_id
+        slots = asyncio.Semaphore(
+            bounded_turn_concurrency(
+                self.concurrency if concurrency is None else concurrency
+            )
+        )
+        # _claim_outbox returns rows in admission order. Tasks are created in
+        # that order and each row waits on its conversation lock first, so a
+        # second row of the same chat cannot overtake the first.
+        tasks = [
+            asyncio.create_task(
+                self._drain_outbox_row(
+                    row, consumer, max_attempts=max_attempts, slots=slots,
+                    per_row_timeout=per_row_timeout,
+                )
+            )
+            for row in claimed
+        ]
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, dict):
+                    for key in ("processed", "suppressed", "failed"):
+                        summary[key] += int(result.get(key, 0) or 0)
+                else:
+                    # A row that escaped its own error boundary must not stop
+                    # the rest of the batch; its row stays retryable.
+                    summary["failed"] += 1
+                    _LOG.warning("outbox row task failed", extra={"error": repr(result)})
+        stats = await self.outbox_stats()
+        summary["remaining"] = stats["pending"] + stats["failed"]
+        return summary
+
+    async def _drain_outbox_row(
+        self,
+        row: Any,
+        consumer: OutboxHandler,
+        *,
+        max_attempts: int,
+        slots: asyncio.Semaphore,
+        per_row_timeout: float,
+    ) -> dict[str, int]:
+        """Deliver one claimed row and return its summary counters."""
+        counts = {"processed": 0, "suppressed": 0, "failed": 0}
+        outbox_id = str(row["id"])
+        try:
+            payload = json.loads(str(row["payload"]))
+        except (TypeError, ValueError):
+            payload = {}
+        # The outbox id is the end-to-end idempotency key: an app handler
+        # must forward it to gateway.send()/the adapter for real suppression.
+        payload["idempotency_key"] = outbox_id
+        # A row without a conversation id gets its own lock rather than
+        # serialising every such row behind one global key.
+        conversation_id = str(payload.get("conversation_id") or outbox_id)
+        # Take the conversation lock BEFORE a slot: asyncio.Lock is FIFO, so
+        # same-chat rows stay in order, and a row waiting on its chat does not
+        # occupy a slot another conversation could use.
+        async with self._conversation_lock(conversation_id), slots:
             try:
                 marker = await self._delivery_state(outbox_id)
                 if marker.get("state") == "delivered":
@@ -949,16 +1018,14 @@ class Gateway:
                         outbox_id=outbox_id, channel=payload.get("channel"),
                         conversation_id=payload.get("conversation_id"),
                     )
-                    summary["suppressed"] += 1
-                    summary["processed"] += 1
-                    continue
+                    counts["suppressed"] += 1
+                    counts["processed"] += 1
+                    return counts
                 typing_task = asyncio.create_task(self._typing_heartbeat(payload))
                 try:
-                    # A turn that never returns would hold this loop — the only
-                    # consumer of the channel outbox — for as long as it hangs.
-                    # Live: one row sat in `processing` for five hours and every
-                    # later message went unanswered. The turn has its own cap, so
-                    # timing out slightly above it only catches a real hang.
+                    # Each row has its own cap: a hung turn holds only its own
+                    # conversation, never the whole outbox. The turn has its own
+                    # timeout too, so this only catches a real hang.
                     result = await asyncio.wait_for(
                         consumer(payload), timeout=max(1.0, float(per_row_timeout))
                     )
@@ -977,7 +1044,7 @@ class Gateway:
                     outbox_id=outbox_id, channel=payload.get("channel"),
                     conversation_id=payload.get("conversation_id"),
                 )
-                summary["processed"] += 1
+                counts["processed"] += 1
             except asyncio.CancelledError as cancel:
                 # A turn that hit its lifetime cap cancels itself; that is a
                 # failed row, not a reason to abandon every row behind it.
@@ -989,7 +1056,7 @@ class Gateway:
                 await self._finish_outbox(
                     outbox_id, status, error=f"CancelledError: {cancel or 'turn cancelled'}"
                 )
-                summary["failed"] += 1
+                counts["failed"] += 1
             except Exception as exc:  # noqa: BLE001 - one bad turn must not stall the queue
                 marker = await self._delivery_state(outbox_id)
                 error = f"{type(exc).__name__}: {exc}"
@@ -1008,10 +1075,8 @@ class Gateway:
                         outbox_id=outbox_id, channel=payload.get("channel"),
                         conversation_id=payload.get("conversation_id"), error=error,
                     )
-                summary["failed"] += 1
-        stats = await self.outbox_stats()
-        summary["remaining"] = stats["pending"] + stats["failed"]
-        return summary
+                counts["failed"] += 1
+        return counts
 
     async def policy_version(self) -> int:
         """Current durable channel-policy version."""

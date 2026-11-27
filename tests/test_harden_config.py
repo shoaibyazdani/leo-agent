@@ -15,12 +15,16 @@ import re
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from leo.config import (
+    DEFAULT_TURN_CONCURRENCY,
+    MAX_TURN_CONCURRENCY,
     ModelConfig,
     ModelProviderConfig,
     Settings,
     _parse_env_bool,
+    bounded_turn_concurrency,
     upstream_provider,
 )
 from leo.contracts import (
@@ -538,3 +542,26 @@ def test_health_catalog_reports_one_provider_for_a_shared_gateway(tmp_path):
     default_cfg = settings.models.providers[settings.models.default]
     assert upstream_provider(default_cfg) == "opencode.ai"
     assert str(default_cfg.model) == "deepseek-v4.1-flash"
+
+
+def test_turn_concurrency_default_and_yaml_override(tmp_path, monkeypatch):
+    """The shipped service is bounded but parallel by default."""
+    assert DEFAULT_TURN_CONCURRENCY == 4
+    assert _load(tmp_path, "", monkeypatch=monkeypatch).server.concurrency == 4
+    assert _load(
+        tmp_path, "server:\n  concurrency: 9\n", monkeypatch=monkeypatch
+    ).server.concurrency == 9
+    shipped = Settings.load(Path(__file__).resolve().parents[1] / "leo.yaml")
+    assert shipped.server.concurrency == DEFAULT_TURN_CONCURRENCY
+
+
+@pytest.mark.parametrize("value", [0, -1, MAX_TURN_CONCURRENCY + 1])
+def test_turn_concurrency_rejects_out_of_range(tmp_path, monkeypatch, value):
+    with pytest.raises(ValidationError):
+        _load(tmp_path, f"server:\n  concurrency: {value}\n", monkeypatch=monkeypatch)
+
+
+def test_bounded_turn_concurrency_clamps_callers():
+    assert bounded_turn_concurrency(None) == DEFAULT_TURN_CONCURRENCY
+    assert bounded_turn_concurrency(0) == 1
+    assert bounded_turn_concurrency(999) == MAX_TURN_CONCURRENCY

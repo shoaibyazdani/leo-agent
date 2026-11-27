@@ -12,7 +12,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from ..config import Settings
+from ..config import DEFAULT_TURN_CONCURRENCY, MAX_TURN_CONCURRENCY, Settings
 from ..contracts import MemoryCategory, MemoryKind, TaskStatus
 from ..core import LeoApp
 
@@ -157,9 +157,13 @@ def serve(
     ),
     gateway_url: str | None = typer.Option(None, "--gateway-url", help="Gateway base URL"),
     once: bool = typer.Option(False, "--once", help="Answer one turn and exit"),
-    concurrency: int = typer.Option(
-        1, "--concurrency", min=1, max=32,
-        help="Turns answered in parallel; 1 means a long turn blocks the queue",
+    concurrency: int | None = typer.Option(
+        None, "--concurrency", min=1, max=MAX_TURN_CONCURRENCY,
+        help=(
+            f"Worker turns answered in parallel; default from leo.yaml "
+            f"server.concurrency ({DEFAULT_TURN_CONCURRENCY}). "
+            "1 restores the serial drain. Single-process servers use leo.yaml."
+        ),
     ),
     turn_max_seconds: float = typer.Option(
         1800.0, "--turn-max-seconds",
@@ -170,8 +174,11 @@ def serve(
     import uvicorn
 
     if worker:
+        effective_concurrency = (
+            concurrency if concurrency is not None else _settings().server.concurrency
+        )
         _serve_worker(gateway_url or os.getenv("LEO_GATEWAY_URL"), once=once,
-                      concurrency=concurrency, turn_max_seconds=turn_max_seconds)
+                      concurrency=effective_concurrency, turn_max_seconds=turn_max_seconds)
         return
 
     settings = _settings()
@@ -196,7 +203,8 @@ def serve(
     )
 
 
-def _serve_worker(url: str | None, *, once: bool = False, concurrency: int = 1,
+def _serve_worker(url: str | None, *, once: bool = False,
+                  concurrency: int = DEFAULT_TURN_CONCURRENCY,
                   turn_max_seconds: float = 1800.0) -> None:
     """Run the brain against a gateway instead of owning the channels."""
     import asyncio

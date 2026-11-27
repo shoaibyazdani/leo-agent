@@ -228,3 +228,50 @@ async def test_a_stuck_turn_is_visible_in_attempts(bad):
     assert claimed is not None
     assert row["queue"]["claimed"] == 1
     assert admission_id
+
+
+async def test_worker_loops_keep_one_turn_per_conversation(monkeypatch):
+    """More claim loops mean more chats in parallel, never two turns in one chat."""
+    from leo import db
+
+    store = GatewayStore()
+    await store.save_route("telegram", "1", "conv-same")
+    ids: list[str] = []
+    for index, text in enumerate(("first", "second")):
+        admission_id, _ = await store.admit(
+            channel="telegram", subject="1",
+            payload=payload(str(index), text),
+        )
+        ids.append(admission_id)
+    for index, admission_id in enumerate(ids):
+        await db.execute(
+            "UPDATE gateway_queue SET created_at=? WHERE admission_id=?",
+            (f"2026-01-01T00:00:0{index}+00:00", admission_id),
+        )
+
+    class OrderedBrain(_Brain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[str] = []
+            self.active = 0
+            self.peak_overlap = 0
+
+        async def ask(self, text, channel=None, subject=None, conversation_id=None):
+            self.seen.append(str(text))
+            self.active += 1
+            self.peak_overlap = max(self.peak_overlap, self.active)
+            await asyncio.sleep(0.05)
+            self.active -= 1
+            return {"content": f"answer:{text}", "conversation_id": conversation_id}
+
+    brain = OrderedBrain()
+    worker_module, original, _ = _wire(monkeypatch, store, brain, concurrency=2)
+    try:
+        answered = await _run(worker_module, brain, wait_seconds=0.0, once=True,
+                              concurrency=2)
+    finally:
+        worker_module.GatewayClient = original
+
+    assert answered == 2
+    assert brain.seen == ["first", "second"]
+    assert brain.peak_overlap == 1, "two worker loops ran turns of one chat together"

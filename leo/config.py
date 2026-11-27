@@ -20,6 +20,20 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 _FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
 
+# Bounded fan-out for channel turns. Different conversations may overlap; turns
+# inside one conversation stay serial. Four is a conservative default: enough
+# parallelism for separate chats without opening an unbounded number of models,
+# shells and provider connections at once.
+DEFAULT_TURN_CONCURRENCY = 4
+MAX_TURN_CONCURRENCY = 32
+
+
+def bounded_turn_concurrency(value: int | None) -> int:
+    """Clamp a caller-supplied fan-out to the safe, documented range."""
+    if value is None:
+        return DEFAULT_TURN_CONCURRENCY
+    return max(1, min(MAX_TURN_CONCURRENCY, int(value)))
+
 
 def _parse_env_bool(env_name: str, raw: str) -> bool:
     """Parse a boolean env override strictly (never fail open on a typo)."""
@@ -598,6 +612,11 @@ class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8765
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    # How many distinct conversations the outbox may work on at once. One
+    # conversation never has more than one turn in flight, whatever this is.
+    concurrency: int = Field(
+        default=DEFAULT_TURN_CONCURRENCY, ge=1, le=MAX_TURN_CONCURRENCY
+    )
 
 
 class ChannelPolicyConfig(BaseModel):

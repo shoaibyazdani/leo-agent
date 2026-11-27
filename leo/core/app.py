@@ -754,6 +754,8 @@ class LeoApp:
             # Resolved once, here: the tool and CLI layers cannot widen the
             # attachment whitelist because they never name a root.
             outbound_media_root=self.settings.resolve(self.settings.paths.outbound_media),
+            # Config-owned fan-out; each conversation stays serial in the drain.
+            concurrency=self.settings.server.concurrency,
         )
         # Approval requests are recorded in SQLite and exposed on /approvals,
         # but nothing told the operator one was waiting: a gated action stalled

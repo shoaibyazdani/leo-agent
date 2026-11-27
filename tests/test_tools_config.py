@@ -225,8 +225,10 @@ async def test_config_sources_reports_real_provenance_and_redaction(env):
 
     filtered = await run(env, "config_sources", {"key_prefix": "server"})
     assert filtered.success is True, filtered.error
-    assert set(filtered.output["sources"]) == {"server.host", "server.port", "server.cors_origins"}
-    assert filtered.output["count"] == 3
+    assert set(filtered.output["sources"]) == {
+        "server.host", "server.port", "server.cors_origins", "server.concurrency",
+    }
+    assert filtered.output["count"] == 4
     assert (await tool_rows("config_sources"))[0]["decision"] == "allowed"
 
 

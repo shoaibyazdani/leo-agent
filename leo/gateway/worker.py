@@ -16,11 +16,13 @@ import inspect
 import logging
 import os
 import socket
+import weakref
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
 
+from ..config import DEFAULT_TURN_CONCURRENCY
 from ..contracts import INCAPABLE_SURFACE, TurnContext, surface_capabilities
 from ..security.approval_cards import presenting_cards_via, schedule_terminal_text
 from .server import APPROVAL_RPC_PROTOCOL, gateway_approval_channels, token_path
@@ -427,6 +429,7 @@ async def _claim_loop(
     once: bool,
     turn_max_seconds: float,
     approval_channels: frozenset[str] = frozenset(),
+    conversation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] | None = None,
 ) -> int:
     """One claim/answer loop. Several of these share a client and a brain."""
     answered = 0
@@ -461,70 +464,83 @@ async def _claim_loop(
             # does PermissionManager record shown_at on the shared row.
             return await _present_gateway_card(client, admission, presented, approval_id)
 
-        with presenting_cards_via(present if turn_ctx.capabilities.can_present_card else None):
-            turn = asyncio.create_task(
-                app.ask(
-                    text,
-                    channel=str(admission.get("channel") or "gateway"),
-                    subject=str(admission.get("subject") or ""),
-                    conversation_id=admission.get("conversation_id") or None,
-                    **ask_kwargs,
-                ),
-                name="leo-turn",
-            )
+        # The lease heartbeat starts before the wait: a message queued behind
+        # a long turn of the SAME conversation must not look dead to the queue.
+        lock_key = str(admission.get("conversation_id") or admission_id)
+        if conversation_locks is None:
+            conversation_locks = weakref.WeakValueDictionary()
+        lock = conversation_locks.get(lock_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            conversation_locks[lock_key] = lock
+        await lock.acquire()
         try:
-            # Whichever finishes first decides the fate of the turn. Without this
-            # race the ceiling only stopped RENEWING: the worker kept working,
-            # another worker re-claimed the lapsed admission, and a long turn was
-            # redone from scratch on every attempt — three attempts, no progress.
-            finished, _pending = await asyncio.wait(
-                {turn, keepalive}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if turn not in finished:
-                await _abandon_turn(client, admission_id, turn, turn_max_seconds)
-                continue
-            result = turn.result()
-            answer = str(result.get("content") or "")
-            if str(result.get("status") or "") == "cancelled":
-                # A stopped turn is terminal. Bury the admission BEFORE delivery so
-                # that a failed send cannot fall through to the retry path and
-                # re-run the work the operator just cancelled — which is what made
-                # a stopped turn start typing again.
+            with presenting_cards_via(present if turn_ctx.capabilities.can_present_card else None):
+                turn = asyncio.create_task(
+                    app.ask(
+                        text,
+                        channel=str(admission.get("channel") or "gateway"),
+                        subject=str(admission.get("subject") or ""),
+                        conversation_id=admission.get("conversation_id") or None,
+                        **ask_kwargs,
+                    ),
+                    name="leo-turn",
+                )
+            try:
+                # Whichever finishes first decides the fate of the turn. Without this
+                # race the ceiling only stopped RENEWING: the worker kept working,
+                # another worker re-claimed the lapsed admission, and a long turn was
+                # redone from scratch on every attempt — three attempts, no progress.
+                finished, _pending = await asyncio.wait(
+                    {turn, keepalive}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if turn not in finished:
+                    await _abandon_turn(client, admission_id, turn, turn_max_seconds)
+                    continue
+                result = turn.result()
+                answer = str(result.get("content") or "")
+                if str(result.get("status") or "") == "cancelled":
+                    # A stopped turn is terminal. Bury the admission BEFORE delivery so
+                    # that a failed send cannot fall through to the retry path and
+                    # re-run the work the operator just cancelled — which is what made
+                    # a stopped turn start typing again.
+                    try:
+                        await client.fail(admission_id, "cancelled at operator request",
+                                          retry=False)
+                    except (httpx.HTTPError, GatewayClientError):
+                        pass
+                await _settle_gateway_cards(client, app, admission_id, presented)
+                await client.complete(
+                    admission_id, answer,
+                    str(result.get("conversation_id") or ""),
+                    reply_markup=_answer_markup(result),
+                    edit_message_id=payload.get("source_message_id") or None,
+                    # Preserve the admitted sender identity and thread the gateway
+                    # verifies before it delivers to the admission's own target.
+                    principal=str(admission.get("principal") or "") or None,
+                    thread_id=(
+                        str(admission.get("thread_id") or "") or None
+                    ),
+                    reply_target=(
+                        str(admission.get("reply_target") or "") or None
+                    ),
+                )
+                answered += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # a broken turn must not stop the worker
+                _LOG.warning("turn failed", extra={"admission_id": admission_id,
+                                                   "error": str(exc)})
                 try:
-                    await client.fail(admission_id, "cancelled at operator request",
-                                      retry=False)
+                    await client.fail(admission_id, f"{type(exc).__name__}: {exc}")
                 except (httpx.HTTPError, GatewayClientError):
                     pass
-            await _settle_gateway_cards(client, app, admission_id, presented)
-            await client.complete(
-                admission_id, answer,
-                str(result.get("conversation_id") or ""),
-                reply_markup=_answer_markup(result),
-                edit_message_id=payload.get("source_message_id") or None,
-                # Preserve the admitted sender identity and thread the gateway
-                # verifies before it delivers to the admission's own target.
-                principal=str(admission.get("principal") or "") or None,
-                thread_id=(
-                    str(admission.get("thread_id") or "") or None
-                ),
-                reply_target=(
-                    str(admission.get("reply_target") or "") or None
-                ),
-            )
-            answered += 1
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # a broken turn must not stop the worker
-            _LOG.warning("turn failed", extra={"admission_id": admission_id,
-                                               "error": str(exc)})
-            try:
-                await client.fail(admission_id, f"{type(exc).__name__}: {exc}")
-            except (httpx.HTTPError, GatewayClientError):
-                pass
+            finally:
+                for helper in (keepalive, turn):
+                    helper.cancel()
+                await asyncio.gather(keepalive, turn, return_exceptions=True)
         finally:
-            for helper in (keepalive, turn):
-                helper.cancel()
-            await asyncio.gather(keepalive, turn, return_exceptions=True)
+            lock.release()
         if once:
             return answered
 
@@ -537,14 +553,15 @@ async def run_worker(
     lease_seconds: int = 30,
     once: bool = False,
     brain: Any = None,
-    concurrency: int = 1,
+    concurrency: int = DEFAULT_TURN_CONCURRENCY,
     turn_max_seconds: float = DEFAULT_TURN_MAX_SECONDS,
 ) -> int:
     """Claim and answer turns until cancelled. Returns the number answered.
 
     ``concurrency`` runs that many claim loops against one brain. A single loop
     is head-of-line blocking: one long turn leaves every later message queued,
-    which looks to a user exactly like the bot being down.
+    which looks to a user exactly like the bot being down. The loops share one
+    brain, so a per-conversation lock still keeps each chat's turns in order.
     """
     from .. import db
     from ..core.app import LeoApp
@@ -576,12 +593,18 @@ async def run_worker(
     await app.initialize()
     me = worker_id()
 
+    # Locks live only as long as a turn holds them: a busy service must not
+    # accumulate one lock per conversation it has ever seen.
+    conversation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        weakref.WeakValueDictionary()
+    )
     loops = [
         asyncio.create_task(
             _claim_loop(client, app, f"{me}:{index + 1}",
                         wait_seconds=wait_seconds, lease_seconds=lease_seconds,
                         once=once, turn_max_seconds=turn_max_seconds,
-                        approval_channels=approval_channels),
+                        approval_channels=approval_channels,
+                        conversation_locks=conversation_locks),
             name=f"leo-claim-{index + 1}",
         )
         for index in range(max(1, int(concurrency)))
