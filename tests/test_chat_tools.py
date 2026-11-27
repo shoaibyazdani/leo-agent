@@ -1625,7 +1625,7 @@ async def test_sixteen_turns_same_tool_id_leave_no_unanswered_tool_use() -> None
         response = await app.ask(
             f"Turn {turn} question", channel="test", conversation_id=conversation_id
         )
-        assert response["status"] == "completed"
+        assert response["status"] == "completed", f"turn {turn}: {response}"
         assert len(response["tool_results"]) == 1
 
     assert router.turn_calls == 32  # two model calls per turn
