@@ -45,11 +45,17 @@ from __future__ import annotations
 import hmac
 import json
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timezone
 from typing import Any
 
 from ... import db
-from ...contracts import LIVE_AUTH_CLAIM_TTL_SECONDS, RiskLevel, TaskStatus, ToolCall
+from ...contracts import RiskLevel, TaskStatus, ToolCall
+from ...schedules.clock import Clock, SystemClock
+from ...schedules.service import (
+    ScheduleServiceError,
+    approval_within_window,
+    claim_is_active,
+    claim_mutation_authorization,
+)
 from ...security.permissions import arguments_digest
 from ..verification import digest as evidence_digest
 
@@ -236,6 +242,17 @@ def _service(services: Mapping[str, Any], *names: str) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _approval_clock(services: Mapping[str, Any]) -> Clock:
+    """One injected clock for approval expiry and lease creation/validation."""
+    for candidate in (
+        services.get("clock"),
+        getattr(_service(services, "schedule_service"), "clock", None),
+    ):
+        if candidate is not None and hasattr(candidate, "now"):
+            return candidate
+    return SystemClock()
 
 
 def _parse_request(objective: Any, context: Mapping[str, Any]) -> dict[str, Any]:
@@ -559,29 +576,19 @@ async def _verify_approval(
         decoded = {}
     if isinstance(decoded, Mapping):
         metadata = decoded
-    # The schedule service settles a live run/cancel lease on this same row.
-    # Refuse a card that is already consumed or currently leased, so a second
-    # specialist call cannot authorize another mutation with the same approval.
+    # Trust boundary: never read settings from request context or from a
+    # caller-supplied tool object; an attacker could otherwise disable expiry.
+    settings = _service(services, "settings")
+    if settings is None:
+        return deny("settings service unavailable for approval expiry verification")
+    # The same injected clock drives this check and the service's lease writes.
+    now = _approval_clock(services).now()
+    # Consumed and still-live leases are refused; a provably stale lease left by
+    # a crashed worker can be reclaimed by the shared conditional claim below.
     if metadata.get("live_authorization_used_at"):
         return deny(f"approval {approval_id} was already used for a live action")
-    lease = metadata.get("live_authorization_claim")
-    if isinstance(lease, Mapping) and lease.get("token"):
-        # A lease left by a crashed worker is reclaimable after the shared
-        # bound; an active or unreadable lease stays fail-closed.
-        leased_at: datetime | None = None
-        try:
-            leased_at = datetime.fromisoformat(str(lease.get("at") or ""))
-            if leased_at.tzinfo is None:
-                leased_at = leased_at.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            leased_at = None
-        stale = (
-            leased_at is not None
-            and (datetime.now(timezone.utc) - leased_at).total_seconds()
-            >= LIVE_AUTH_CLAIM_TTL_SECONDS
-        )
-        if not stale:
-            return deny(f"approval {approval_id} is already in use for a live action")
+    if claim_is_active(metadata.get("live_authorization_claim"), now):
+        return deny(f"approval {approval_id} is already in use for a live action")
 
     for field in ("action", "resource", "risk", "actor"):
         expected = {
@@ -599,31 +606,7 @@ async def _verify_approval(
     ):
         return deny("approval arguments digest does not match this mutation")
 
-    # Trust boundary: never read settings from request context or from a
-    # caller-supplied tool object; an attacker could otherwise disable expiry.
-    settings = _service(services, "settings")
-    if settings is None:
-        return deny("settings service unavailable for approval expiry verification")
-    security = getattr(settings, "security", None)
-    try:
-        timeout = int(getattr(security, "approval_timeout_seconds", 900))
-    except (TypeError, ValueError):
-        timeout = 900
-    now = datetime.now(timezone.utc)
-    try:
-        created = datetime.fromisoformat(str(row["created_at"]))
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        expired = (now - created).total_seconds() > timeout
-        # A card's own deadline can be shorter than the configured age limit.
-        if "expires_at" in row.keys() and str(row["expires_at"] or "").strip():
-            deadline = datetime.fromisoformat(str(row["expires_at"]))
-            if deadline.tzinfo is None:
-                deadline = deadline.replace(tzinfo=timezone.utc)
-            expired = expired or now >= deadline
-    except (TypeError, ValueError):
-        expired = True
-    if expired:
+    if not approval_within_window(row, now, settings):
         return deny(f"approval {approval_id} has expired")
 
     # Trust boundary: only the injected PermissionManager can verify and audit
@@ -981,6 +964,25 @@ def make_handler(services: Any = None) -> Callable[..., Any]:
             if not verified:
                 return _blocked(action, tool_name, approval)
 
+        # Enqueue has no schedule service of its own: claim its card here, on
+        # the same single-use, time-bounded path the service uses for run,
+        # cancel and delete. The service claims its own cards after this gate.
+        lease = None
+        if mutating and tool_name == "task_create":
+            resource = str(approval.get("resource") or "")
+            try:
+                lease = await claim_mutation_authorization(
+                    str(approval["approval_id"]),
+                    clock=_approval_clock(injected),
+                    settings=_service(injected, "settings"),
+                    allowed=lambda card, _meta: (
+                        str(card["action"]) == APPROVAL_ACTION
+                        and str(card["resource"] or "") == resource
+                    ),
+                )
+            except ScheduleServiceError as exc:
+                return _blocked(action, tool_name, {**approval, "reason": exc.message})
+
         try:
             output, primary_anchor = await _call(
                 tool_view,
@@ -992,7 +994,15 @@ def make_handler(services: Any = None) -> Callable[..., Any]:
                 ),
             )
         except Exception as exc:
+            if lease is not None:
+                await lease.settle(consumed=False)
             return _failed(action, tool_name, f"{type(exc).__name__}: {exc}", approval)
+        except BaseException:
+            if lease is not None:
+                await lease.settle(consumed=False)
+            raise
+        if lease is not None:
+            await lease.settle(consumed=True)
 
         try:
             return await _shape(

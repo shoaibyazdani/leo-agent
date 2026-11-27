@@ -109,6 +109,30 @@ async def test_stale_one_shot_is_retired_as_missed_without_dispatch(env) -> None
     assert missed[0].payload["reason"] == "outside grace window"
 
 
+async def test_stale_resumed_one_shot_is_retired_as_missed(env) -> None:
+    """N5 pin: a stale preserved anchor never dispatches after resume."""
+    await env.scheduler.register_interval(
+        "resumed", 3600, "remind", {"one_shot": True}
+    )
+    # Simulate a paused edit that preserved the old instant, followed by a
+    # resume that reached the store through a trusted path.
+    await db.execute(
+        "UPDATE schedules SET kind='once', expression='', enabled=1, "
+        "next_run_at=?, grace_minutes=5 WHERE name='resumed'",
+        ((NOW - timedelta(hours=3)).isoformat(),),
+    )
+    assert await env.scheduler.tick(now=NOW) == []
+    row = await db.fetchone("SELECT id FROM schedules WHERE name='resumed'")
+    assert row is None
+    tombstone = await db.fetchone(
+        "SELECT reason FROM schedule_tombstones WHERE name='resumed'"
+    )
+    assert "missed" in tombstone["reason"]
+    missed = await env.events.history("schedule.missed", limit=10)
+    assert len(missed) == 1
+    assert missed[0].payload["reason"] == "outside grace window"
+
+
 async def test_one_shot_inside_grace_still_runs(env) -> None:
     await env.scheduler.register_interval("fresh", 3600, "remind", {"one_shot": True})
     await db.execute(

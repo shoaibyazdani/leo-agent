@@ -38,6 +38,12 @@ a bounded `paused_reason` for the audit trail, and neither re-anchors the
 stored cadence or first run. `schedule_run_now` returns a durable background
 task handle; `schedule_cancel` stops that run without deleting the job.
 
+A paused one-shot has no live instant: an edit that *preserves* its stored
+instant is accepted for operators and models, and the past check applies when
+it is resumed. Creating or re-anchoring a one-shot to a past instant stays
+rejected even while paused. If a stale anchor reaches the runtime, grace
+retires that resumed one-shot as missed instead of dispatching it late.
+
 ## Conditional scheduling guidance
 
 `automation.proactive_mode` is `offer` by default; `off` removes the guidance
@@ -45,8 +51,9 @@ line only and `create` is an opt-in for a later evaluation campaign. No mode
 bypasses a card or a create grant. A short, neutral paragraph is appended to
 the system prompt only when the trusted turn context reports a surface that can
 present a card, wait for a decision, show full text and rewrite its result.
-Blocking CLI/API turns, scheduled or delegated turns, and turns with no trusted
-context get no such guidance. The hint tells the model to list existing
+Blocking CLI/API turns, unattended turns (`scheduled`, `schedule`, `unattended`
+and delegated `agent` sources) and turns with no trusted context get no such
+guidance or create grant. The hint tells the model to list existing
 schedules first, prefer a one-shot or finite run, call `schedule_create` only
 for a clearly user-authorized future moment, describe a job as pending until
 consent, and never retry after a decline.
@@ -95,6 +102,13 @@ bound to one canonical proposal digest and config revision, is shown before it
 can be resolved, and expires at the earlier of the approval timeout and the
 first run it displayed. Grants never cover edits, lifecycle actions, future
 tools or workspace trust; chat actors cannot resolve their own cards.
+
+Telegram inline buttons carry a choice and a card locator only, so a deny tap
+records the explicit sentinel `no reason supplied` in the approval row (shown
+to the model as `no reason given` with a placeholder marker). That gap is
+accepted: no interactive ask-for-reason flow is implemented on Telegram. Real
+free-text reasons are captured on web, TUI and API only: a web prompt, TUI's
+`/deny <id> [reason]`, or the API's `deny_reason` field.
 
 LEO does **not** port the source project's no-card auto-save. A model create or
 semantic edit without an answerable surface returns a durable
@@ -154,10 +168,13 @@ Every surviving field has a runtime consumer:
   controls delivered framing and participates in edit fingerprints.
 - `attach_to_session` uses a durable job conversation; `pinned` stores the
   operator-owned provider/model at creation and fails closed with a needs-you
-  notice when the target disappears; `grace_minutes` is operator-only late-run
-  policy on cron and interval jobs. A legacy one-shot carrying a grace window
-  is retired as missed rather than dispatched after the window; an edit that
-  turns a recurring job into a one-shot must set the window to zero first.
+  notice when the target disappears; `grace_minutes` is an operator-only
+  late-run window admitted by compilation for exactly the kinds the runtime
+  honours it on: cron, interval and one-shot. An occurrence older than the
+  window is skipped; a one-shot is retired as missed rather than dispatched
+  late. Validation and runtime therefore treat the same kinds consistently,
+  including a one-shot that resumes with a stale anchor. Zero clears the
+  window.
 
 Removed intermediate scope stays absent: watcher skills/templates, inline
 script content, per-job script state directories, gate-context/watchdog and a

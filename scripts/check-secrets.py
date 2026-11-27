@@ -99,7 +99,8 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "tests/channels/test_teams.py": {"32": "test fixture"},
     "tests/test_agents_automation_operator.py": {
         "40": "test fixture",
-        "42": "only=assigned secret: synthetic fixture at its current line",
+        "42": "only=assigned secret: synthetic fixture in an earlier revision",
+        "43": "only=assigned secret: synthetic fixture at its current line",
         "41": "only=assigned secret: synthetic fixture in an earlier revision",
         "33": "only=assigned secret: synthetic fixture in an earlier revision",
     },

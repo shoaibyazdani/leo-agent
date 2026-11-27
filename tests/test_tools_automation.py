@@ -402,14 +402,18 @@ async def test_run_now_is_a_background_handle_with_no_cadence_consumption(env):
     assert noop.output["status"] == "no_live_run"
 
 
-async def test_run_and_cancel_copy_is_routine_and_the_gate_still_holds(env):
-    """Plain descriptions must not imply elevated rights or bypass the gate."""
+async def test_run_and_cancel_copy_discloses_the_service_gate_and_it_holds(env):
+    """R10: routine copy must name the real operator/approved-card gate."""
     specs = {spec.name: spec for spec in env.registry.list_specs()}
     for name in ("schedule_run_now", "schedule_cancel"):
         description = specs[name].description.lower()
-        for privileged in ("operator", "admin", "privileg", "approval", "authorized"):
-            assert privileged not in description, (name, privileged)
+        # The ordinary operation stays plain; the gate is attributed to the
+        # service instead of promising the model elevated rights.
         assert "schedule" in description and "task" in description
+        assert "operator turn" in description and "approved card" in description
+        assert "the schedule service enforces this gate" in description
+        for misleading in ("admin", "privileg", "bypass"):
+            assert misleading not in description, (name, misleading)
 
     await run_operator(env, "schedule_create", {
         "name": "gated", "schedule": "1h", "prompt": "build report",

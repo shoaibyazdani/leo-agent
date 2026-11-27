@@ -65,6 +65,22 @@ def test_agent_source_does_not_inherit_a_capable_surface() -> None:
     assert not _has_guidance(_prompt("tui", source="agent"))
 
 
+@pytest.mark.parametrize("source", ["scheduled", "schedule", "unattended", "agent"])
+def test_unattended_sources_get_no_guidance_on_a_capable_surface(source: str) -> None:
+    """R9 pin: both scheduled labels are denied even with a card-capable UI."""
+    assert not _has_guidance(_prompt("tui", source=source))
+
+
+def test_unattended_source_set_is_shared_across_entry_points() -> None:
+    """R9 pin: app guidance, service grants and the tool gate agree on labels."""
+    from leo.core.app import _UNATTENDED_TURN_SOURCES as APP_SOURCES
+    from leo.schedules.service import _UNATTENDED_TURN_SOURCES as SERVICE_SOURCES
+    from leo.tools.executor import _UNATTENDED_SOURCES as EXECUTOR_SOURCES
+
+    assert APP_SOURCES == SERVICE_SOURCES
+    assert {"scheduled", "schedule", "unattended"} <= EXECUTOR_SOURCES
+
+
 def test_guidance_does_not_claim_an_autonomous_save() -> None:
     line = next(
         part for part in _prompt("tui").split("\n\n") if part.startswith(GUIDANCE_START)
@@ -131,7 +147,12 @@ async def test_live_create_grant_rewords_guidance_instead_of_promising_a_card(tm
 
         other = turn.model_copy(update={"conversation_id": "conv-other"})
         assert await app._turn_has_create_grant(other) is False
-        scheduled = turn.model_copy(update={"source": "scheduled"})
-        assert await app._turn_has_create_grant(scheduled) is False
+        for source in ("scheduled", "schedule", "unattended", "agent"):
+            unattended = turn.model_copy(update={"source": source})
+            assert await app._turn_has_create_grant(unattended) is False
+            with turn_context(unattended):
+                assert not _has_guidance(
+                    app._conversation_system_prompt(create_grant=True)
+                )
     finally:
         await app.shutdown()

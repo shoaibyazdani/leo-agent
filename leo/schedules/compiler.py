@@ -375,24 +375,10 @@ class ScheduleCompiler:
         repeat_limit = self._merged_repeat(args, base, parsed, operation=operation)
         execution = self._merged_execution(args, base, parsed, operator=operator)
 
-        # Validation follows the effective spec, not just the fields present in
-        # this request. An edit that turns a cron/interval job into a one-shot
-        # must not silently carry a grace window the runtime would still apply.
-        # An unchanged legacy one-shot may keep its stored window.
-        if (
-            execution.grace_minutes
-            and parsed.kind not in ("cron", "interval")
-            and (
-                operation == "create"
-                or "grace_minutes" in args
-                or (base is not None and base.expression.kind != parsed.kind)
-            )
-        ):
-            raise _fail(
-                "grace_requires_recurring",
-                "grace_minutes only applies to a cron or interval schedule.",
-                field="grace_minutes",
-            )
+        # The runtime applies grace_minutes to every schedule kind: cron,
+        # interval and one-shot alike (a stale one-shot is retired as missed).
+        # Validation must not reject a window the runtime will honour, so no
+        # kind-specific grace check belongs here.
 
         self._validate_supplied_skills(args, base, operation, execution.skills)
 
@@ -736,11 +722,10 @@ class ScheduleCompiler:
             if operation == "create" or reanchors:
                 delta = (candidate - now.astimezone(UTC)).total_seconds()
                 if operator:
-                    # A paused edit does not arm the new instant; re-check it
-                    # if and when the job is resumed.
-                    if delta < -self.past_grace_seconds and not (
-                        operation == "update" and paused
-                    ):
+                    # Pausing suppresses the live next_run, but it does not
+                    # license a new past instant: only *preserving* an existing
+                    # anchor is allowed while paused (resume re-checks it).
+                    if delta < -self.past_grace_seconds:
                         raise _fail(
                             "one_shot_in_past",
                             "The requested one-shot time is in the past.",

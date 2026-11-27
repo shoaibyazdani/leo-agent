@@ -110,6 +110,13 @@ _GRANTED_SCHEDULE_GUIDANCE = (
     "schedule_list first to see what already exists, create only a concrete "
     "user-authorized moment, and say plainly that the job was saved."
 )
+# A turn with no human at the gate must never see scheduling guidance or a
+# create grant, even when it inherited an interactive conversation. Keep the
+# labels aligned with ScheduleService._UNATTENDED_TURN_SOURCES and the
+# executor's unattended gate: "schedule" is a real delegated-scheduled source.
+_UNATTENDED_TURN_SOURCES = frozenset({
+    "scheduled", "schedule", "unattended", "agent",
+})
 _STALL_NUDGE = (
     "You announced a next action but did not perform it. Continue now: either "
     "call the needed tool(s) or deliver the complete final answer. Do not "
@@ -3151,9 +3158,7 @@ class LeoApp:
 
     async def _turn_has_create_grant(self, turn: TurnContext | None) -> bool:
         """True when a live create grant covers this interactive turn."""
-        if turn is None or str(turn.source or "").strip().lower() in (
-            "scheduled", "unattended", "agent"
-        ):
+        if turn is None or str(turn.source or "").strip().lower() in _UNATTENDED_TURN_SOURCES:
             return False
         service = getattr(self, "schedule_service", None)
         checker = getattr(service, "has_live_create_grant", None)
@@ -3217,7 +3222,7 @@ class LeoApp:
             mode != "off"
             and turn is not None
             and capabilities is not None
-            and turn.source not in ("scheduled", "unattended", "agent")
+            and str(turn.source or "").strip().lower() not in _UNATTENDED_TURN_SOURCES
             and capabilities.can_present_card
             and capabilities.can_wait_for_decision
             and capabilities.full_text

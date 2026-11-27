@@ -3,13 +3,13 @@
   "owner": "leo",
   "evidence_source": "leo_local_test_run",
   "upstream_test_evidence": false,
-  "generated_at": "2026-11-27T05:19:17.446308+00:00",
+  "generated_at": "2026-11-27T07:29:28.490679+00:00",
   "command": ".venv/bin/python -m pytest --junitxml=scripts/release/evidence/junit.xml",
   "junit_xml": "scripts/release/evidence/junit.xml",
-  "junit_sha256": "4bb0e34865695706f64565c56351fbe37de8424063d11ae2437c8776d9e7010e",
+  "junit_sha256": "0549d5fd1a47872017c18af0fe1377c2b957023ba07d898e885a2c5a0ca1e1c2",
   "summary": {
-    "total": 3055,
-    "passed": 3030,
+    "total": 3073,
+    "passed": 3048,
     "failed": 0,
     "errors": 0,
     "skipped": 25

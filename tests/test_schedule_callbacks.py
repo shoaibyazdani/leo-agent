@@ -262,3 +262,26 @@ async def test_the_schedule_resolution_audit_names_the_choice(env) -> None:
         "SELECT deny_reason FROM approvals ORDER BY created_at DESC LIMIT 1"
     )
     assert row is not None and row["deny_reason"] == "no reason supplied"
+
+
+@pytest.mark.parametrize("kind", [KIND_SCHEDULE_CREATE, KIND_SCHEDULE_EDIT])
+async def test_telegram_deny_tap_records_the_explicit_no_reason_sentinel(env, kind) -> None:
+    """B4 decision pin: a button carries no reason, and the gap is explicit.
+
+    No interactive ask-for-reason flow exists on Telegram. Real free-text
+    reasons remain available only on web/TUI/API; see docs/SCHEDULES.md.
+    """
+    card = await _card(env, kind=kind)
+    result = await handle_tap(
+        "telegram", _tap(card, "deny"), settings=env.settings,
+        permissions=env.permissions, adapters=env.adapters, allowed=[OWNER],
+    )
+    assert result["decision"] == "rejected" and result["choice"] == "deny"
+    row = await db.fetchone(
+        "SELECT status, deny_reason FROM approvals WHERE id=?", (card.approval_id,)
+    )
+    assert row is not None
+    assert row["status"] == "denied"
+    # Never NULL (which would look like a lost reason) and never a fabricated
+    # human explanation: the sentinel is the accepted durable record.
+    assert row["deny_reason"] == "no reason supplied"

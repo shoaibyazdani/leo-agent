@@ -33,6 +33,7 @@ from leo.security.approval_cards import (
     card_from_row,
     render_edit_body,
     render_schedule_body,
+    schedule_terminal_text,
 )
 from leo.security.permissions import (
     SCHEDULE_CREATE_ACTION,
@@ -502,6 +503,48 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
     assert render_edit_body("Water", ["prompt: water -> tea"]) == (
         'Change "Water": prompt: water -> tea'
     )
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    [
+        "no reason supplied",
+        "denied by operator",
+        "  Denied By Operator  ",
+    ],
+)
+def test_terminal_text_normalizes_placeholder_deny_reasons(sentinel: str) -> None:
+    """M3: the Telegram/TUI rewrite never speaks a system fallback as a reason."""
+    card = ApprovalCard(
+        approval_id="apr-terminal",
+        kind=KIND_SCHEDULE_CREATE,
+        title="Schedule Water",
+        body="Schedule \"Water\" (first run Wed Nov 25 08:00 UTC)",
+        status="denied",
+        outcome="denied",
+        deny_reason=sentinel,
+    )
+    text = schedule_terminal_text(card, status="denied")
+    assert "reason: no reason given" in text
+    assert sentinel.strip().lower() not in text.lower()
+    # Only the rendered copy changes: audit/model projections stay literal.
+    assert card.deny_reason == sentinel
+    assert card.view().deny_reason == sentinel
+    assert "no reason given" not in str(card.model_dump())
+
+
+def test_terminal_text_keeps_a_human_authored_deny_reason() -> None:
+    card = ApprovalCard(
+        approval_id="apr-terminal-human",
+        kind=KIND_SCHEDULE_EDIT,
+        title="Change Water",
+        body='Change "Water": prompt: water -> tea',
+        status="denied",
+        outcome="denied",
+        deny_reason="too expensive",
+    )
+    text = schedule_terminal_text(card, status="denied")
+    assert "reason: too expensive" in text
 
 
 def test_legacy_command_rows_project_into_the_same_frozen_shape() -> None:

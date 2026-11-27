@@ -1202,13 +1202,23 @@ async def test_export_rate_limit_is_durable_and_shared_across_workers(
     # A genuinely different worker (separate interpreter and module state)
     # reads the same SQLite counters and must refuse the third request.
     repo = Path(__file__).resolve().parents[1]
+    # A transient cross-process SQLite lock is environmental, not a rate-limit
+    # result. Retry only that condition so the assertion still pins the real
+    # durable denial.
     worker = (
-        "import asyncio, sys\n"
+        "import asyncio, sqlite3, sys, time\n"
         "from leo import db\n"
         "from leo.interfaces import api\n"
         "db.set_db_path(sys.argv[1])\n"
         "api.EXPORT_RATE_LIMIT = 2\n"
-        "asyncio.run(api._check_export_rate(sys.argv[2]))\n"
+        "for attempt in range(20):\n"
+        "    try:\n"
+        "        asyncio.run(api._check_export_rate(sys.argv[2]))\n"
+        "    except sqlite3.OperationalError as exc:\n"
+        "        if 'locked' not in str(exc).lower() or attempt == 19: raise\n"
+        "        time.sleep(0.05)\n"
+        "    else:\n"
+        "        break\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", worker, str(db.get_db_path()), principal],

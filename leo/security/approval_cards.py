@@ -26,6 +26,9 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 from ..contracts import surface_capabilities
+from ..schedules.outcome import (
+    _model_deny_reason,  # one placeholder set for the model and chat surfaces
+)
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -682,8 +685,11 @@ def schedule_terminal_text(
     else:
         verdict = config.terminal_deny
     lines = [str(card.title or config.header).strip(), str(card.body or "").rstrip()]
-    if card.deny_reason:
-        lines.append(f"reason: {card.deny_reason}")
+    # Chat/TUI copy must not replay a system fallback as if the human spoke it.
+    # The card and its projections stay literal for audit.
+    reason = _model_deny_reason(card.deny_reason)
+    if reason:
+        lines.append(f"reason: {reason}")
     lines += ["", f"{verdict} · {card.outcome or status}"]
     if grant_label:
         lines.append(grant_label)

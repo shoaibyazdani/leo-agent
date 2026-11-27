@@ -16,7 +16,7 @@ import pytest
 
 from leo import db
 from leo.config import Settings
-from leo.contracts import TurnContext
+from leo.contracts import LIVE_AUTH_CLAIM_TTL_SECONDS, TurnContext
 from leo.events import EventBus
 from leo.security.approval_cards import (
     DECLINE_MESSAGES,
@@ -712,6 +712,101 @@ async def test_stale_live_authorization_lease_can_be_reclaimed(env):
     assert run["status"] == "running"
     markers = await _live_authorization_markers(approval_id)
     assert markers["used_at"] and markers["claim"] is None
+
+
+async def test_live_action_beyond_lease_ttl_cannot_be_reclaimed(env, monkeypatch):
+    """M4: a long live action keeps its lease; only a crashed worker's is stale."""
+    await _create_operator(env, name="slow-job", schedule="1h", prompt="run")
+    card = await _approved_edit_card(env, name="slow-job")
+    approval_id = card["approval_id"]
+    started, release = asyncio.Event(), asyncio.Event()
+    original_create = env.engine.create
+
+    async def slow_create(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original_create(*args, **kwargs)
+
+    monkeypatch.setattr(env.engine, "create", slow_create)
+    first = asyncio.create_task(env.service.run_now(
+        name="slow-job", actor="chat:web", turn=_chat("tui"),
+        authorized_by=approval_id, request_key="slow-a",
+    ))
+    await started.wait()
+    env.clock.advance(seconds=LIVE_AUTH_CLAIM_TTL_SECONDS + 1)
+
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="slow-job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=approval_id, request_key="slow-b",
+        )
+    assert caught.value.code == "authorization_consumed"
+
+    release.set()
+    result = await first
+    assert result["status"] == "running"
+    markers = await _live_authorization_markers(approval_id)
+    assert markers["used_at"] and markers["claim"] is None
+
+
+async def test_lease_staleness_uses_numeric_expiry_epoch(env):
+    """M5: SQL never compares ISO timestamp strings to decide staleness."""
+    await _create_operator(env, name="epoch-job", schedule="1h", prompt="run")
+    card = await _approved_edit_card(env, name="epoch-job")
+    approval_id = card["approval_id"]
+    await db.execute(
+        "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+        "'$.live_authorization_claim', json_object('token',?,'at',?,'expires_at',?)) "
+        "WHERE id=?",
+        (
+            "future-iso-past-expiry", (NOW + timedelta(minutes=5)).isoformat(),
+            (NOW - timedelta(seconds=1)).timestamp(), approval_id,
+        ),
+    )
+    claim_type = await db.fetchone(
+        "SELECT typeof(json_extract(metadata,'$.live_authorization_claim.expires_at')) AS kind "
+        "FROM approvals WHERE id=?", (approval_id,),
+    )
+    assert claim_type["kind"] == "real"
+    # The numeric expiry wins even though the ISO 'at' still looks fresh.
+    assert (await env.service.run_now(
+        name="epoch-job", actor="chat:web", turn=_chat("tui"),
+        authorized_by=approval_id,
+    ))["status"] == "running"
+
+    second = await _approved_edit_card(env, name="epoch-job")
+    second_id = second["approval_id"]
+    await db.execute(
+        "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+        "'$.live_authorization_claim', json_object('token',?,'at',?,'expires_at',?)) "
+        "WHERE id=?",
+        (
+            "past-iso-future-expiry", (NOW - timedelta(minutes=5)).isoformat(),
+            (NOW + timedelta(minutes=5)).timestamp(), second_id,
+        ),
+    )
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="epoch-job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=second_id,
+        )
+    assert caught.value.code == "authorization_consumed"
+
+
+async def test_claim_and_settle_use_the_injected_clock(env):
+    """M6: no wall-clock reads in the lease path."""
+    await _create_operator(env, name="clock-job", schedule="1h", prompt="run")
+    card = await _approved_edit_card(env, name="clock-job")
+    approval_id = card["approval_id"]
+    assert (await env.service.run_now(
+        name="clock-job", actor="chat:web", turn=_chat("tui"),
+        authorized_by=approval_id,
+    ))["status"] == "running"
+    row = await db.fetchone(
+        "SELECT json_extract(metadata,'$.live_authorization_used_at') AS used_at "
+        "FROM approvals WHERE id=?", (approval_id,),
+    )
+    assert row["used_at"] == NOW.isoformat()
 
 
 async def test_failed_run_and_noop_cancel_do_not_burn_single_use_cards(env):

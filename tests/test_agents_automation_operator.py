@@ -31,6 +31,7 @@ from leo.agents.specs.automation_operator import (
 from leo.config import Settings
 from leo.contracts import AgentSpec, RiskLevel, ToolCall, TurnContext, turn_context
 from leo.events import EventBus
+from leo.schedules.clock import FrozenClock
 from leo.schedules.service import ScheduleService
 from leo.schedules.store import ScheduleStore
 from leo.security.permissions import PermissionManagerImpl
@@ -402,6 +403,65 @@ async def test_delete_keeps_the_exact_durable_mutation_gate(env) -> None:
         and json.loads(item["metadata"] or "{}").get("approval_id") == approval_id
         for item in audit
     )
+
+
+async def test_one_task_create_approval_authorizes_only_one_enqueue(env) -> None:
+    """Round-4 regression: one task_create card must not enqueue twice."""
+    args = {"objective": "durable work"}
+    approval_id = await approve(env, "task_create", tool_arguments("enqueue_task", args))
+
+    first = await run(env, action="enqueue_task", **args, approval_id=approval_id)
+    assert first.success, first.error
+    assert first.output["status"] == "queued"
+
+    second = await run(env, action="enqueue_task", **args, approval_id=approval_id)
+    assert second.success is False
+    assert second.output["status"] == "blocked_approval_required"
+    assert "already used" in second.output["approval"]["reason"]
+    tasks = await db.fetchall(
+        "SELECT id FROM tasks WHERE json_extract(metadata,'$.source')=?", (AGENT_ID,)
+    )
+    assert len(tasks) == 1
+
+
+async def test_specialist_enqueue_lease_uses_the_injected_clock(env) -> None:
+    """M6: the specialist validates and claims on the service's one clock."""
+    args = {"objective": "clock work"}
+    approval_id = await approve(env, "task_create", tool_arguments("enqueue_task", args))
+    frozen = FrozenClock(datetime.now(timezone.utc) + timedelta(seconds=60))
+    handler = make_handler({**env.services, "clock": frozen})
+    scoped = env.engine._scoped_tools(AgentSpec.model_validate(SEED))
+    assert scoped is not None
+
+    result = await handler(
+        json.dumps({"action": "enqueue_task", **args, "approval_id": approval_id}),
+        context={}, tools=scoped,
+    )
+    assert result["success"], result["error"]
+    row = await db.fetchone(
+        "SELECT json_extract(metadata,'$.live_authorization_used_at') AS used_at "
+        "FROM approvals WHERE id=?", (approval_id,),
+    )
+    assert row["used_at"] == frozen.now().isoformat()
+
+
+async def test_one_delete_approval_cannot_delete_a_recreated_schedule(env) -> None:
+    """Round-4 regression: delete, recreate, delete again with one card."""
+    args = {"name": "recreate-me"}
+    await _service_create(env, name=args["name"])
+    approval_id = await approve(env, "schedule_delete", args)
+
+    first = await run(env, action="delete_schedule", **args, approval_id=approval_id)
+    assert first.success, first.error
+    assert first.output["status"] == "applied"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name=?", (args["name"],)) is None
+
+    await _service_create(env, name=args["name"])
+    second = await run(env, action="delete_schedule", **args, approval_id=approval_id)
+    assert second.success is False
+    assert second.output["status"] == "blocked_approval_required"
+    assert "already used" in second.output["approval"]["reason"]
+    assert await db.fetchone("SELECT id FROM schedules WHERE name=?", (args["name"],)) is not None
 
 
 async def test_trigger_keeps_the_exact_gate_and_reports_queued(env) -> None:

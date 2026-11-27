@@ -20,11 +20,14 @@ schedule store.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+import threading
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .. import db
 from ..contracts import (
@@ -102,6 +105,228 @@ class ScheduleServiceError(ValueError):
 
 def _fail(code: str, message: str, *, field: str | None = None) -> ScheduleServiceError:
     return ScheduleServiceError(code, message, field=field)
+
+
+# One durable approval is one capability. Both the schedule service and the
+# automation specialist use the claim/settle helpers below, so a run, cancel,
+# delete or enqueue card cannot authorize two mutations. The claim carries a
+# numeric UTC expiry epoch (never a lexicographically compared ISO string) and
+# is renewed while its action is live: a crashed worker's claim becomes stale
+# and reclaimable, but a slow live action cannot lose its lease to a second
+# concurrent caller.
+_CLAIM_KEY = "live_authorization_claim"
+_USED_KEY = "live_authorization_used_at"
+_ACTIVE_CLAIMS: dict[str, str] = {}
+_ACTIVE_CLAIMS_LOCK = threading.Lock()
+
+
+def _parse_approval_instant(value: Any) -> datetime | None:
+    """Parse a durable approval timestamp; malformed values fail closed."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def approval_within_window(card: Mapping[str, Any], now: datetime, settings: Any) -> bool:
+    """Both the card's own deadline and the configured approval age apply."""
+    expiry = _parse_approval_instant(
+        card["expires_at"] if "expires_at" in card.keys() else None
+    )
+    if expiry is not None and now >= expiry:
+        return False
+    created = _parse_approval_instant(card["created_at"])
+    if created is None:
+        return False
+    security = getattr(settings, "security", None)
+    try:
+        timeout = int(getattr(security, "approval_timeout_seconds", 900))
+    except (TypeError, ValueError):
+        timeout = 900
+    return 0 <= (now - created).total_seconds() <= max(timeout, 0)
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    try:
+        loaded = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def claim_is_active(claim: Any, now: datetime) -> bool:
+    """True while a lease may still be live, or when it cannot be read.
+
+    Unreadable leases stay fail-closed. Expiry is numeric epoch seconds; an
+    older claim that only carries an ISO ``at`` is interpreted as ``at + TTL``
+    so records written before the epoch representation remain safe.
+    """
+    if claim is None:
+        return False
+    if not isinstance(claim, Mapping) or not claim.get("token"):
+        return True
+    raw_expiry = claim.get("expires_at")
+    if isinstance(raw_expiry, (int, float)) and not isinstance(raw_expiry, bool):
+        expiry = float(raw_expiry)
+    elif isinstance(raw_expiry, str):
+        moment = _parse_approval_instant(raw_expiry)
+        expiry = moment.timestamp() if moment is not None else None
+    elif claim.get("at") is not None:
+        moment = _parse_approval_instant(claim.get("at"))
+        expiry = (
+            moment.timestamp() + LIVE_AUTH_CLAIM_TTL_SECONDS
+            if moment is not None else None
+        )
+    else:
+        expiry = None
+    if expiry is None:
+        return True
+    return now.timestamp() < expiry
+
+
+class MutationAuthorizationLease:
+    """A one-shot approval claim that must be settled exactly once."""
+
+    def __init__(self, card_id: str, token: str, clock: Clock) -> None:
+        self.card_id = card_id
+        self.token = token
+        self.clock = clock
+        self._heartbeat: asyncio.Task[None] | None = None
+        self._settled = False
+
+    def _activate(self) -> None:
+        with _ACTIVE_CLAIMS_LOCK:
+            _ACTIVE_CLAIMS[self.card_id] = self.token
+        # The lease is renewed while the action runs. An action that outlives
+        # the TTL therefore never looks stale, while a crashed worker's task
+        # stops renewing and its claim can be reclaimed.
+        self._heartbeat = asyncio.create_task(self._renew())
+
+    async def _renew(self) -> None:
+        while True:
+            await asyncio.sleep(LIVE_AUTH_CLAIM_TTL_SECONDS / 3)
+            expiry = self.clock.now().timestamp() + LIVE_AUTH_CLAIM_TTL_SECONDS
+            try:
+                updated = await db.execute(
+                    "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+                    "'$.live_authorization_claim.expires_at',?) "
+                    "WHERE id=? "
+                    "AND json_extract(metadata,'$.live_authorization_claim.token')=? "
+                    "AND COALESCE(json_extract(metadata,'$." + _USED_KEY + "'),'')=''",
+                    (expiry, self.card_id, self.token),
+                )
+            except Exception:  # a renewal failure must not abort the live action
+                continue
+            if int(getattr(updated, "rowcount", 0) or 0) < 1:
+                return
+
+    async def settle(self, *, consumed: bool) -> None:
+        """Consume the card after a durable effect, or release an unused lease."""
+        if self._settled:
+            return
+        self._settled = True
+        heartbeat, self._heartbeat = self._heartbeat, None
+        if heartbeat is not None:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await heartbeat
+        with _ACTIVE_CLAIMS_LOCK:
+            if _ACTIVE_CLAIMS.get(self.card_id) == self.token:
+                _ACTIVE_CLAIMS.pop(self.card_id, None)
+        if consumed:
+            await db.execute(
+                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+                "'$.live_authorization_used_at',?,"
+                "'$.live_authorization_claim', json('null')) "
+                "WHERE id=? AND json_extract(metadata,'$.live_authorization_claim.token')=? "
+                "AND COALESCE(json_extract(metadata,'$.live_authorization_used_at'),'')=''",
+                (self.clock.now().isoformat(), self.card_id, self.token),
+            )
+        else:
+            await db.execute(
+                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+                "'$.live_authorization_claim', json('null')) "
+                "WHERE id=? AND json_extract(metadata,'$.live_authorization_claim.token')=?",
+                (self.card_id, self.token),
+            )
+
+
+async def claim_mutation_authorization(
+    approval_id: str,
+    *,
+    clock: Clock,
+    settings: Any = None,
+    allowed: Callable[[Mapping[str, Any], Mapping[str, Any]], bool] | None = None,
+) -> MutationAuthorizationLease:
+    """Atomically lease one approved mutation card to exactly one caller."""
+    card_id = str(approval_id or "").strip()
+    if not card_id:
+        raise _fail(
+            "invalid_authorization", "A mutation requires an approved card.",
+            field="authorization",
+        )
+    row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (card_id,))
+    if row is None or str(row["status"]) != "approved":
+        raise _fail(
+            "invalid_authorization", "The supplied approval is not approved.",
+            field="authorization",
+        )
+    now = clock.now()
+    if not approval_within_window(row, now, settings):
+        raise _fail(
+            "invalid_authorization", "The supplied approval has expired.",
+            field="authorization",
+        )
+    metadata = _json_mapping(row["metadata"])
+    if metadata.get(_USED_KEY):
+        raise _fail(
+            "authorization_consumed",
+            "This approval was already used to authorize a mutation.",
+            field="authorization",
+        )
+    claim = metadata.get(_CLAIM_KEY)
+    with _ACTIVE_CLAIMS_LOCK:
+        active = card_id in _ACTIVE_CLAIMS
+    if active or claim_is_active(claim, now):
+        raise _fail(
+            "authorization_consumed",
+            "This approval is already authorizing another action.",
+            field="authorization",
+        )
+    if allowed is not None and not allowed(row, metadata):
+        raise _fail(
+            "invalid_authorization",
+            "The supplied approval does not authorize this mutation.",
+            field="authorization",
+        )
+    token = new_id("authz")
+    expiry = now.timestamp() + LIVE_AUTH_CLAIM_TTL_SECONDS
+    previous_token = str(claim.get("token") or "") if isinstance(claim, Mapping) else ""
+    claimed = await db.execute(
+        "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+        "'$.live_authorization_claim', json_object('token',?,'at',?,'expires_at',?)) "
+        "WHERE id=? AND status='approved' "
+        "AND COALESCE(json_extract(metadata,'$." + _USED_KEY + "'),'')='' "
+        "AND COALESCE(json_extract(metadata,'$.live_authorization_claim.token'),'')=?",
+        (token, now.isoformat(), expiry, card_id, previous_token),
+    )
+    if int(getattr(claimed, "rowcount", 0) or 0) < 1:
+        raise _fail(
+            "authorization_consumed",
+            "This approval was already used to authorize a mutation.",
+            field="authorization",
+        )
+    lease = MutationAuthorizationLease(card_id, token, clock)
+    lease._activate()
+    return lease
 
 
 class ScheduleService:
@@ -396,8 +621,9 @@ class ScheduleService:
         actor = self._actor(actor, turn)
         principal = self._principal(turn, actor)
         # ``authorized_by`` is set only by the automation specialist after its
-        # own durable ``automation:mutate`` approval was re-verified. It is the
-        # exact existing gate for delete, not the operator path and not a card.
+        # own durable ``automation:mutate`` approval was re-verified. It goes
+        # through the same one-shot lease as run/cancel: a status-only check
+        # would let one delete card remove several schedules.
         is_operator = self._is_operator(turn, actor) or bool(authorized_by)
         if authorized_by:
             approval = await db.fetchone(
@@ -425,6 +651,24 @@ class ScheduleService:
         if replay is not None:
             return replay
 
+        lease: MutationAuthorizationLease | None = None
+        if authorized_by:
+            def allowed(card: Mapping[str, Any], _metadata: Mapping[str, Any]) -> bool:
+                prefix = "schedule_delete:"
+                resource = str(card["resource"] or "")
+                if str(card["action"]) != _SPECIALIST_APPROVAL_ACTION \
+                        or not resource.startswith(prefix):
+                    return False
+                subject = resource[len(prefix):]
+                return subject in {
+                    "", str(view.name)[:160], str(schedule_id or "")[:160],
+                }
+
+            lease = await claim_mutation_authorization(
+                str(authorized_by), clock=self.clock, settings=self.settings,
+                allowed=allowed,
+            )
+
         spec = spec_from_view(view)
         proposal = build_remove_proposal(
             spec=spec,
@@ -442,37 +686,43 @@ class ScheduleService:
         outcome: ScheduleOutcome
         extra: dict[str, Any] = {"changes": changes}
         card = None
-
-        async with db.transaction():
-            stored = await self._create_proposal(proposal)
-            if is_operator:
-                await self._commit_remove(stored)
-                await self.store.update_proposal(stored.id, status="committed")
-                await self._audit(
-                    actor, "schedule.removed", stored.schedule_id,
-                    (
-                        "specialist-approved removal"
-                        if authorized_by
-                        else "operator direct removal"
-                    ),
-                    {
-                        "schedule_id": stored.schedule_id,
-                        **({"authorized_by": authorized_by} if authorized_by else {}),
-                    },
-                )
-                outcome = self._outcome(stored, "removed", view.name, None)
-            elif self._can_answer(turn):
-                card = await self._create_edit_card(
-                    stored, None, actor, changes,
-                    schedule_id=view.id, config_revision=view.config_revision,
-                )
-                outcome = self._outcome(
-                    stored, "approval_required", view.name, None
-                )
-            else:
-                outcome = self._outcome(
-                    stored, "approval_required", view.name, None
-                )
+        effected = False
+        try:
+            async with db.transaction():
+                stored = await self._create_proposal(proposal)
+                if is_operator:
+                    await self._commit_remove(stored)
+                    effected = True
+                    await self.store.update_proposal(stored.id, status="committed")
+                    await self._audit(
+                        actor, "schedule.removed", stored.schedule_id,
+                        (
+                            "specialist-approved removal"
+                            if authorized_by
+                            else "operator direct removal"
+                        ),
+                        {
+                            "schedule_id": stored.schedule_id,
+                            **({"authorized_by": authorized_by} if authorized_by else {}),
+                        },
+                    )
+                    outcome = self._outcome(stored, "removed", view.name, None)
+                elif self._can_answer(turn):
+                    card = await self._create_edit_card(
+                        stored, None, actor, changes,
+                        schedule_id=view.id, config_revision=view.config_revision,
+                    )
+                    outcome = self._outcome(
+                        stored, "approval_required", view.name, None
+                    )
+                else:
+                    outcome = self._outcome(
+                        stored, "approval_required", view.name, None
+                    )
+        except BaseException:
+            await self._settle_live_run_authorization(lease, consumed=effected)
+            raise
+        await self._settle_live_run_authorization(lease, consumed=effected)
         if card is not None:
             extra["card"] = (await self._present_card(card, turn)).model_dump(mode="json")
         return self._finish(outcome, **extra)
@@ -1329,37 +1579,6 @@ class ScheduleService:
             return False
         return str(turn.source or "").strip().lower() in _UNATTENDED_TURN_SOURCES
 
-    @staticmethod
-    def _parse_approval_instant(value: Any) -> datetime | None:
-        """Parse a durable approval timestamp; malformed values fail closed."""
-        text = str(value or "").strip()
-        if not text:
-            return None
-        try:
-            moment = datetime.fromisoformat(text)
-        except (TypeError, ValueError):
-            return None
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        return moment.astimezone(timezone.utc)
-
-    def _approval_within_window(self, card: Any, now: datetime) -> bool:
-        """Both the card's own deadline and the configured approval age apply."""
-        expiry = self._parse_approval_instant(
-            card["expires_at"] if "expires_at" in card.keys() else None
-        )
-        if expiry is not None and now >= expiry:
-            return False
-        created = self._parse_approval_instant(card["created_at"])
-        if created is None:
-            return False
-        security = getattr(self.settings, "security", None)
-        try:
-            timeout = int(getattr(security, "approval_timeout_seconds", 900))
-        except (TypeError, ValueError):
-            timeout = 900
-        return 0 <= (now - created).total_seconds() <= max(timeout, 0)
-
     async def _claim_live_run_authorization(
         self,
         view: Any,
@@ -1368,16 +1587,8 @@ class ScheduleService:
         turn: TurnContext | None,
         authorized_by: str | None,
         operation: str,
-    ) -> tuple[str, str] | None:
-        """Atomically lease a one-shot capability to fire/kill one live run.
-
-        Only an operator or a fresh, human-approved card may proceed. Both
-        accepted card kinds (a schedule edit for this job and the specialist's
-        exact-action ``automation:mutate`` approval) get the same lease: the
-        conditional metadata write means exactly one concurrent caller can win,
-        and settlement consumes the card only after a durable effect. A failed
-        or no-op action releases the lease instead of burning the card.
-        """
+    ) -> MutationAuthorizationLease | None:
+        """Lease one approved card to exactly one live run or cancel."""
         if self._is_operator(turn, actor):
             return None
         card_id = str(authorized_by or "").strip()
@@ -1388,102 +1599,30 @@ class ScheduleService:
                 "schedule edit card.",
                 field="authorization",
             )
-        card = await db.fetchone("SELECT * FROM approvals WHERE id=?", (card_id,))
-        if card is None or str(card["status"]) != "approved":
-            raise _fail(
-                "invalid_authorization",
-                "The supplied approval is not approved.",
-                field="authorization",
-            )
-        now = self._now()
-        if not self._approval_within_window(card, now):
-            raise _fail(
-                "invalid_authorization",
-                "The supplied approval has expired.",
-                field="authorization",
-            )
-        metadata = self._load_json(card["metadata"])
-        if metadata.get("live_authorization_used_at"):
-            raise _fail(
-                "authorization_consumed",
-                "This approval was already used to authorize a run or cancel.",
-                field="authorization",
-            )
-        edit_card = (
-            str(card["kind"]) == KIND_SCHEDULE_EDIT
-            and str(metadata.get("schedule_id") or "") == view.id
-        )
         tool = "schedule_run_now" if operation == "fire" else "schedule_cancel"
         resource = f"{tool}:{str(view.name)[:160]}"
-        exact_action = (
-            str(card["action"]) == _SPECIALIST_APPROVAL_ACTION
-            and str(card["resource"] or "") == resource
-        )
-        if not (edit_card or exact_action):
-            raise _fail(
-                "invalid_authorization",
-                "The supplied approval does not authorize this schedule run.",
-                field="authorization",
+
+        def allowed(card: Mapping[str, Any], metadata: Mapping[str, Any]) -> bool:
+            edit_card = (
+                str(card["kind"]) == KIND_SCHEDULE_EDIT
+                and str(metadata.get("schedule_id") or "") == view.id
             )
-        existing = metadata.get("live_authorization_claim")
-        if isinstance(existing, Mapping):
-            claimed_at = self._parse_approval_instant(existing.get("at"))
-            if claimed_at is not None and 0 <= (now - claimed_at).total_seconds() \
-                    < LIVE_AUTH_CLAIM_TTL_SECONDS:
-                raise _fail(
-                    "authorization_consumed",
-                    "This approval is already authorizing another live action.",
-                    field="authorization",
-                )
-        token = new_id("authz")
-        cutoff = (now - timedelta(seconds=LIVE_AUTH_CLAIM_TTL_SECONDS)).isoformat()
-        claimed = await db.execute(
-            "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
-            "'$.live_authorization_claim', json_object('token',?,'at',?)) "
-            "WHERE id=? AND status='approved' "
-            "AND ((kind=? AND json_extract(metadata,'$.schedule_id')=?) "
-            "OR (action=? AND resource=?)) "
-            "AND COALESCE(json_extract(metadata,'$.live_authorization_used_at'),'')='' "
-            "AND (json_extract(metadata,'$.live_authorization_claim.token') IS NULL "
-            "OR COALESCE(json_extract(metadata,'$.live_authorization_claim.at'),'') < ?)",
-            (
-                token, now.isoformat(), card_id,
-                KIND_SCHEDULE_EDIT, view.id,
-                _SPECIALIST_APPROVAL_ACTION, resource,
-                cutoff,
-            ),
-        )
-        if int(getattr(claimed, "rowcount", 0) or 0) < 1:
-            raise _fail(
-                "authorization_consumed",
-                "This approval was already used to authorize a run or cancel.",
-                field="authorization",
+            exact_action = (
+                str(card["action"]) == _SPECIALIST_APPROVAL_ACTION
+                and str(card["resource"] or "") == resource
             )
-        return card_id, token
+            return bool(edit_card or exact_action)
+
+        return await claim_mutation_authorization(
+            card_id, clock=self.clock, settings=self.settings, allowed=allowed,
+        )
 
     async def _settle_live_run_authorization(
-        self, claim: tuple[str, str] | None, *, consumed: bool
+        self, claim: MutationAuthorizationLease | None, *, consumed: bool
     ) -> None:
         """Consume a successful lease, or release it when nothing took effect."""
-        if claim is None:
-            return
-        card_id, token = claim
-        if consumed:
-            await db.execute(
-                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
-                "'$.live_authorization_used_at',?,"
-                "'$.live_authorization_claim', json('null')) "
-                "WHERE id=? AND json_extract(metadata,'$.live_authorization_claim.token')=? "
-                "AND COALESCE(json_extract(metadata,'$.live_authorization_used_at'),'')=''",
-                (self._now_iso(), card_id, token),
-            )
-        else:
-            await db.execute(
-                "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
-                "'$.live_authorization_claim', json('null')) "
-                "WHERE id=? AND json_extract(metadata,'$.live_authorization_claim.token')=?",
-                (card_id, token),
-            )
+        if claim is not None:
+            await claim.settle(consumed=consumed)
 
     @staticmethod
     def _can_answer(turn: TurnContext | None) -> bool:

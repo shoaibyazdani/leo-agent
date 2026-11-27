@@ -161,7 +161,7 @@ def test_unknown_and_operator_only_fields_are_rejected(roots) -> None:
         _error(roots, "operator_only_field", **{key: value})
 
 
-def test_operator_fields_validate_and_grace_is_recurring_only(roots) -> None:
+def test_operator_fields_validate_and_grace_is_kind_independent(roots) -> None:
     result = _compiler(roots).compile_create(
         {
             **BASE,
@@ -175,18 +175,17 @@ def test_operator_fields_validate_and_grace_is_recurring_only(roots) -> None:
     assert result.spec.execution.base_url == "https://example.test/v1"
     assert result.spec.execution.grace_minutes == 0
 
-    # The scheduler honours grace on intervals as well as cron, so the
-    # compiler must not reject a field the runtime will actually apply.
+    # The scheduler honours grace on every kind it can run, so validation
+    # admits exactly the same kinds: cron, interval and one-shot.
     interval = _compiler(roots).compile_create(
         {**BASE, "schedule": "every 2h", "grace_minutes": 5}, operator=True
     )
     assert interval.spec.execution.grace_minutes == 5
 
-    with pytest.raises(ScheduleCompileError) as caught:
-        _compiler(roots).compile_create(
-            {**BASE, "schedule": "in 2h", "grace_minutes": 5}, operator=True
-        )
-    assert caught.value.code == "grace_requires_recurring"
+    one_shot = _compiler(roots).compile_create(
+        {**BASE, "schedule": "in 2h", "grace_minutes": 5}, operator=True
+    )
+    assert one_shot.spec.execution.grace_minutes == 5
 
     with pytest.raises(ScheduleCompileError) as caught:
         _compiler(roots).compile_create(
@@ -407,87 +406,83 @@ def test_edit_does_not_revalidate_skills_checked_at_creation(roots) -> None:
     assert caught.value.field == "skills"
 
 
-def test_paused_one_shot_edit_ignores_the_stale_instant_until_resume(roots) -> None:
-    """A paused job has no live instant to re-arm until it is resumed."""
+def test_paused_one_shot_preserves_only_an_existing_instant(roots) -> None:
+    """N5 pin: a paused edit may keep a stale anchor but never create one."""
     compiler = _compiler(roots)
-    created = compiler.compile_create(
-        {**BASE, "schedule": (NOW + timedelta(hours=1)).isoformat(), "paused": True},
-        operator=True,
-    )
     stale = (NOW - timedelta(hours=3)).isoformat()
+    for operator in (False, True):
+        created = compiler.compile_create(
+            {
+                **BASE,
+                "schedule": (NOW + timedelta(hours=1)).isoformat(),
+                "paused": True,
+            },
+            operator=operator,
+        )
 
-    stay_paused = compiler.compile_update(
-        created.spec, {"prompt": "revised"}, current_next_run=stale, base_revision=1
-    )
-    assert stay_paused.spec.paused is True
-    assert stay_paused.next_run_at is None
-    assert stay_paused.first_run_at == datetime.fromisoformat(stale)
-
-    with pytest.raises(ScheduleCompileError) as caught:
-        compiler.compile_update(
+        # Keeping the stored instant is inert while paused, for both roles.
+        stay_paused = compiler.compile_update(
             created.spec,
-            {"paused": False},
+            {"prompt": "revised"},
+            operator=operator,
             current_next_run=stale,
             base_revision=1,
-            allow_pause_edit=True,
         )
-    assert caught.value.code == "one_shot_in_past"
+        assert stay_paused.spec.paused is True
+        assert stay_paused.next_run_at is None
+        assert stay_paused.first_run_at == datetime.fromisoformat(stale)
 
-    # Re-anchoring a paused job to a past instant is equally inert until resume.
-    reanchored = compiler.compile_update(
-        created.spec, {"schedule": stale}, operator=True, base_revision=1
-    )
-    assert reanchored.spec.paused is True
-    assert reanchored.next_run_at is None
-    assert reanchored.first_run_at == datetime.fromisoformat(stale)
+        # Resume re-checks the preserved anchor and refuses to re-arm it.
+        with pytest.raises(ScheduleCompileError) as caught:
+            compiler.compile_update(
+                stay_paused.spec,
+                {"paused": False},
+                operator=operator,
+                current_next_run=stale,
+                base_revision=1,
+                allow_pause_edit=True,
+            )
+        assert caught.value.code == "one_shot_in_past"
 
-    with pytest.raises(ScheduleCompileError) as caught:
-        compiler.compile_update(
-            reanchored.spec,
-            {"paused": False},
-            current_next_run=stale,
-            base_revision=1,
-            allow_pause_edit=True,
-        )
-    assert caught.value.code == "one_shot_in_past"
+        # A new past instant is rejected even though the job stays paused.
+        past_code = "one_shot_in_past" if operator else "one_shot_lead_too_short"
+        with pytest.raises(ScheduleCompileError) as caught:
+            compiler.compile_update(
+                created.spec,
+                {"schedule": stale},
+                operator=operator,
+                base_revision=1,
+            )
+        assert caught.value.code == past_code
+        with pytest.raises(ScheduleCompileError) as caught:
+            compiler.compile_create(
+                {**BASE, "schedule": stale, "paused": True}, operator=operator
+            )
+        assert caught.value.code == past_code
 
 
-def test_grace_validation_matches_the_effective_schedule_kind(roots) -> None:
-    """An edit must not leave a one-shot with a recurring-only grace window."""
+def test_grace_survives_conversion_between_all_kinds(roots) -> None:
+    """An edit never silently drops a window the runtime would still honour."""
     compiler = _compiler(roots)
     recurring = compiler.compile_create(
         {**BASE, "schedule": "0 9 * * *", "grace_minutes": 5}, operator=True
     )
-    with pytest.raises(ScheduleCompileError) as caught:
-        compiler.compile_update(
-            recurring.spec,
-            {"schedule": (NOW + timedelta(hours=2)).isoformat()},
-            operator=True,
-            base_revision=1,
-        )
-    assert caught.value.code == "grace_requires_recurring"
-
-    legacy_once = compiler.compile_create(
-        {**BASE, "schedule": (NOW + timedelta(hours=2)).isoformat()},
-        operator=True,
-    ).spec
-    legacy_once = legacy_once.model_copy(
-        update={
-            "execution": legacy_once.execution.model_copy(update={"grace_minutes": 5})
-        }
-    )
-    # An unchanged legacy one-shot keeps its stored window; converting it to a
-    # recurring kind keeps a valid window too.
-    unchanged = compiler.compile_update(
-        legacy_once, {"prompt": "revised"}, operator=True, base_revision=1
-    )
-    assert unchanged.spec.execution.grace_minutes == 5
+    # A recurring-to-one-shot conversion keeps the window: the runtime retires
+    # a stale one-shot as missed instead of dispatching it arbitrarily late.
     converted = compiler.compile_update(
-        legacy_once, {"schedule": "0 9 * * *"}, operator=True, base_revision=1
+        recurring.spec,
+        {"schedule": (NOW + timedelta(hours=2)).isoformat()},
+        operator=True,
+        base_revision=1,
     )
     assert converted.spec.execution.grace_minutes == 5
 
-    # Zero disables the window, so the same conversion is legal after clearing.
+    once_again = compiler.compile_update(
+        converted.spec, {"schedule": "every 2h"}, operator=True, base_revision=1
+    )
+    assert once_again.spec.execution.grace_minutes == 5
+
+    # Zero disables the window for every kind.
     cleared = compiler.compile_update(
         recurring.spec,
         {
@@ -498,3 +493,26 @@ def test_grace_validation_matches_the_effective_schedule_kind(roots) -> None:
         base_revision=1,
     )
     assert cleared.spec.execution.grace_minutes == 0
+
+
+def test_grace_uses_one_kind_set_for_validation_and_runtime(roots) -> None:
+    """R14 pin: the compiler admits grace for every kind the scheduler reads."""
+    from typing import get_args
+
+    from leo.schedules.grammar import ScheduleKind
+    from leo.tasks.scheduler import Scheduler
+
+    schedules = {
+        "cron": "0 9 * * *",
+        "interval": "every 2h",
+        "once": (NOW + timedelta(hours=2)).isoformat(),
+    }
+    assert set(get_args(ScheduleKind)) == set(schedules)
+    for kind, schedule in schedules.items():
+        compiled = _compiler(roots).compile_create(
+            {**BASE, "schedule": schedule, "grace_minutes": 5}, operator=True
+        )
+        assert compiled.spec.expression.kind == kind
+        assert compiled.spec.execution.grace_minutes == 5
+        # The runtime reads the same window from the row without a kind gate.
+        assert Scheduler._grace_seconds({"kind": kind, "grace_minutes": 5}) == 300.0

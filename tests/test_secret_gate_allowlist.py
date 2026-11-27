@@ -54,6 +54,7 @@ def test_dead_line_exceptions_are_removed_and_current_ones_are_explicit() -> Non
 
     current = [
         ("tests/test_agents_automation_operator.py", 41, "assigned secret"),
+        ("tests/test_agents_automation_operator.py", 43, "assigned secret"),
         ("tests/test_tools_http.py", 669, "assigned secret"),
         ("tests/test_tools_http.py", 686, "openai key"),
         ("tests/test_tools_http.py", 686, "assigned secret"),

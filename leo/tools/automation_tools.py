@@ -550,12 +550,12 @@ def _tool_defs() -> list[tuple[ToolSpec, Any]]:
         (
             ToolSpec(
                 name="schedule_run_now",
-                # Routine tool copy: the operator/card gate lives in
-                # ScheduleService, not in what the description promises.
                 description=(
                     "Run the named schedule once now as a normal background task "
                     "and return its handle. This does not consume a repeat count "
-                    "or change the saved cadence."
+                    "or change the saved cadence. A chat-initiated run requires "
+                    "an operator turn or a fresh approved card; the schedule "
+                    "service enforces this gate."
                 ),
                 category="automation",
                 risk=RiskLevel.LOW,
@@ -582,7 +582,9 @@ def _tool_defs() -> list[tuple[ToolSpec, Any]]:
                 description=(
                     "Cancel the named schedule's in-flight background task. The "
                     "schedule itself stays saved; returns a no-op when no task "
-                    "is running."
+                    "is running. A chat-initiated cancel requires an operator "
+                    "turn or a fresh approved card; the schedule service "
+                    "enforces this gate."
                 ),
                 category="automation",
                 risk=RiskLevel.LOW,
