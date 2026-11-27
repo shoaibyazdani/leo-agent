@@ -598,6 +598,26 @@ def _serialized_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=True, allow_nan=False, default=str))
 
 
+def api_identifier(value: Any) -> str | None:
+    """Quote an API object's own ``number`` field, never its list position.
+
+    Issue and PR numbers are identifiers: they must be copied from the fetched
+    object itself. A caller that only has a title or an array index does not
+    have an identifier and gets no invented ``#1`` from this helper.
+    """
+    if not isinstance(value, dict):
+        return None
+    number = value.get("number")
+    if isinstance(number, bool) or not isinstance(number, (int, str)):
+        return None
+    digits = str(number).strip()
+    if not digits.isascii() or not digits.isdigit() or len(digits) > 32:
+        return None
+    if int(digits) < 1:
+        return None
+    return f"#{digits}"
+
+
 def _echo_fields(
     url: str, document: dict[str, Any], patterns: list[re.Pattern[str]]
 ) -> dict[str, Any]:
@@ -650,6 +670,9 @@ async def http_json(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]
         "found": True,
         "path": _sanitize_token(path, patterns),
     }
+    identifier = api_identifier(value)
+    if identifier is not None:
+        output["identifier"] = identifier
     output.update(_echo_fields(url, document, patterns))
     _assert_redaction_stability(output, patterns, "extracted value")
     _assert_message_budget(
@@ -786,6 +809,8 @@ _OUTPUT_JSON = {
         "path": {"type": "string"},
         "found": {"type": "boolean"},
         "value": {},  # any JSON value: proven by the strict decode above
+        # Only present when the fetched object carries its own `number` field.
+        "identifier": {"type": "string"},
     },
     "required": ["url", "status_code", "path", "found", "value", "source",
                  "url_hash", "fetched_at", "freshness"],
@@ -818,8 +843,10 @@ _SPECS: list[tuple[ToolSpec, Any]] = [
                 "JSON value with no caller-supplied data and no default/fallback. The response "
                 "may be cached/stale even though a fresh fetch was requested: check the freshness "
                 "evidence and do not claim real-time data. Numbers are decoded as floats, so "
-                "decimal precision may be normalized. Use http_json_paths first if the path is "
-                "unknown. Keys containing '.' cannot be addressed by the shared path grammar. "
+                "decimal precision may be normalized. When the fetched value is an issue/PR "
+                "object with a `number` field, `identifier` quotes that number verbatim; report "
+                "that identifier, never a list position. Use http_json_paths first if the path "
+                "is unknown. Keys containing '.' cannot be addressed by the shared path grammar. "
                 "max_bytes counts wire bytes and decoded bytes of the first gzip/deflate member; "
                 "concatenated/truncated compressed members are refused rather than partially "
                 "decoded and published."
@@ -897,4 +924,4 @@ def register(registry: Any, services: Any = None) -> list[str]:
     return registered
 
 
-__all__ = ["register", "http_json", "http_json_paths", "SOURCE"]
+__all__ = ["register", "http_json", "http_json_paths", "api_identifier", "SOURCE"]

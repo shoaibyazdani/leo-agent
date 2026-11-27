@@ -1740,3 +1740,48 @@ def test_protected_bounds_never_split_a_tool_group():
     )
     _head_end, tail_start = optimizer._protected_bounds(group)
     assert tail_start == 1, "the tail boundary moved back to the tool opener"
+
+
+def test_tail_eviction_keeps_tool_groups_atomic_at_1024_tokens():
+    """A tight window may evict a whole tool group, never half of one.
+
+    Regression for the 16 turns reusing one tool id: with the longer system
+    prompt a 1024-token budget tipped the optimizer over, and tail trimming
+    popped the assistant opener while leaving its tool result behind.
+    Providers reject that orphaned tool_result.
+    """
+    messages = [ChatMessage(role="system", content="rules " * 700)]
+    messages.append(ChatMessage(role="user", content="Turn 0 question"))
+    for turn in range(16):
+        messages.extend([
+            ChatMessage(
+                role="assistant", content="",
+                tool_calls=[{"id": "turn-call", "name": "calculator", "arguments": {}}],
+            ),
+            ChatMessage(role="tool", content="42", tool_call_id="turn-call"),
+            ChatMessage(role="assistant", content=f"Answer {turn}."),
+        ])
+    # The newest turn is waiting on a tool result when the budget runs out.
+    messages.extend([
+        ChatMessage(
+            role="assistant", content="",
+            tool_calls=[{"id": "turn-call", "name": "calculator", "arguments": {}}],
+        ),
+        ChatMessage(role="tool", content="42", tool_call_id="turn-call"),
+    ])
+
+    fitted = ContextOptimizer(compact=False).optimize(messages, budget=1024)
+
+    assert sum(estimate_tokens(m.content) for m in fitted) <= 1024
+    openers = {
+        str(call["id"])
+        for message in fitted
+        for call in message.tool_calls
+    }
+    results = {
+        str(message.tool_call_id)
+        for message in fitted
+        if message.role == "tool" and message.tool_call_id
+    }
+    assert results <= openers, "no tool result may outlive its assistant opener"
+    assert openers <= results, "no assistant tool call may be left unanswered"

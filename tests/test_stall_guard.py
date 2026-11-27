@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from leo.core.stall import looks_like_stall
+from leo.core.stall import is_direct_reply, looks_like_stall
 
 
 def test_a_normal_answer_is_not_a_stall() -> None:
@@ -30,3 +30,54 @@ def test_promoted_reasoning_tail_can_trigger() -> None:
     assert looks_like_stall(
         "Done.", "stop", [], reasoning_tail="Let me now check the parser."
     )
+
+
+def test_a_direct_answer_is_not_a_stall_even_with_planning_reasoning() -> None:
+    """A visible answer ends the turn; private reasoning is not a reply."""
+    reaction = (
+        "Cute — fluffy gray cat in a purple hedgehog cave bed, going for the pom-pom."
+    )
+    assert not looks_like_stall(
+        reaction, "stop", [],
+        reasoning_tail="Let me now check the open PRs and report back.",
+    )
+    assert not looks_like_stall(
+        "Cute cat.", "stop", [], reasoning_tail="Next: I will run a GitHub check"
+    )
+    assert not looks_like_stall("The fix is live and verified.", "stop", [])
+
+
+def test_an_answer_followed_by_visible_next_steps_is_a_direct_reply() -> None:
+    """A plan after the answer does not swallow the answer."""
+    for text in (
+        "Cute cat! First, I'll check the PRs.",
+        "Cute cat. Let me check the open PRs now.",
+        "Looks great. I'll open the PR.",
+        "The fix is live. Next: I will deploy it.",
+    ):
+        assert is_direct_reply(text), text
+        assert not looks_like_stall(text, "stop", []), text
+
+
+def test_leading_plans_and_progress_reports_are_not_direct_replies() -> None:
+    for text in (
+        "First, I'll check the PRs.",
+        "Done. Let me now check the parser.",
+        "Found the file. Let me now patch it.",
+        "Cute cat! Next:",
+    ):
+        assert not is_direct_reply(text), text
+
+
+def test_short_acknowledgements_can_still_be_stalls() -> None:
+    assert looks_like_stall("Done.", "stop", [], reasoning_tail="I'll now run tests")
+    assert looks_like_stall("OK", "stop", [], reasoning_tail="First, I'll check git")
+    assert not looks_like_stall("Done.", "stop", [])
+
+
+def test_announced_work_is_still_a_stall_with_distracting_reasoning() -> None:
+    assert looks_like_stall(
+        "I'll now run the tests.", "stop", [], reasoning_tail="nothing to add"
+    )
+    assert looks_like_stall("Still working on it…", "stop", [])
+    assert looks_like_stall("Still checking the PR list", "stop", [])

@@ -485,8 +485,13 @@ class ContextOptimizer:
             group = self._tool_group(head, 0)
             head[:] = [m for i, m in enumerate(head) if i not in group]
         # 3. Keep the newest tail message; drop/truncate older tail entries.
+        #    Eviction is group-atomic here as well: popping a lone assistant
+        #    opener would leave its tool result orphaned (providers reject a
+        #    tool_result with no matching tool_use). If the whole tail is one
+        #    tool group, it goes as a unit instead of splitting the pair.
         while over() and len(tail) > 1:
-            tail.pop(0)
+            group = self._tool_group(tail, 0)
+            tail[:] = [m for i, m in enumerate(tail) if i not in group]
         if over() and tail:
             remaining = (
                 budget - total(system) - total(head) - total(middle)
