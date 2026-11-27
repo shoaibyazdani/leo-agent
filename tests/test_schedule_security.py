@@ -59,8 +59,8 @@ async def executor_env(tmp_path):
         executed.append("gateway.send")
         return {"sent": True}
 
-    # An outbound reply registered LOW and named in the allowlist: the
-    # category-first gate must still refuse it (N11 invariant).
+    # An outbound reply registered LOW: the category-first gate must refuse it
+    # even though it is not (and never was safely) in the read-only allowlist.
     registry.register(
         ToolSpec(
             name="gateway.send", description="low-tier outbound fixture",

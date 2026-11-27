@@ -159,8 +159,11 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     },
     "tests/test_api.py": {
         "241": "test fixture", "345": "synthetic failure-message fixture",
+        "346": "only=assigned secret: synthetic failure-message fixture at its current line",
         "452": "test fixture", "489": "test fixture",
         "556": "synthetic secret fixture", "593": "synthetic secret fixture",
+        "557": "only=assigned secret: synthetic secret fixture at its current line",
+        "594": "only=assigned secret: synthetic secret fixture at its current line",
         "257": "only=assigned secret: synthetic failure-message fixture in an earlier revision",
         "468": "only=assigned secret: synthetic secret fixture in an earlier revision",
         "505": "only=assigned secret: synthetic secret fixture in an earlier revision",

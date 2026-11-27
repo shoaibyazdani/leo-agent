@@ -71,7 +71,10 @@ _UNATTENDED_ALLOWED_TOOLS = frozenset(
     {
         "read_file", "list_files", "search_files", "schedule_list",
         "schedule_get", "task_list", "task_status", "metrics_snapshot",
-        "webhook_verify", "channel_send", "gateway.send", "send_message",
+        "webhook_verify",
+        # Outbound send names (channel_send/gateway.send/send_message) are
+        # classified by name before this list is consulted, so they can never
+        # be allowlisted here - even at LOW risk or under a benign category.
         # Read-only research fetches are the most natural scheduled network
         # work. They are MEDIUM by registration but write no local state; the
         # egress policy in their handlers remains the authority on destinations.

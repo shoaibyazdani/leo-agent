@@ -111,9 +111,11 @@ _GRANTED_SCHEDULE_GUIDANCE = (
     "user-authorized moment, and say plainly that the job was saved."
 )
 # A turn with no human at the gate must never see scheduling guidance or a
-# create grant, even when it inherited an interactive conversation. Keep the
-# labels aligned with ScheduleService._UNATTENDED_TURN_SOURCES and the
-# executor's unattended gate: "schedule" is a real delegated-scheduled source.
+# create grant, even when it inherited an interactive conversation. These are
+# the app/service labels, which also include "agent" (a nested agent turn).
+# The executor's unattended gate is deliberately narrower: it covers only the
+# three scheduled/unattended labels, so a nested agent from an attended parent
+# keeps that parent's tool authority. "schedule" is a real delegated source.
 _UNATTENDED_TURN_SOURCES = frozenset({
     "scheduled", "schedule", "unattended", "agent",
 })

@@ -425,6 +425,117 @@ async def test_model_remove_is_a_card_and_operator_remove_is_direct(env):
     ) is not None
 
 
+async def test_id_only_delete_card_cannot_delete_a_different_schedule(env):
+    """M7: an empty delete subject binds to the resolved id, not every row."""
+    await _create_operator(env, name="first", schedule="1h", prompt="a")
+    first_id = (await db.fetchone(
+        "SELECT id FROM schedules WHERE name='first'"
+    ))["id"]
+    await _create_operator(env, name="second", schedule="1h", prompt="b")
+    second_id = (await db.fetchone(
+        "SELECT id FROM schedules WHERE name='second'"
+    ))["id"]
+
+    card = await _approved_specialist_card(
+        env, "schedule_delete", {"schedule_id": first_id}
+    )
+    stored = await db.fetchone(
+        "SELECT resource FROM approvals WHERE id=?", (card,)
+    )
+    assert stored["resource"] == "schedule_delete:"
+
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.remove(
+            schedule_id=second_id, actor="automation-operator",
+            authorized_by=card,
+        )
+    assert caught.value.code == "invalid_authorization"
+    assert await db.fetchone(
+        "SELECT id FROM schedules WHERE id=?", (second_id,)
+    ) is not None
+    assert await db.fetchone(
+        "SELECT id FROM schedules WHERE id=?", (first_id,)
+    ) is not None
+
+    # The resolved id is an accepted subject, so the same shape still works
+    # when it targets the schedule the card was issued for.
+    matching = await _approved_specialist_card(
+        env, "schedule_delete", {"schedule_id": first_id}
+    )
+    removed = await env.service.remove(
+        schedule_id=first_id, actor="automation-operator",
+        authorized_by=matching,
+    )
+    assert removed["status"] == "removed"
+    assert await db.fetchone(
+        "SELECT id FROM schedules WHERE id=?", (first_id,)
+    ) is None
+
+
+async def test_failed_delete_audit_releases_card_and_retry_succeeds(env, monkeypatch):
+    """M8: a rolled-back delete releases its lease instead of burning it."""
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    approval_id = await _approved_specialist_card(
+        env, "schedule_delete", {"name": "job"}
+    )
+    original_audit = env.service._audit
+
+    async def broken_audit(*args, **kwargs):
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr(env.service, "_audit", broken_audit)
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        await env.service.remove(
+            name="job", actor="automation-operator", authorized_by=approval_id,
+        )
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='job'") is not None
+    markers = await _live_authorization_markers(approval_id)
+    assert markers["used_at"] is None and markers["claim"] is None
+
+    monkeypatch.setattr(env.service, "_audit", original_audit)
+    retry = await env.service.remove(
+        name="job", actor="automation-operator", authorized_by=approval_id,
+    )
+    assert retry["status"] == "removed"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='job'") is None
+    assert (await _live_authorization_markers(approval_id))["used_at"]
+
+
+async def test_claim_rechecks_authorization_at_update_time(env, monkeypatch):
+    """Q2: a widening between the SELECT and the claim UPDATE is refused."""
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    card = await _approved_edit_card(env)
+    approval_id = card["approval_id"]
+    original_execute = db.execute
+    widened = False
+
+    async def widen_before_claim(sql, params=()):
+        nonlocal widened
+        if (
+            not widened
+            and "UPDATE approvals" in sql
+            and "live_authorization_claim" in sql
+        ):
+            widened = True
+            await original_execute(
+                "UPDATE approvals SET resource=? WHERE id=?",
+                ("schedule_delete:someone-else", approval_id),
+            )
+        return await original_execute(sql, params)
+
+    monkeypatch.setattr(db, "execute", widen_before_claim)
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.run_now(
+            name="job", actor="chat:web", turn=_chat("tui"),
+            authorized_by=approval_id,
+        )
+    assert caught.value.code in {"invalid_authorization", "authorization_consumed"}
+    assert widened is True
+    assert await db.fetchall("SELECT id FROM tasks") == []
+    markers = await _live_authorization_markers(approval_id)
+    assert markers["used_at"] is None and markers["claim"] is None
+
+
 async def test_run_now_creates_a_manual_task_and_cancel_stops_it(env):
     created = await _create_operator(env, name="job", schedule="1h", prompt="run")
     assert created["status"] == "created"

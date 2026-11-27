@@ -48,6 +48,7 @@ from ..security.approval_cards import (
     render_edit_body,
     render_schedule_body,
 )
+from ..security.permissions import arguments_digest
 from .clock import Clock, SystemClock
 from .compiler import CompileResult, ScheduleCompileError, ScheduleCompiler
 from .delivery import DeliveryContext, Origin, delivery_context_from_settings
@@ -273,57 +274,91 @@ async def claim_mutation_authorization(
             "invalid_authorization", "A mutation requires an approved card.",
             field="authorization",
         )
-    row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (card_id,))
-    if row is None or str(row["status"]) != "approved":
-        raise _fail(
-            "invalid_authorization", "The supplied approval is not approved.",
-            field="authorization",
+    # One write transaction covers the snapshot, the predicate and the claim:
+    # no other writer can mutate the card's scope between checking ``allowed``
+    # and winning the conditional UPDATE.
+    async with db.transaction():
+        row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (card_id,))
+        if row is None or str(row["status"]) != "approved":
+            raise _fail(
+                "invalid_authorization", "The supplied approval is not approved.",
+                field="authorization",
+            )
+        now = clock.now()
+        if not approval_within_window(row, now, settings):
+            raise _fail(
+                "invalid_authorization", "The supplied approval has expired.",
+                field="authorization",
+            )
+        metadata = _json_mapping(row["metadata"])
+        if metadata.get(_USED_KEY):
+            raise _fail(
+                "authorization_consumed",
+                "This approval was already used to authorize a mutation.",
+                field="authorization",
+            )
+        claim = metadata.get(_CLAIM_KEY)
+        with _ACTIVE_CLAIMS_LOCK:
+            active = card_id in _ACTIVE_CLAIMS
+        if active or claim_is_active(claim, now):
+            raise _fail(
+                "authorization_consumed",
+                "This approval is already authorizing another action.",
+                field="authorization",
+            )
+        if allowed is not None and not allowed(row, metadata):
+            raise _fail(
+                "invalid_authorization",
+                "The supplied approval does not authorize this mutation.",
+                field="authorization",
+            )
+        token = new_id("authz")
+        expiry = now.timestamp() + LIVE_AUTH_CLAIM_TTL_SECONDS
+        previous_token = str(claim.get("token") or "") if isinstance(claim, Mapping) else ""
+        # The conditional UPDATE re-asserts every authorization-bearing column
+        # from the checked snapshot, not just the claim token. A concurrent
+        # mutation that widens action/resource/kind/metadata cannot be claimed
+        # even if it lands after the SELECT.
+        authorization_columns = (
+            "kind", "action", "resource", "risk", "metadata",
+            "created_at", "expires_at", "proposal_id", "digest",
         )
-    now = clock.now()
-    if not approval_within_window(row, now, settings):
-        raise _fail(
-            "invalid_authorization", "The supplied approval has expired.",
-            field="authorization",
+        snapshot_guard = "".join(
+            f" AND COALESCE({column},'')=?" for column in authorization_columns
         )
-    metadata = _json_mapping(row["metadata"])
-    if metadata.get(_USED_KEY):
-        raise _fail(
-            "authorization_consumed",
-            "This approval was already used to authorize a mutation.",
-            field="authorization",
+        snapshot_values = tuple(
+            row[column] if row[column] is not None else ""
+            for column in authorization_columns
         )
-    claim = metadata.get(_CLAIM_KEY)
-    with _ACTIVE_CLAIMS_LOCK:
-        active = card_id in _ACTIVE_CLAIMS
-    if active or claim_is_active(claim, now):
-        raise _fail(
-            "authorization_consumed",
-            "This approval is already authorizing another action.",
-            field="authorization",
+        claimed = await db.execute(
+            "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
+            "'$.live_authorization_claim', json_object('token',?,'at',?,'expires_at',?)) "
+            "WHERE id=? AND status='approved' "
+            "AND COALESCE(json_extract(metadata,'$." + _USED_KEY + "'),'')='' "
+            "AND COALESCE(json_extract(metadata,'$.live_authorization_claim.token'),'')=?"
+            + snapshot_guard,
+            (token, now.isoformat(), expiry, card_id, previous_token) + snapshot_values,
         )
-    if allowed is not None and not allowed(row, metadata):
-        raise _fail(
-            "invalid_authorization",
-            "The supplied approval does not authorize this mutation.",
-            field="authorization",
+        if int(getattr(claimed, "rowcount", 0) or 0) < 1:
+            raise _fail(
+                "authorization_consumed",
+                "This approval was already used to authorize a mutation.",
+                field="authorization",
+            )
+        # Check the predicate once more against the row as claimed. Inside this
+        # transaction nothing else can widen it, so a failure here rolls the
+        # claim back instead of leasing an authorization that no longer holds.
+        claimed_row = await db.fetchone(
+            "SELECT * FROM approvals WHERE id=?", (card_id,)
         )
-    token = new_id("authz")
-    expiry = now.timestamp() + LIVE_AUTH_CLAIM_TTL_SECONDS
-    previous_token = str(claim.get("token") or "") if isinstance(claim, Mapping) else ""
-    claimed = await db.execute(
-        "UPDATE approvals SET metadata=json_set(COALESCE(metadata,'{}'),"
-        "'$.live_authorization_claim', json_object('token',?,'at',?,'expires_at',?)) "
-        "WHERE id=? AND status='approved' "
-        "AND COALESCE(json_extract(metadata,'$." + _USED_KEY + "'),'')='' "
-        "AND COALESCE(json_extract(metadata,'$.live_authorization_claim.token'),'')=?",
-        (token, now.isoformat(), expiry, card_id, previous_token),
-    )
-    if int(getattr(claimed, "rowcount", 0) or 0) < 1:
-        raise _fail(
-            "authorization_consumed",
-            "This approval was already used to authorize a mutation.",
-            field="authorization",
-        )
+        if allowed is not None and not allowed(
+            claimed_row, _json_mapping(claimed_row["metadata"])
+        ):
+            raise _fail(
+                "invalid_authorization",
+                "The supplied approval does not authorize this mutation.",
+                field="authorization",
+            )
     lease = MutationAuthorizationLease(card_id, token, clock)
     lease._activate()
     return lease
@@ -653,15 +688,27 @@ class ScheduleService:
 
         lease: MutationAuthorizationLease | None = None
         if authorized_by:
-            def allowed(card: Mapping[str, Any], _metadata: Mapping[str, Any]) -> bool:
+            def allowed(card: Mapping[str, Any], metadata: Mapping[str, Any]) -> bool:
                 prefix = "schedule_delete:"
                 resource = str(card["resource"] or "")
                 if str(card["action"]) != _SPECIALIST_APPROVAL_ACTION \
                         or not resource.startswith(prefix):
                     return False
                 subject = resource[len(prefix):]
+                # An id-only delete has no name/task_id/objective in its
+                # approval target, so its subject is empty. That is not a
+                # wildcard: bind the card to the resolved row's exact
+                # arguments digest instead.
+                if subject == "":
+                    expected = arguments_digest({
+                        "tool": "schedule_delete",
+                        "arguments": {"schedule_id": view.id},
+                    })
+                    return bool(expected) and str(
+                        metadata.get("arguments_digest") or ""
+                    ) == str(expected)
                 return subject in {
-                    "", str(view.name)[:160], str(schedule_id or "")[:160],
+                    str(view.name)[:160], str(view.id)[:160],
                 }
 
             lease = await claim_mutation_authorization(
@@ -686,13 +733,12 @@ class ScheduleService:
         outcome: ScheduleOutcome
         extra: dict[str, Any] = {"changes": changes}
         card = None
-        effected = False
+        delete_committed = False
         try:
             async with db.transaction():
                 stored = await self._create_proposal(proposal)
                 if is_operator:
                     await self._commit_remove(stored)
-                    effected = True
                     await self.store.update_proposal(stored.id, status="committed")
                     await self._audit(
                         actor, "schedule.removed", stored.schedule_id,
@@ -707,6 +753,7 @@ class ScheduleService:
                         },
                     )
                     outcome = self._outcome(stored, "removed", view.name, None)
+                    delete_committed = True
                 elif self._can_answer(turn):
                     card = await self._create_edit_card(
                         stored, None, actor, changes,
@@ -720,8 +767,11 @@ class ScheduleService:
                         stored, "approval_required", view.name, None
                     )
         except BaseException:
-            await self._settle_live_run_authorization(lease, consumed=effected)
+            await self._settle_live_run_authorization(lease, consumed=False)
             raise
+        # A failed proposal/audit write rolls the transaction back; only a
+        # committed delete may consume a single-use card.
+        effected = delete_committed
         await self._settle_live_run_authorization(lease, consumed=effected)
         if card is not None:
             extra["card"] = (await self._present_card(card, turn)).model_dump(mode="json")

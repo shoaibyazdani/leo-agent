@@ -72,13 +72,19 @@ def test_unattended_sources_get_no_guidance_on_a_capable_surface(source: str) ->
 
 
 def test_unattended_source_set_is_shared_across_entry_points() -> None:
-    """R9 pin: app guidance, service grants and the tool gate agree on labels."""
+    """R9/Q1 pin: guidance and grants withhold "agent" too; the tool gate does not.
+
+    App and service share one label set. The executor is intentionally narrower:
+    "agent" is a nested agent turn that inherits an attended parent's authority,
+    so it must not be treated as an unattended tool-turn.
+    """
     from leo.core.app import _UNATTENDED_TURN_SOURCES as APP_SOURCES
     from leo.schedules.service import _UNATTENDED_TURN_SOURCES as SERVICE_SOURCES
     from leo.tools.executor import _UNATTENDED_SOURCES as EXECUTOR_SOURCES
 
     assert APP_SOURCES == SERVICE_SOURCES
-    assert {"scheduled", "schedule", "unattended"} <= EXECUTOR_SOURCES
+    assert "agent" in APP_SOURCES
+    assert EXECUTOR_SOURCES == {"scheduled", "schedule", "unattended"}
 
 
 def test_guidance_does_not_claim_an_autonomous_save() -> None:

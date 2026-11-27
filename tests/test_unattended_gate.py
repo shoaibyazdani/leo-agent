@@ -79,6 +79,11 @@ async def env(tmp_path):
         _schema(target={"type": "string"}, subject={"type": "string"},
                 text={"type": "string"}),
     )
+    # R5: outbound send names are owned by the category-first gate, not by the
+    # read-only allowlist. Declaring them LOW and uncategorized must not help.
+    for name in ("gateway.send", "send_message"):
+        register(name, "utility", RiskLevel.LOW,
+                 _schema(target={"type": "string"}, text={"type": "string"}))
     # MEDIUM tools outside the five original categories: an unattended turn
     # must not use them to write files, memory, tasks or schedules.
     for name in ("write_file", "patch", "memory_add", "task_create", "schedule_create"):
@@ -175,6 +180,23 @@ async def test_allowlisted_medium_read_still_runs_unattended(env):
     )
     assert result.success is True
     assert "read_file" in env["executed"]
+
+
+@pytest.mark.parametrize("name", ["channel_send", "gateway.send", "send_message"])
+async def test_outbound_names_are_not_allowlisted_and_stay_denied(env, name):
+    """R5: send names are denied by name before the allowlist is consulted."""
+    from leo.tools.executor import _UNATTENDED_ALLOWED_TOOLS
+
+    assert name not in _UNATTENDED_ALLOWED_TOOLS
+    result = await env["executor"].execute(
+        _call(name, {"target": "chat:origin", "text": "scheduled reply"},
+              source="scheduled", correlation_id=f"turn-{name}")
+    )
+    assert result.success is False and result.decision == "denied"
+    assert result.metadata["unattended_gate"] == {
+        "source": "scheduled", "category": "outbound", "risk": "medium",
+    }
+    assert name not in env["executed"]
 
 
 async def test_low_risk_or_attended_calls_still_run(env):
