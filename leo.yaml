@@ -341,6 +341,16 @@ learning:
     max_transcript_chars: 60000
     tool_preview_chars: 500
 
+  # Self-improvement from LEO's own work. Recurring tool patterns become
+  # documentation-only skills and nightly failure reviews write durable notes.
+  # Neither path raises an approval card; both are validated first and never
+  # touch safety rules, secrets, hardline permissions or model/provider config.
+  self_improvement:
+    enabled: true
+    nightly_cron: "0 3 * * *"   # UTC, on the durable scheduler
+    min_recurrences: 3          # matching turns/tasks before a skill is saved
+    max_corrections: 3          # corrections before a learned skill is retired
+
 skills:
   # Deterministic lifecycle for agent-authored skills. Stale/archive are
   # reversible state transitions; content is never rewritten or deleted.

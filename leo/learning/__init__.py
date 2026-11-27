@@ -5,7 +5,9 @@ into evidence-backed memory proposals. Writes require a trusted human approval
 or an explicitly enabled low-risk :class:`AutoNotePolicy`; secrets, raw tool
 output, instruction-shaped text and model self-attestation are never learned.
 
-Public entry point: :class:`leo.learning.engine.LearningEngine`.
+Public entry points: :class:`leo.learning.engine.LearningEngine` for evidence-
+backed notes and :class:`leo.learning.self_improvement.SelfImprovementEngine`
+for approval-free skills, standing instructions and nightly review notes.
 """
 
 from .engine import (
@@ -22,6 +24,13 @@ from .engine import (
     LearningProposal,
     NoteDraft,
 )
+from .self_improvement import (
+    NIGHTLY_SCHEDULE_NAME,
+    NIGHTLY_WORKER,
+    SelfImprovementDenied,
+    SelfImprovementEngine,
+    validate_change,
+)
 
 __all__ = [
     "ACTION_CONSOLIDATE",
@@ -36,4 +45,9 @@ __all__ = [
     "LearningEngine",
     "LearningProposal",
     "NoteDraft",
+    "NIGHTLY_SCHEDULE_NAME",
+    "NIGHTLY_WORKER",
+    "SelfImprovementDenied",
+    "SelfImprovementEngine",
+    "validate_change",
 ]

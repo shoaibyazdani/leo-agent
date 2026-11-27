@@ -491,9 +491,27 @@ class ReviewConfig(BaseModel):
     tool_preview_chars: int = Field(default=500, ge=0, le=5_000)
 
 
+class SelfImprovementConfig(BaseModel):
+    """Approval-free skill learning from the agent's own recurring work.
+
+    This only governs inert skills, standing instructions and review notes.
+    Safety rules, secrets, hardline permissions and model/provider settings are
+    never eligible, and every write is still validated before it is durable.
+    """
+
+    enabled: bool = True
+    # Nightly review runs on the durable scheduler (UTC cron); one pass per day.
+    nightly_cron: str = "0 3 * * *"
+    # Distinct turns/tasks with the same tool pattern before a skill is saved.
+    min_recurrences: int = Field(default=3, ge=2, le=20)
+    # Corrections of a learned skill before it is retired (kept, never deleted).
+    max_corrections: int = Field(default=3, ge=2, le=20)
+
+
 class LearningConfig(BaseModel):
     auto_notes: AutoNoteConfig = Field(default_factory=AutoNoteConfig)
     review: ReviewConfig = Field(default_factory=ReviewConfig)
+    self_improvement: SelfImprovementConfig = Field(default_factory=SelfImprovementConfig)
 
 
 class CuratorConfig(BaseModel):
