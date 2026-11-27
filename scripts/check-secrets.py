@@ -189,12 +189,6 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "146": "only=assigned secret: synthetic secret-refusal fixture",
         "169": "only=assigned secret: synthetic secret-refusal fixture",
     },
-    "junit.xml": {
-        "1": "only=anthropic key|stripe live key: generated pytest evidence containing synthetic fixture names",
-    },
-    "leo/tools/shell_policy.py": {
-        "671": "only=assigned secret: local variable naming a classifier helper result",
-    },
     "tests/test_api.py": {
         "241": "test fixture", "345": "synthetic failure-message fixture",
         "346": "only=assigned secret: synthetic failure-message fixture at its current line",

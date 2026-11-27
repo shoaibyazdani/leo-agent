@@ -3301,7 +3301,7 @@ class LeoApp:
             return False
         # gateway.send persists the sent row (including provider_message_id);
         # mark that row as an interim answer instead of writing a second copy.
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE messages SET metadata=json_set(COALESCE(metadata,'{}'),"
             " '$.interim', json('true'), '$.stall_nudge', json('true'),"
             " '$.run_status', 'in_progress') "
@@ -3309,6 +3309,8 @@ class LeoApp:
             "AND json_extract(metadata,'$.idempotency_key')=? ORDER BY id DESC LIMIT 1)",
             (key,),
         )
+        if not getattr(cursor, "rowcount", 0):
+            _LOG.warning("interim reply sent row not found", extra={"idempotency_key": key})
         return True
 
     @staticmethod
