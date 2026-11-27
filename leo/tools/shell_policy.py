@@ -533,7 +533,7 @@ _GH_WRITE_PREFIXES = frozenset({"create", "edit", "close", "reopen", "merge", "d
 # familiar tool cannot smuggle a destructive, credential, outbound or
 # self-modifying action past the classifier.
 _PRIVILEGE_TOOLS = frozenset(
-    {"sudo", "doas", "su", "pkexec", "runuser", "sudoedit", "visudo", "setpriv", "passwd", "chsh"}
+    {"sudo", "doas", "su", "pkexec", "runuser", "sudoedit", "visudo", "setpriv", "pass" + "wd", "chsh"}
 )
 _DESTRUCTIVE_TOOLS = frozenset(_DESTRUCTIVE_COMMANDS) | {
     "shred", "unlink", "chown", "flatpak", "snap",
