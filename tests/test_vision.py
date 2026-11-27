@@ -236,3 +236,24 @@ def test_a_url_image_and_a_broken_block_are_handled() -> None:
     assert _openai_image_part(url_block)["image_url"]["url"] == "https://x/y.png"
     assert _openai_image_part({"type": "image", "source": {}}) is None
     assert _openai_image_part({"type": "image", "source": {"type": "base64"}}) is None
+
+
+def test_the_vision_tool_schema_is_valid_for_beam_free() -> None:
+    """beam-free rejects root oneOf/anyOf even when type='object'.
+
+    Live 2026-11-26: `?` → HTTP 400 in 2 s:
+    [invalid_function_parameters] Invalid schema for function 'vision_analyze':
+    schema must have type 'object' and not have 'oneOf'/'anyOf'.
+    """
+    from leo.tools.registry import ToolRegistry
+    from leo.tools.vision_tools import register
+
+    registry = ToolRegistry()
+    register(registry)
+    spec = next(s for s in registry.list_specs() if s.name == "vision_analyze")
+
+    assert spec.input_schema["type"] == "object"
+    assert "anyOf" not in spec.input_schema
+    assert "oneOf" not in spec.input_schema
+    # The handler still enforces the alternative at execution time:
+    # _load_blocks raises when neither path nor attachment_id is present.

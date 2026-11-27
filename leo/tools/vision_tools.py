@@ -124,7 +124,9 @@ def register(registry: Any, services: Any = None) -> list[str]:
                 "attachment_id": {"type": "string", "minLength": 1},
                 "question": {"type": "string", "minLength": 1},
             },
-            "anyOf": [{"required": ["path"]}, {"required": ["attachment_id"]}],
+            # Beam-free rejects root-level oneOf/anyOf even with type=object.
+            # The handler enforces the alternatives; the description tells the
+            # model what to pass, and the strict upstream sees a plain object.
         },
     )
     registry.register(spec, vision_analyze)
