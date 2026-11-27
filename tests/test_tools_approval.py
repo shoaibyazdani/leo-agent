@@ -450,3 +450,67 @@ async def test_auto_reviewer_failure_falls_back_to_a_human(env):
     decision = await _shell_decision(env, reviewer)
 
     assert decision.requires_approval is True and decision.approval_id
+
+
+async def test_auto_reviewer_reaches_ordinary_interpreter_commands(env):
+    """A HIGH 'python runs arbitrary code' call is ordinary dev work, not a hardline."""
+    calls = []
+
+    async def reviewer(**kwargs):
+        calls.append(kwargs)
+        return "allow", "local test run"
+
+    env.permissions.set_reviewer(reviewer)
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", str(env.settings.root.resolve()), RiskLevel.HIGH,
+        risk_reason="python runs arbitrary code",
+        review_command="python -m pytest -q",
+    )
+
+    assert decision.allowed is True and "auto-reviewed" in decision.reason
+    assert calls and calls[0]["command"] == "python -m pytest -q"
+
+
+@pytest.mark.parametrize("reason", [
+    "git history or remote rewrite",
+    "hardline blocklist: filesystem root wipe (rm -rf /)",
+    "sudo escalates privileges",
+    "command substitution",
+    "redirection outside allowed roots",
+    "unparseable command",
+])
+async def test_auto_reviewer_keeps_hardline_reasons_with_the_human(env, reason):
+    calls = []
+
+    async def reviewer(**kwargs):
+        calls.append(kwargs)
+        return "allow", ""
+
+    decision = await _shell_decision(env, reviewer, reason=reason)
+
+    assert decision.requires_approval is True
+    assert calls == []
+
+
+async def test_expiry_is_durable_and_emits_an_explicit_event(env):
+    seen = []
+
+    async def on_expired(event):
+        seen.append(event.payload)
+
+    env.permissions.events.subscribe("approval.expired", on_expired)
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", str(env.settings.root.resolve()), RiskLevel.HIGH,
+        risk_reason="unclassified command (rsvg-convert)",
+        command_preview="rsvg-convert -z 2 -o girl.png girl.svg",
+        task_id="conv-1",
+    )
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await db.execute("UPDATE approvals SET created_at=? WHERE id=?", (old, decision.approval_id))
+
+    assert await env.permissions.expire_approval_if_stale(decision.approval_id) is True
+    row = await db.fetchone("SELECT status FROM approvals WHERE id=?", (decision.approval_id,))
+    assert row["status"] == "expired"
+    assert seen and seen[0]["command"].startswith("rsvg-convert")
+    assert seen[0]["reason"] and "not run" in seen[0]["reason"]
+    assert await env.permissions.expire_approval_if_stale(decision.approval_id) is False

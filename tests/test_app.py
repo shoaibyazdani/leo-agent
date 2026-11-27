@@ -63,3 +63,23 @@ async def test_memory_persists_across_app_restarts(mock_settings: Settings) -> N
     found = await second.search.search("dark mode", limit=3)
     assert any(m.id == record.id for m in found)
     await second.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_calls_run_before_a_call_that_may_wait(mock_settings: Settings) -> None:
+    """A pending card must not hold up unrelated steps in the same batch."""
+    mock_settings.security.wait_for_approval = True
+    app = LeoApp(mock_settings)
+    await app.initialize()
+    calls = [
+        {"id": "gated", "name": "shell", "arguments": {"command": "git push --force origin main"}},
+        {"id": "safe", "name": "read_file", "arguments": {"path": "README.md"}},
+        {"id": "also-gated", "name": "shell", "arguments": {"command": "rm -rf build"}},
+    ]
+
+    ordered = app._safe_calls_before_wait(calls)
+
+    assert [call["id"] for call in ordered] == ["safe", "gated", "also-gated"]
+    # The original batch is untouched: provider pairing still follows the ids.
+    assert [call["id"] for call in calls] == ["gated", "safe", "also-gated"]
+    await app.shutdown()

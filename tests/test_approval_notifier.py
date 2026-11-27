@@ -543,3 +543,52 @@ async def test_review_notices_are_off_without_operator_config() -> None:
     await bus.emit("review.completed", review_id="rev_3", status="completed",
                    mode="review", staged=[{"proposal_id": "sprop_x", "skill": "x"}])
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_expiry_is_announced_with_the_command_that_waited(monkeypatch) -> None:
+    from leo import db
+
+    monkeypatch.setenv("LEO_DB_PATH", str(db.get_db_path()))
+    bus = EventBus(persist=False)
+    adapter = FakeAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    assert notifier.start() is True
+
+    await bus.emit(
+        "approval.expired", approval_id="apr_expired", action="tool:shell",
+        command="pytest tests/test_x.py", risk_reason="python runs arbitrary code",
+        reason="approval expired: the action was not run",
+    )
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0][1]
+    assert "expired" in text.lower()
+    assert "pytest tests/test_x.py" in text
+    assert "not run" in text
+
+
+@pytest.mark.asyncio
+async def test_ordinary_shell_approval_offers_workspace_trust(monkeypatch) -> None:
+    from leo import db
+
+    monkeypatch.setenv("LEO_DB_PATH", str(db.get_db_path()))
+    bus = EventBus(persist=False)
+    adapter = KeyboardAdapter()
+    notifier = ApprovalNotifier(FakeGateway(adapter, bus), _settings(), events=bus)
+    assert notifier.start() is True
+    await _pending_approval("apr_python", action="tool:shell")
+
+    await bus.emit(
+        "approval.requested", approval_id="apr_python", action="tool:shell",
+        resource="/root/workspace", risk="high",
+        risk_reason="python runs arbitrary code", arguments_digest="a" * 64,
+        command="python -m pytest -q",
+    )
+
+    labels = [
+        button["text"] for row in (adapter.markups[0] or {}).get("inline_keyboard", [])
+        for button in row
+    ]
+    assert any("Trust workspace" in text for text in labels)
+    assert any("This command" in text for text in labels)

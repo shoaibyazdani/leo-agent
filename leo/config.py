@@ -184,10 +184,14 @@ class SecurityConfig(BaseModel):
     # workspace. The reference tools default to "until revoked"; 30 days is the
     # shipped middle ground and is configurable.
     workspace_trust_days: float = Field(default=30.0, ge=0.0, le=3650.0)
+    # How long an approval remembered for one task/conversation keeps covering
+    # the same kind of work (program prefix for shell, directory for path tools).
+    conversation_grant_seconds: int = Field(default=8 * 60 * 60, ge=60, le=30 * 86400)
     # In smart mode, ask a cheap model to review a HIGH shell call that no
     # grant covers before bothering a human: allow once, deny with a reason, or
-    # ask. Destructive/credential/privilege/arbitrary-code reasons are never
-    # sent to the reviewer; they still require a human.
+    # ask. Ordinary interpreters (python/node) and unclassified dev commands
+    # reach it; hardline destructive/credential/privilege reasons still require
+    # a human.
     reviewer_enabled: bool = True
     # Empty means the configured default chat model; set a provider key or model
     # id to pin a cheaper reviewer.
@@ -791,7 +795,7 @@ class Settings(BaseModel):
             "security": [
                 "workspace_only", "allow_medium_risk", "high_risk_requires_approval",
                 "wait_for_approval", "approval_poll_seconds",
-                "approval_mode", "workspace_trust_days",
+                "approval_mode", "workspace_trust_days", "conversation_grant_seconds",
                 "reviewer_enabled", "reviewer_timeout_seconds",
                 "max_tool_calls_per_task", "max_tool_calls_ceiling",
             ],

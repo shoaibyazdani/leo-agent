@@ -764,22 +764,50 @@ def _load_json(value: Any) -> Any:
         return None
 
 
+_GENERIC_COMMAND_REASON = "high-risk action requires explicit approval"
+
+
 def _command_card(row: Mapping[str, Any]) -> ApprovalCard:
-    """Legacy command approvals projected into the same frozen shape."""
+    """Command approvals projected into the same frozen shape.
+
+    R7: the card shows the command the operator is authorising and *why* it
+    needs a tap. The row's generic approval reason is a fallback of last
+    resort: the stored classifier reason (or, for older rows, a reason derived
+    from the stored command) is what a human can actually judge.
+    """
     metadata = _load_json(row.get("metadata"))
     metadata = metadata if isinstance(metadata, dict) else {}
     action = str(row.get("action") or "?")
     resource = row.get("resource")
     risk = str(row.get("risk") or "?")
     lines = [f"action: {action}"]
-    command = str(metadata.get("command_preview") or "").strip()
+    command = str(
+        metadata.get("command") or metadata.get("command_preview") or ""
+    ).strip()
     if command:
         lines.append(f"command: {command}")
+        if len(command) >= 300:
+            lines.append("(stored command preview; full text was not kept)")
+    else:
+        lines.append("command: not stored on this approval")
     if resource:
         lines.append(f"resource: {resource}")
-    reason = str(row.get("reason") or metadata.get("risk_reason") or "").strip()
-    if reason:
-        lines.append(f"why: {reason}")
+    reason = ""
+    for candidate in (metadata.get("risk_reason"), row.get("reason")):
+        text = str(candidate or "").strip()
+        if text and text.strip().lower() != _GENERIC_COMMAND_REASON:
+            reason = text
+            break
+    if not reason:
+        # Local import: leo.tools imports this package's permission manager, so
+        # a module-level import would close a cycle during startup.
+        try:
+            from ..tools.shell_policy import card_reason
+
+            reason = card_reason(command)
+        except Exception:  # noqa: BLE001 - card copy must not break presentation
+            reason = f"command classified high risk: {command}"
+    lines.append(f"why: {reason}")
     lines.append(f"risk: {risk}")
     config = KIND_CONFIG[KIND_COMMAND]
     return ApprovalCard(

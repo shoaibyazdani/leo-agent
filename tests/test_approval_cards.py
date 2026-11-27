@@ -604,9 +604,51 @@ def test_legacy_command_rows_project_into_the_same_frozen_shape() -> None:
     card = card_from_row(row)
     assert card.kind == "command"
     assert card.title == "Approval needed"
-    assert "ls -la" in card.body
+    assert "command: ls -la" in card.body
     assert card.choices == ["once", "deny"]
     assert card.choice_labels == ["Approve", "Deny"]
+
+
+def test_command_card_shows_exact_command_and_specific_risk() -> None:
+    """R7: a human must see what will run and why, not the generic row copy."""
+    row = {
+        "id": "apr_why",
+        "status": "pending",
+        "action": "tool:shell",
+        "resource": "/tmp/workspace",
+        "risk": "high",
+        "reason": "high-risk action requires explicit approval",
+        "metadata": json.dumps({
+            "command_preview": "rm -rf build/cache",
+            "risk_reason": "rm is destructive",
+        }),
+        "kind": "command",
+    }
+    card = card_from_row(row)
+    assert "command: rm -rf build/cache" in card.body
+    assert "why: rm is destructive" in card.body
+    assert "high-risk action requires explicit approval" not in card.body
+    assert card.view().body == card.body
+    assert card.event_payload()["body"] == card.body
+
+
+def test_command_card_derives_a_specific_reason_for_legacy_rows() -> None:
+    row = {
+        "id": "apr_legacy",
+        "status": "pending",
+        "action": "tool:shell",
+        "resource": "/tmp/workspace",
+        "risk": "high",
+        "reason": "high-risk action requires explicit approval",
+        "metadata": json.dumps({"command_preview": "git push --force origin main"}),
+        "kind": "command",
+    }
+    card = card_from_row(row)
+    assert "command: git push --force origin main" in card.body
+    assert "why: " in card.body
+    why = next(line for line in card.body.splitlines() if line.startswith("why: "))
+    assert "high-risk action requires explicit approval" not in why
+    assert len(why) > len("why: ")
 
 
 def test_schedule_callback_payloads_keep_kind_and_checksummed_locators() -> None:
