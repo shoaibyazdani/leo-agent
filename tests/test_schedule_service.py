@@ -457,19 +457,43 @@ async def test_id_only_delete_card_cannot_delete_a_different_schedule(env):
         "SELECT id FROM schedules WHERE id=?", (first_id,)
     ) is not None
 
-    # The resolved id is an accepted subject, so the same shape still works
-    # when it targets the schedule the card was issued for.
-    matching = await _approved_specialist_card(
-        env, "schedule_delete", {"schedule_id": first_id}
-    )
+    # The refused card is not burned by the wrong-target attempt: the same
+    # card still deletes the schedule it was issued for.
     removed = await env.service.remove(
         schedule_id=first_id, actor="automation-operator",
-        authorized_by=matching,
+        authorized_by=card,
     )
     assert removed["status"] == "removed"
     assert await db.fetchone(
         "SELECT id FROM schedules WHERE id=?", (first_id,)
     ) is None
+
+
+@pytest.mark.parametrize("tamper", ["missing", "wrong"])
+async def test_name_subject_delete_card_is_digest_bound(env, tamper):
+    """Q4: a name subject alone does not authorize a service-layer delete."""
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    approval_id = await _approved_specialist_card(
+        env, "schedule_delete", {"name": "job"}
+    )
+    if tamper == "missing":
+        await db.execute(
+            "UPDATE approvals SET metadata=json_remove(metadata,'$.arguments_digest') "
+            "WHERE id=?", (approval_id,),
+        )
+    else:
+        await db.execute(
+            "UPDATE approvals SET metadata=json_set(metadata,'$.arguments_digest',?) "
+            "WHERE id=?", ("wrong-digest", approval_id),
+        )
+
+    with pytest.raises(ScheduleServiceError) as caught:
+        await env.service.remove(
+            name="job", actor="automation-operator", authorized_by=approval_id,
+        )
+    assert caught.value.code == "invalid_authorization"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='job'") is not None
+    assert (await _live_authorization_markers(approval_id))["claim"] is None
 
 
 async def test_failed_delete_audit_releases_card_and_retry_succeeds(env, monkeypatch):
@@ -501,8 +525,8 @@ async def test_failed_delete_audit_releases_card_and_retry_succeeds(env, monkeyp
     assert (await _live_authorization_markers(approval_id))["used_at"]
 
 
-async def test_claim_rechecks_authorization_at_update_time(env, monkeypatch):
-    """Q2: a widening between the SELECT and the claim UPDATE is refused."""
+async def test_claim_snapshot_guard_refuses_card_widened_before_update(env, monkeypatch):
+    """Q2: the conditional claim UPDATE refuses a card widened after its SELECT."""
     await _create_operator(env, name="job", schedule="1h", prompt="a")
     card = await _approved_edit_card(env)
     approval_id = card["approval_id"]
@@ -529,7 +553,7 @@ async def test_claim_rechecks_authorization_at_update_time(env, monkeypatch):
             name="job", actor="chat:web", turn=_chat("tui"),
             authorized_by=approval_id,
         )
-    assert caught.value.code in {"invalid_authorization", "authorization_consumed"}
+    assert caught.value.code == "authorization_consumed"
     assert widened is True
     assert await db.fetchall("SELECT id FROM tasks") == []
     markers = await _live_authorization_markers(approval_id)

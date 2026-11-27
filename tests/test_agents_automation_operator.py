@@ -405,6 +405,23 @@ async def test_delete_keeps_the_exact_durable_mutation_gate(env) -> None:
     )
 
 
+async def test_digestless_mutation_card_is_refused(env) -> None:
+    """Q4: a missing arguments digest fails closed at the specialist gate."""
+    await _service_create(env, name="hourly")
+    args = {"name": "hourly"}
+    approval_id = await approve(env, "schedule_delete", args)
+    await db.execute(
+        "UPDATE approvals SET metadata=json_remove(metadata,'$.arguments_digest') "
+        "WHERE id=?", (approval_id,),
+    )
+
+    blocked = await run(env, action="delete_schedule", **args, approval_id=approval_id)
+    assert not blocked.success
+    assert blocked.output["status"] == "blocked_approval_required"
+    assert "no arguments digest" in blocked.output["approval"]["reason"]
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='hourly'") is not None
+
+
 async def test_one_task_create_approval_authorizes_only_one_enqueue(env) -> None:
     """Round-4 regression: one task_create card must not enqueue twice."""
     args = {"objective": "durable work"}

@@ -600,8 +600,12 @@ async def _verify_approval(
         if str(row[field]) != str(expected):
             return deny(f"approval binding mismatch on {field}")
 
+    # No in-repo writer mints an automation:mutate card without an arguments
+    # digest, so a digest-less card is malformed, not a legacy shape to accept.
     expected_digest = metadata.get("arguments_digest")
-    if expected_digest and not hmac.compare_digest(
+    if not expected_digest:
+        return deny(f"approval {approval_id} has no arguments digest")
+    if not hmac.compare_digest(
         str(expected_digest), str(target["arguments_digest"])
     ):
         return deny("approval arguments digest does not match this mutation")

@@ -1194,11 +1194,17 @@ async def test_export_rate_limit_is_durable_and_shared_across_workers(
     await api_module._check_export_rate(principal)
     with pytest.raises(HTTPException) as denied:
         await api_module._check_export_rate(principal)
-    assert denied.value.status_code == 429
+    assert denied.value.status_code == 429, (
+        f"third request was not denied: status={denied.value.status_code}, "
+        f"detail={getattr(denied.value, 'detail', None)!r}"
+    )
 
     kv_key = api_module._export_rate_kv_key(principal)
     row = await db.fetchone("SELECT value FROM kv WHERE key=?", (kv_key,))
-    assert row is not None and len(json.loads(row["value"])) == 2
+    assert row is not None and len(json.loads(row["value"])) == 2, (
+        f"expected two durable timestamps under kv key {kv_key!r}: "
+        f"{json.loads(row['value']) if row else None!r}"
+    )
 
     # A genuinely different worker (separate interpreter and module state)
     # reads the same SQLite counters and must refuse the third request.
@@ -1236,7 +1242,10 @@ async def test_export_rate_limit_is_durable_and_shared_across_workers(
             break
         await asyncio.sleep(0.2 * (attempt + 1))
     assert result is not None, f"export worker never completed: last={last_outcome!r}"
-    assert result.returncode != 0 and "rate limit" in result.stderr
+    assert result.returncode != 0 and "rate limit" in result.stderr, (
+        f"cross-process worker should be denied by the durable window: "
+        f"exit={result.returncode}, stderr={result.stderr[-200:]!r}"
+    )
 
     # Buckets are per principal, and expired kv counters are pruned.
     await api_module._check_export_rate("another-principal")
@@ -1247,7 +1256,11 @@ async def test_export_rate_limit_is_durable_and_shared_across_workers(
     )
     with pytest.raises(HTTPException):
         await api_module._check_export_rate(principal)
-    assert await db.fetchone("SELECT 1 FROM kv WHERE key=?", (stale_key,)) is None
+    stale_row = await db.fetchone("SELECT 1 FROM kv WHERE key=?", (stale_key,))
+    assert stale_row is None, (
+        f"expired counter under kv key {stale_key!r} was not pruned: "
+        f"{dict(stale_row) if stale_row else None!r}"
+    )
 
 
 async def test_fake_digest_prefix_is_scrubbed_on_every_browser_surface(

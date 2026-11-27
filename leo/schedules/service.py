@@ -21,6 +21,7 @@ schedule store.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import sqlite3
 import threading
@@ -695,21 +696,30 @@ class ScheduleService:
                         or not resource.startswith(prefix):
                     return False
                 subject = resource[len(prefix):]
-                # An id-only delete has no name/task_id/objective in its
-                # approval target, so its subject is empty. That is not a
-                # wildcard: bind the card to the resolved row's exact
-                # arguments digest instead.
-                if subject == "":
-                    expected = arguments_digest({
-                        "tool": "schedule_delete",
-                        "arguments": {"schedule_id": view.id},
-                    })
-                    return bool(expected) and str(
-                        metadata.get("arguments_digest") or ""
-                    ) == str(expected)
-                return subject in {
-                    str(view.name)[:160], str(view.id)[:160],
-                }
+                # The subject alone is not a capability: every delete card is
+                # bound to the exact tool arguments the human approved. An
+                # id-only target has no name/task_id/objective, so its subject
+                # is empty; a name target carries the name as its subject.
+                id_digest = arguments_digest({
+                    "tool": "schedule_delete",
+                    "arguments": {"schedule_id": view.id},
+                })
+                name_digest = arguments_digest({
+                    "tool": "schedule_delete",
+                    "arguments": {"name": view.name},
+                })
+                stored = str(metadata.get("arguments_digest") or "")
+                if not stored:
+                    return False
+                if subject == str(view.name)[:160]:
+                    expected = name_digest
+                elif subject in {"", str(view.id)[:160]}:
+                    expected = id_digest
+                else:
+                    return False
+                return expected is not None and hmac.compare_digest(
+                    stored, str(expected)
+                )
 
             lease = await claim_mutation_authorization(
                 str(authorized_by), clock=self.clock, settings=self.settings,
