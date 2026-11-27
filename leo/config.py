@@ -494,9 +494,10 @@ class ReviewConfig(BaseModel):
 class SelfImprovementConfig(BaseModel):
     """Approval-free skill learning from the agent's own recurring work.
 
-    This only governs inert skills, standing instructions and review notes.
-    Safety rules, secrets, hardline permissions and model/provider settings are
-    never eligible, and every write is still validated before it is durable.
+    This only governs inert skills and review notes. Standing instructions are
+    not authored by this engine. Safety rules, secrets, hardline permissions
+    and model/provider settings are never eligible, and every write is still
+    validated before it is durable.
     """
 
     enabled: bool = True
@@ -506,6 +507,8 @@ class SelfImprovementConfig(BaseModel):
     min_recurrences: int = Field(default=3, ge=2, le=20)
     # Corrections of a learned skill before it is retired (kept, never deleted).
     max_corrections: int = Field(default=3, ge=2, le=20)
+    # Nightly pass flags a learned skill as stale after this many days unused.
+    unused_after_days: int = Field(default=30, ge=1, le=3650)
 
 
 class LearningConfig(BaseModel):

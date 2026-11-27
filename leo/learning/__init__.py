@@ -7,7 +7,8 @@ output, instruction-shaped text and model self-attestation are never learned.
 
 Public entry points: :class:`leo.learning.engine.LearningEngine` for evidence-
 backed notes and :class:`leo.learning.self_improvement.SelfImprovementEngine`
-for approval-free skills, standing instructions and nightly review notes.
+for approval-free skills and nightly review notes. Standing instructions are
+not authored here; durable guidance is expressed as a documentation-only skill.
 """
 
 from .engine import (

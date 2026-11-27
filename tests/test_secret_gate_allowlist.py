@@ -47,10 +47,28 @@ def test_dead_line_exceptions_are_removed_and_current_ones_are_explicit() -> Non
         ("tests/test_tool_agent_integration.py", "387", "assigned secret"),
         ("tests/test_tools_context.py", "88", "bearer token"),
         ("tests/test_tools_run.py", "213", "bearer token"),
+        # PR #88 copied this from another branch: this file has 632 lines.
+        ("leo/tools/shell_policy.py", "671", "assigned secret"),
     ]
     for path, line, label in dead:
         assert line not in scanner.REVIEWED_ALLOWLIST.get(path, {}), (path, line)
         assert not scanner.is_reviewed(path, int(line), label)
+    # Exceptions for synthetic fixtures in historical blobs are keyed by blob
+    # id, not by a path+line that would be dead in this branch's working tree
+    # (and collide with other PRs shifting those same test files).
+    for path, line in (
+        ("tests/test_harden_config.py", "285"), ("junit.xml", "1"),
+        ("tests/test_tools_http.py", "113"), ("tests/test_tools_http.py", "1413"),
+    ):
+        assert line not in scanner.REVIEWED_ALLOWLIST.get(path, {}), (path, line)
+    assert scanner.is_reviewed("6554f3e06d2b", 706, "assigned secret", scanner.BLOB_REVIEWED_ALLOWLIST)
+    assert scanner.is_reviewed("a5e90bcb150f", 709, "assigned secret", scanner.BLOB_REVIEWED_ALLOWLIST)
+    assert scanner.is_reviewed("2eef7488acd5", 285, "anthropic key", scanner.BLOB_REVIEWED_ALLOWLIST)
+    assert scanner.is_reviewed("31f599f244e3", 1, "stripe live key", scanner.BLOB_REVIEWED_ALLOWLIST)
+    for oid in ("5fd12656c30c", "7f5c9f7a485e", "9a156a7d4d40"):
+        assert scanner.is_reviewed(oid, 671, "assigned secret", scanner.BLOB_REVIEWED_ALLOWLIST)
+        assert not scanner.is_reviewed(oid, 671, "openai key", scanner.BLOB_REVIEWED_ALLOWLIST)
+    assert not scanner.is_reviewed("a5e90bcb150f", 709, "openai key", scanner.BLOB_REVIEWED_ALLOWLIST)
 
     current = [
         ("tests/test_agents_automation_operator.py", 41, "assigned secret"),

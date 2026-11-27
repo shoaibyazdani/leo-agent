@@ -1,9 +1,12 @@
 """Approval-free self-improvement: learn durable skills and nightly review notes.
 
 This engine is deliberately narrow. It writes only three kinds of durable
-state: documentation-only skills / standing instructions in the real
-``SkillRegistry``, bounded review notes in ``kv``, and lifecycle flags on
-skills it authored itself. It never raises an approval card, never edits code,
+state: documentation-only skills in the real ``SkillRegistry``, bounded review
+notes in ``kv``, and lifecycle flags on skills it authored itself. Standing
+instructions are explicitly out of scope here: ``validate_change`` accepts the
+``instruction`` kind as inert, but this PR provides no instruction store, prompt
+injection path or writer for it. Durable guidance is expressed as a skill.
+It never raises an approval card, never edits code,
 and never touches safety rules, the hardline floor, secrets, secrets-shaped
 content, untrusted external text, model/provider configuration or permissions.
 
@@ -16,8 +19,10 @@ you learn?" has a inspectable answer.
 Recurring work is detected deterministically from the tool patterns of
 completed turns (``tool.called`` plus ``chat.completed`` events). After the
 configured number of distinct turns with the same pattern, a skill is
-registered directly: the user corrects it only when it is wrong. Repeated
-corrections retire the learned skill without deleting its history.
+registered directly: the user corrects it only when it is wrong, in chat via
+``/skills correct <name>``. Repeated corrections retire the learned skill
+without deleting its history; the nightly pass also flags learned skills left
+unused for ``unused_after_days``.
 
 The nightly pass is registered on LEO's durable scheduler. It reads the day's
 stalls, dead letters, silent fallbacks, failed turns and expired approvals,
@@ -107,6 +112,8 @@ _FAILURE_CHANGES: dict[str, str] = {
     "failed_turn": "validate tool arguments before the call and report the reason on failure",
     "expired_approval": "narrow the requested action or remind the operator before expiry",
 }
+# Learned skills unused for a long time are flagged, never silently deleted.
+_UNUSED_CHANGE = "flag the learned skill as stale and confirm it still helps before reuse"
 _FAILURE_EVENT_TOPICS: dict[str, tuple[str, ...]] = {
     "silent_fallback": (
         "automation.needs_you", "schedule.execution_error",
@@ -211,7 +218,10 @@ def validate_change(change: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class SelfImprovementEngine:
-    """Write approved-by-correctness skills and notes; never ask for a card."""
+    """Write approved-by-correctness skills and notes; never ask for a card.
+
+    Standing instructions are out of scope: durable guidance is a skill here.
+    """
 
     def __init__(
         self,
@@ -227,6 +237,7 @@ class SelfImprovementEngine:
         self.enabled = bool(getattr(cfg, "enabled", True))
         self.min_recurrences = max(2, int(getattr(cfg, "min_recurrences", 3) or 3))
         self.max_corrections = max(2, int(getattr(cfg, "max_corrections", 3) or 3))
+        self.unused_after_days = max(1, int(getattr(cfg, "unused_after_days", 30) or 30))
         self.actor = str(actor or ACTOR)
 
     # ------------------------------------------------------------------ state
@@ -502,6 +513,35 @@ class SelfImprovementEngine:
         text = f"{day}: {note}" if day else note
         return text[: max(0, int(limit_chars))]
 
+    async def _unused_learned(self, now: datetime) -> list[str]:
+        """Learned skills whose last recorded use is older than the threshold."""
+        cutoff = now - timedelta(days=self.unused_after_days)
+        names: list[str] = []
+        for record in await self.skills.list():
+            origin = dict(getattr(record, "origin", None) or {})
+            if origin.get("learned_by") != "self_improvement":
+                continue
+            name = str(getattr(record, "name") or "")
+            if not _SAFE_ID.fullmatch(name):
+                continue
+            row = await db.fetchone(
+                "SELECT last_viewed_at, last_used_at, last_patched_at, updated_at, state "
+                "FROM skill_usage WHERE skill_name=?",
+                (name,),
+            )
+            if row is None or str(row["state"] or "active") == "archived":
+                continue
+            used = [value for value in (
+                _parse_time(row["last_viewed_at"]), _parse_time(row["last_used_at"]),
+                _parse_time(row["last_patched_at"]), _parse_time(row["updated_at"]),
+            ) if value is not None]
+            # A skill with no usage record at all is only aged from its
+            # learning time; a used skill ages from its last recorded use.
+            last = max(used, default=_parse_time(origin.get("learned_at")))
+            if last is not None and last <= cutoff:
+                names.append(name)
+        return names[:MAX_SOURCE_IDS]
+
     async def nightly_review(
         self,
         day: str | None = None,
@@ -531,6 +571,25 @@ class SelfImprovementEngine:
             raise SelfImprovementDenied(f"invalid review day: {day}") from exc
         end = start + timedelta(days=1)
         findings, sources = await self._collect(start, end)
+        # R4: a learned skill that has not been used recently is flagged, not
+        # deleted. The state change is reversible, and one bad skill cannot
+        # stop the review note for the day.
+        unused = await self._unused_learned(moment)
+        for name in unused:
+            try:
+                if str((await self.skills.usage(name)).get("state") or "active") != "stale":
+                    await self.skills.set_state(name, "stale")
+            except Exception as exc:  # noqa: BLE001 - one flag must not fail the pass
+                _LOG.warning("could not flag unused learned skill %s: %s", name, exc)
+        if unused:
+            findings.append({
+                "kind": "unused_skill", "count": len(unused),
+                "change": _UNUSED_CHANGE, "sources": unused[:5],
+            })
+            for name in unused[:5]:
+                if name not in sources:
+                    sources.append(name)
+            sources = sources[:MAX_SOURCE_IDS]
         total = sum(int(item["count"]) for item in findings)
         lines = [f"Nightly review for {day}: {total} findings."]
         for item in findings:
@@ -686,13 +745,27 @@ class SelfImprovementEngine:
             "approval_required": False,
             "min_recurrences": self.min_recurrences,
             "max_corrections": self.max_corrections,
+            "unused_after_days": self.unused_after_days,
             "nightly_schedule": NIGHTLY_SCHEDULE_NAME,
-            "mutable_targets": ["skill", "instruction", "note"],
+            # Standing instructions are explicitly out of scope for this PR.
+            "mutable_targets": ["skill", "note"],
             "protected_targets": [
                 "safety rules", "hardline floor", "secrets", "approvals",
                 "permissions", "model/provider configuration",
             ],
         }
+
+
+def _parse_time(value: Any) -> datetime | None:
+    """Parse one durable ISO timestamp, treating naive values as UTC."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
 
 
 async def recent_review_brief(*, limit_chars: int = 900) -> str:

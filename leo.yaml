@@ -350,6 +350,7 @@ learning:
     nightly_cron: "0 3 * * *"   # UTC, on the durable scheduler
     min_recurrences: 3          # matching turns/tasks before a skill is saved
     max_corrections: 3          # corrections before a learned skill is retired
+    unused_after_days: 30       # nightly pass flags unused learned skills as stale
 
 skills:
   # Deterministic lifecycle for agent-authored skills. Stale/archive are

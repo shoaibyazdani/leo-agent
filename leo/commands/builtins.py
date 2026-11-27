@@ -1686,6 +1686,19 @@ async def skills_command(ctx: CommandContext) -> CommandResult:
         record = await skills.enable(name) if sub == "enable" else await skills.disable(name)
         await _audit(ctx, f"slash.skills.{sub}", name, f"skill {sub} via slash")
         return _summary(ctx, "skills", f"Skill {name} {sub}d", {"skill": _dump(record)})
+    if sub == "correct":
+        # A real chat correction signal for a skill this engine learned: the
+        # engine itself refuses native/foreign skills and dedupes by source id.
+        name = ctx.require(1, "skill name")
+        engine = _require_service(ctx, "self_improvement")
+        source_id = f"skills-correct:{ctx.conversation_id or ctx.channel}:{new_id()}"
+        outcome = await engine.record_correction(name, source_id=source_id)
+        await _audit(
+            ctx, "slash.skills.correct", name,
+            f"correction {outcome['corrections']} for a learned skill via chat",
+            metadata={"retired": outcome["retired"]},
+        )
+        return _summary(ctx, "skills", f"Correction recorded for {name}", outcome)
     if sub == "usage":
         rows = await skills.usage_list()
         rows.sort(
@@ -2822,10 +2835,11 @@ def register_builtins(registry: CommandRegistry | None = None) -> CommandRegistr
     # -- skills --------------------------------------------------------------
     registry.register(_spec(
         "skills",
-        "List, search, inspect, run, enable/disable, review history, approve staged writes or manage lifecycle",
+        "List, search, inspect, run, enable/disable, correct a learned skill, "
+        "review history, approve staged writes or manage lifecycle",
         skills_command,
         args_hint=(
-            "[list|search <q>|inspect <name>|run <name> [k=v]|enable|disable|history|"
+            "[list|search <q>|inspect <name>|run <name> [k=v]|enable|disable|correct <name>|history|"
             "snapshots <name>|rollback <id>|usage|pin|unpin|lock|unlock|archive|restore|"
             "pending|diff <id>|approve <id>|reject <id>|"
             "curator [status|run|candidates|consolidate [--dry-run]]]"

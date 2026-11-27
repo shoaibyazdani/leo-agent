@@ -26,6 +26,7 @@ from leo.learning.self_improvement import (
 from leo.schedules.execution import ScheduleExecution
 from leo.schedules.store import ScheduleStore
 from leo.skills import SkillRegistry
+from leo.tasks.scheduler import Scheduler
 
 DAY = "2026-11-27"
 DAY_START = f"{DAY}T00:00:00+00:00"
@@ -273,16 +274,56 @@ async def test_repeated_corrections_retire_a_learned_skill(env) -> None:
         await env.engine.record_correction("summarize_text", source_id="native")
 
 
+async def test_nightly_review_flags_learned_skills_unused_too_long(env) -> None:
+    observed = await three_turns(env.engine)
+    name = observed["skill"]
+    old = "2026-09-01T00:00:00+00:00"
+    await db.execute(
+        "UPDATE skill_usage SET last_viewed_at=?, last_used_at=?, last_patched_at=?, "
+        "updated_at=? WHERE skill_name=?",
+        (old, old, old, old, name),
+    )
+
+    review = await env.engine.nightly_review(
+        DAY, now=datetime(2026, 11, 28, 3, 0, tzinfo=UTC)
+    )
+    unused = [item for item in review["findings"] if item["kind"] == "unused_skill"]
+    assert len(unused) == 1 and unused[0]["count"] == 1
+    assert name in unused[0]["sources"] and name in review["sources"]
+    assert "unused" in review["note"] and "stale" in review["note"]
+    # Flagged, never deleted: the skill stays inspectable and out of the index
+    # only through the existing lifecycle state (not a hard removal).
+    assert (await env.skills.usage(name))["state"] == "stale"
+    assert any(
+        item["kind"] == "skill" and item["name"] == name
+        for item in await env.engine.learned()
+    )
+    assert await approval_count() == 0
+
+
+async def test_standing_instructions_are_explicitly_out_of_scope(env) -> None:
+    """The instruction kind validates as inert, but nothing authors one."""
+    await three_turns(env.engine)
+    assert all(item["kind"] != "instruction" for item in await env.engine.learned())
+    assert env.engine.status()["mutable_targets"] == ["skill", "note"]
+    assert env.engine.status()["unused_after_days"] == 30
+    assert "out of scope" in (SelfImprovementEngine.__doc__ or "")
+
+
 # ------------------------------------------------------------- app integration
-@pytest.fixture
-async def app():
+def _mock_settings() -> Settings:
     settings = Settings()
     settings.models = ModelConfig(
         default="mock",
         fallback="mock",
         providers={"mock": ModelProviderConfig(kind="mock", model="mock-1")},
     )
-    application = LeoApp(settings)
+    return settings
+
+
+@pytest.fixture
+async def app():
+    application = LeoApp(_mock_settings())
     await application.initialize()
     yield application
     await application.shutdown()
@@ -320,3 +361,64 @@ async def test_scheduled_nightly_worker_writes_the_previous_days_note(app) -> No
     assert notes[0]["day"] == DAY
     assert notes[0]["approval_id"] is None
     assert await approval_count() == 0
+
+
+async def test_invalid_nightly_cron_never_breaks_boot() -> None:
+    settings = _mock_settings()
+    settings.learning.self_improvement.nightly_cron = "not a cron expression"
+    application = LeoApp(settings)
+    await application.initialize()  # must not raise
+    try:
+        assert application.self_improvement is not None
+        with pytest.raises(KeyError):
+            await application.scheduler.get(NIGHTLY_SCHEDULE_NAME)
+        assert await approval_count() == 0
+    finally:
+        await application.shutdown()
+
+
+async def test_scheduler_failure_never_breaks_boot(monkeypatch) -> None:
+    async def broken_register_cron(*args, **kwargs):
+        raise RuntimeError("scheduler storage unavailable")
+
+    monkeypatch.setattr(Scheduler, "register_cron", broken_register_cron)
+    application = LeoApp(_mock_settings())
+    await application.initialize()  # must not raise
+    try:
+        assert application.self_improvement is not None
+        assert NIGHTLY_WORKER in application.tasks._workers
+        assert await approval_count() == 0
+    finally:
+        await application.shutdown()
+
+
+async def test_chat_correction_command_reaches_record_correction(app) -> None:
+    observed: dict = {}
+    for index in range(3):
+        observed = await app.self_improvement.observe_workflow(
+            ["list_files", "read_file"],
+            source_ids=[f"turn-{index}"],
+            conversation_id="conv-correction",
+        )
+    assert "skill" in observed, observed
+    name = observed["skill"]
+    for expected in (1, 2, 3):
+        result = await app.commands.dispatch(
+            f"/skills correct {name}", app=app, principal="local", surface="chat",
+            channel="test-chat", conversation_id="conv-correction",
+        )
+        assert result.success, result.message
+        assert result.data["corrections"] == expected
+    record = await app.skills.get(name)
+    assert record is not None and record.status == "archived"
+
+    rows = await db.fetchall(
+        "SELECT action FROM audit_log WHERE action='slash.skills.correct'"
+    )
+    assert len(rows) == 3
+
+    native = await app.commands.dispatch(
+        "/skills correct summarize_text", app=app, principal="local", surface="chat",
+        channel="test-chat", conversation_id="conv-correction",
+    )
+    assert not native.success  # only self-improvement's own skills can be corrected

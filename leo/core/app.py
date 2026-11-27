@@ -2329,47 +2329,61 @@ class LeoApp:
             _LOG.warning("self-improvement turn observation failed: %s", exc)
 
     async def _register_self_improvement_schedule(self) -> None:
-        """Register the nightly review on the durable scheduler, without a card."""
-        from ..learning.self_improvement import (
-            NIGHTLY_SCHEDULE_NAME, NIGHTLY_WORKER,
-        )
+        """Register the nightly review defensively; maintenance must not block boot.
 
-        engine = getattr(self, "self_improvement", None)
-        if engine is None or not getattr(engine, "enabled", False):
-            return
-        cfg = getattr(getattr(self.settings, "learning", None), "self_improvement", None)
-        expression = str(getattr(cfg, "nightly_cron", "0 3 * * *") or "0 3 * * *")
-
-        async def review_worker(task: Any, tasks_engine: Any) -> dict[str, Any]:
-            # An occurrence is anchored to its scheduled day, including a
-            # bounded catch-up after downtime; always review that day, not the
-            # day the app happened to restart.
-            metadata = getattr(task, "metadata", None) or {}
-            scheduled = str(metadata.get("scheduled_for") or "")[:10]
-            day = None
-            if scheduled:
-                try:
-                    day = (datetime.fromisoformat(scheduled) - timedelta(days=1)).date().isoformat()
-                except ValueError:
-                    day = None
-            result = await engine.nightly_review(day)
-            evidence = [{
-                "source": "self_improvement_review",
-                "claim": f"nightly note {result.get('id')} written for {result.get('day')}",
-                "task_id": getattr(task, "id", None),
-                "note_id": result.get("id"),
-            }]
-            await tasks_engine.complete(
-                getattr(task, "id"), result, evidence, note="nightly self-review"
+        A bad ``nightly_cron``, a missing scheduler or a storage failure leaves
+        the rest of the app running. The review is optional maintenance, not a
+        dependency of the chat/turn path.
+        """
+        try:
+            from ..learning.self_improvement import (
+                NIGHTLY_SCHEDULE_NAME, NIGHTLY_WORKER,
             )
-            return result
+            from ..tasks.scheduler import every_interval, parse_cron
 
-        self.tasks.register_worker(NIGHTLY_WORKER, review_worker)
-        await self.scheduler.register_cron(
-            NIGHTLY_SCHEDULE_NAME, expression,
-            "Review the day's stalls, dead letters, fallbacks, failed turns and expired approvals",
-            payload={"worker": NIGHTLY_WORKER, "source": "self-improvement"},
-        )
+            engine = getattr(self, "self_improvement", None)
+            if engine is None or not getattr(engine, "enabled", False):
+                return
+            cfg = getattr(getattr(self.settings, "learning", None), "self_improvement", None)
+            expression = str(getattr(cfg, "nightly_cron", "0 3 * * *") or "0 3 * * *")
+            if every_interval(expression) is None:
+                parse_cron(expression)  # invalid cron is logged, never fatal at boot
+
+            async def review_worker(task: Any, tasks_engine: Any) -> dict[str, Any]:
+                # An occurrence is anchored to its scheduled day, including a
+                # bounded catch-up after downtime; always review that day, not the
+                # day the app happened to restart.
+                metadata = getattr(task, "metadata", None) or {}
+                scheduled = str(metadata.get("scheduled_for") or "")[:10]
+                day = None
+                if scheduled:
+                    try:
+                        day = (datetime.fromisoformat(scheduled) - timedelta(days=1)).date().isoformat()
+                    except ValueError:
+                        day = None
+                result = await engine.nightly_review(day)
+                evidence = [{
+                    "source": "self_improvement_review",
+                    "claim": f"nightly note {result.get('id')} written for {result.get('day')}",
+                    "task_id": getattr(task, "id", None),
+                    "note_id": result.get("id"),
+                }]
+                await tasks_engine.complete(
+                    getattr(task, "id"), result, evidence, note="nightly self-review"
+                )
+                return result
+
+            self.tasks.register_worker(NIGHTLY_WORKER, review_worker)
+            await self.scheduler.register_cron(
+                NIGHTLY_SCHEDULE_NAME, expression,
+                "Review the day's stalls, dead letters, fallbacks, failed turns and expired approvals",
+                payload={"worker": NIGHTLY_WORKER, "source": "self-improvement"},
+            )
+        except Exception as exc:  # noqa: BLE001 - optional maintenance must not block boot
+            _LOG.warning(
+                "nightly self-review could not be registered",
+                extra={"error": str(exc)},
+            )
 
     async def _learning_history_has_real_source(self) -> bool:
         """Whether durable history contains a non-harness channel at all."""

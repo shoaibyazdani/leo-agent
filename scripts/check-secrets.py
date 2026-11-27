@@ -83,7 +83,6 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "uv.lock": {"1-": "only=long hex: lockfile integrity hashes, not credentials"},
     "tests/test_harden_config.py": {
         "280-281": "synthetic invalid-token parameter",
-        "285": "only=anthropic key: synthetic fixture at its current line",
         "430-458": "synthetic provider fixtures and hex fixture",
     },
     "tests/channels/test_bluebubbles.py": {"23": "test fixture", "25": "test fixture"},
@@ -144,36 +143,6 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "1047": "only=openai key|assigned secret: synthetic fixture at its current line",
         "1286": "only=openai key|assigned secret: synthetic fixture at its current line",
         "1373": "only=openai key|assigned secret: synthetic fixture at its current line",
-        # Insertions from follow-up issues shifted these known fixtures again.
-        "113": "only=openai key: synthetic fixture at its current line",
-        "128": "only=openai key: synthetic fixture at its current line",
-        "706": "only=assigned secret: synthetic fixture at its current line",
-        "723": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "773": "only=openai key: redaction assertion at its current line",
-        "851": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "868": "only=openai key: redaction assertion at its current line",
-        "929": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1000": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1043": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1053": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1084": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1323": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1410": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "709": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "726": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "776": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "854": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "871": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "932": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1003": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1046": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1056": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1087": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1326": "only=openai key|assigned secret: synthetic fixture at its current line",
-        "1413": "only=openai key|assigned secret: synthetic fixture at its current line",
-    },
-    "leo/tools/shell_policy.py": {
-        "671": "only=assigned secret: local variable naming a classifier helper result",
     },
     "tests/test_tools_webhook.py": {"33": "test fixture"},
     "tests/channels/test_a2a.py": {"42": "test fixture"},
@@ -189,11 +158,11 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "728": "synthetic bearer fixture in an earlier revision (two pattern families)",
     },
     "tests/test_self_improvement.py": {
-        "146": "only=assigned secret: synthetic secret-refusal fixture",
-        "169": "only=assigned secret: synthetic secret-refusal fixture",
-    },
-    "junit.xml": {
-        "1": "only=anthropic key|stripe live key: generated pytest evidence containing synthetic fixture names",
+        "146": "only=assigned secret: synthetic secret-refusal fixture at the PR head line",
+        "169": "only=assigned secret: synthetic secret-refusal fixture at the PR head line",
+        # New tests inserted above these fixtures in the fix branch.
+        "147": "only=assigned secret: synthetic secret-refusal fixture at its current line",
+        "170": "only=assigned secret: synthetic secret-refusal fixture at its current line",
     },
     "tests/test_api.py": {
         "241": "test fixture", "345": "synthetic failure-message fixture",
@@ -343,6 +312,62 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "object:commit:f99b540085d9:msg": {"1-": "only=long hex: cherry-picked commit reference"},
 }
 
+# Synthetic fixtures in *historical blobs* of this branch. These exceptions are
+# keyed by blob id, not by path+line: path entries for lines that no longer
+# exist would be dead in the working tree and collide with other PRs shifting
+# the same test files. A blob-scoped entry can never exempt a current file.
+BLOB_REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
+    "6554f3e06d2b": {  # tests/test_tools_http.py, earlier revision
+        "113": "only=openai key: synthetic fixture in a historical blob",
+        "128": "only=openai key: synthetic fixture in a historical blob",
+        "706": "only=assigned secret: synthetic fixture in a historical blob",
+        "723": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "773": "only=openai key: redaction assertion in a historical blob",
+        "851": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "868": "only=openai key: redaction assertion in a historical blob",
+        "929": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1000": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1043": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1053": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1084": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1323": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1410": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+    },
+    "a5e90bcb150f": {  # the same fixtures, shifted by three lines
+        "113": "only=openai key: synthetic fixture in a historical blob",
+        "128": "only=openai key: synthetic fixture in a historical blob",
+        "709": "only=assigned secret: synthetic fixture in a historical blob",
+        "726": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "776": "only=openai key: redaction assertion in a historical blob",
+        "854": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "871": "only=openai key: redaction assertion in a historical blob",
+        "932": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1003": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1046": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1056": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1087": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1326": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+        "1413": "only=openai key|assigned secret: synthetic fixture in a historical blob",
+    },
+    "2eef7488acd5": {  # tests/test_harden_config.py, older revision
+        "285": "only=anthropic key: synthetic fixture in a historical blob",
+    },
+    "31f599f244e3": {  # junit.xml evidence blob, not a path in the release set
+        "1": "only=anthropic key|stripe live key: synthetic pytest evidence in a historical blob",
+    },
+    # The current shell_policy.py has 632 lines; these three old revisions
+    # still name a classifier result `secret` on line 671.
+    "5fd12656c30c": {
+        "671": "only=assigned secret: local variable in a historical blob",
+    },
+    "7f5c9f7a485e": {
+        "671": "only=assigned secret: local variable in a historical blob",
+    },
+    "9a156a7d4d40": {
+        "671": "only=assigned secret: local variable in a historical blob",
+    },
+}
+
 
 def git(*args: str, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
@@ -428,13 +453,16 @@ def display(path: Path) -> str:
         return path.name
 
 
-def is_reviewed(path_key: str, line: int, label: str) -> bool:
+def is_reviewed(
+    path_key: str, line: int, label: str, table: dict | None = None
+) -> bool:
+    table = REVIEWED_ALLOWLIST if table is None else table
     keys = [path_key]
     keys.extend(
-        key for key in REVIEWED_ALLOWLIST if key.endswith("/") and path_key.startswith(key)
+        key for key in table if key.endswith("/") and path_key.startswith(key)
     )
     for key in keys:
-        for spec, reason in REVIEWED_ALLOWLIST.get(key, {}).items():
+        for spec, reason in table.get(key, {}).items():
             only = (
                 set(reason.split(":", 1)[0][len("only="):].split("|"))
                 if reason.startswith("only=") else None
@@ -508,7 +536,7 @@ def scan_objects(oids: list[str], unreachable: list[str]) -> int:
         if kind == "blob":
             paths = blob_paths.get(oid, [])
             if paths:
-                findings += _scan_blob_by_path(text, paths)
+                findings += _scan_blob_by_path(text, paths, oid)
             else:
                 findings += scan_lines(text, source, f"object:{oid}")
         elif kind == "tree":
@@ -530,12 +558,13 @@ def scan_objects(oids: list[str], unreachable: list[str]) -> int:
 _BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".db", ".sqlite", ".pyc"}
 
 
-def _scan_blob_by_path(text: str, paths: list[str]) -> int:
+def _scan_blob_by_path(text: str, paths: list[str], oid: str) -> int:
     """Scan a blob under its repository path keys so the allowlist applies.
 
     A line is skipped only when *every* path that references this blob
     allowlists that line and label — a shared blob cannot use one reviewed
-    fixture to smuggle content into a path that was never reviewed.
+    fixture to smuggle content into a path that was never reviewed. Blob-scoped
+    exceptions are keyed by content id and only apply to historical objects.
     """
     findings = 0
     allow_hex = not all(Path(p).suffix.lower() in _BINARY_SUFFIXES for p in paths)
@@ -544,6 +573,8 @@ def _scan_blob_by_path(text: str, paths: list[str]) -> int:
             if label == "long hex" and not allow_hex:
                 continue
             if all(is_reviewed(path, number, label) for path in paths):
+                continue
+            if is_reviewed(oid[:12], number, label, BLOB_REVIEWED_ALLOWLIST):
                 continue
             if pattern.search(line):
                 redacted = pattern.sub("[REDACTED]", line).strip()[:160]
