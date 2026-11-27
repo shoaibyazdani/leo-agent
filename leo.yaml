@@ -417,3 +417,22 @@ automation:
   bot_profiles: []
   local_conversations: []
   default_room_channel: null
+  # Judgment watcher: a read-only scheduled job that decides whether anything
+  # is worth an interruption. It never takes actions or answers third parties.
+  watcher:
+    enabled: true
+    cadence_seconds: 1800  # every 30 minutes
+    waking_start: "09:00"
+    waking_end: "23:00"
+    timezone: Asia/Karachi  # PKT
+    # Plain text, edited by the operator. Missing file = safe defaults.
+    # Sections: "topics to tell", "never mention", "quiet hours",
+    # "max items per day"; topics are "- name" bullets under their section.
+    preferences_path: ~/.config/leo/watcher-preferences.txt
+    # Same tokens schedules use; "home" needs a configured home_channel.
+    delivery:
+      - home
+    # External read-only sources. No token value is ever stored here.
+    github_repos:
+      - shoaibyazdani/leo-agent
+    github_token_env: GITHUB_TOKEN

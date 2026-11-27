@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import time
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -515,6 +516,36 @@ class SkillsConfig(BaseModel):
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
 
 
+class WatcherConfig(BaseModel):
+    """Judgment-driven proactivity, layered on the existing scheduler.
+
+    Delivery targets use the same tokens as schedules (``home`` or
+    ``platform:chat[:thread]``). With no configured home channel the watcher
+    stays silent rather than guessing a destination.
+    """
+
+    enabled: bool = True
+    cadence_seconds: int = Field(default=1800, ge=60)
+    waking_start: str = "09:00"
+    waking_end: str = "23:00"
+    timezone: str = "Asia/Karachi"
+    preferences_path: Path = Path("~/.config/leo/watcher-preferences.txt")
+    delivery: list[str] = Field(default_factory=lambda: ["home"])
+    github_repos: list[str] = Field(default_factory=lambda: ["shoaibyazdani/leo-agent"])
+    github_token_env: str = "GITHUB_TOKEN"
+    model: str = ""
+    max_signals: int = Field(default=50, ge=1, le=200)
+
+    @field_validator("waking_start", "waking_end")
+    @classmethod
+    def _validate_clock(cls, value: str) -> str:
+        try:
+            parsed = time.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("waking hours must be HH:MM") from exc
+        return parsed.strftime("%H:%M")
+
+
 class AutomationConfig(BaseModel):
     tick_seconds: float = 1.0
     recovery_on_startup: bool = True
@@ -548,6 +579,7 @@ class AutomationConfig(BaseModel):
     # ``local:<id>`` resolve only to ids listed here.
     bot_profiles: list[str] = Field(default_factory=list)
     local_conversations: list[str] = Field(default_factory=list)
+    watcher: WatcherConfig = Field(default_factory=WatcherConfig)
 
 
 class ComputerConfig(BaseModel):
@@ -850,6 +882,35 @@ class Settings(BaseModel):
                                 f"{env_name} must be smart, manual or off; got {value!r}"
                             )
                     setattr(target, field, value)
+        # Watcher overrides are nested, so they need their own strict parsing.
+        for field, current in {
+            "enabled": settings.automation.watcher.enabled,
+            "cadence_seconds": settings.automation.watcher.cadence_seconds,
+            "waking_start": settings.automation.watcher.waking_start,
+            "waking_end": settings.automation.watcher.waking_end,
+            "timezone": settings.automation.watcher.timezone,
+            "preferences_path": settings.automation.watcher.preferences_path,
+            "model": settings.automation.watcher.model,
+        }.items():
+            env_name = f"LEO_WATCHER_{field.upper()}"
+            if env_name not in os.environ:
+                continue
+            value: Any = os.environ[env_name]
+            if isinstance(current, bool):
+                value = _parse_env_bool(env_name, value)
+            elif isinstance(current, int):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{env_name} must be an integer; got {value!r}") from exc
+            elif isinstance(current, Path):
+                value = Path(value)
+            if field in ("waking_start", "waking_end"):
+                try:
+                    value = time.fromisoformat(str(value)).strftime("%H:%M")
+                except ValueError as exc:
+                    raise ValueError(f"{env_name} must be HH:MM; got {value!r}") from exc
+            setattr(settings.automation.watcher, field, value)
         return settings
 
     def ensure_dirs(self) -> None:

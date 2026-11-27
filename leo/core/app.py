@@ -789,6 +789,11 @@ class LeoApp:
         # A reminder carries its own message: delivering it is the whole job, so
         # it never enters the agent loop where it spent tool rounds and failed.
         self.tasks.register_worker("reminder", self._reminder_worker)
+        # The watcher judges signals and only ever tells; it has no tools and
+        # never calls the agent loop, approvals or any mutating operation.
+        from ..watchers import WORKER_WATCHER
+
+        self.tasks.register_worker(WORKER_WATCHER, self._watcher_worker)
         # Phase 6 native adapters. The scheduler preflight selects these worker
         # names from persisted execution config; the default worker remains the
         # agent adapter.
@@ -956,6 +961,9 @@ class LeoApp:
         the dashboard.
         """
         await self.initialize()
+        # Registered at startup, after the durable DB exists, so the watcher is
+        # a normal scheduler job rather than a separate loop.
+        await self._register_watcher_job()
         if self._scheduler_task is None or self._scheduler_task.done():
             self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="leo-scheduler")
         if self._gateway_task is None or self._gateway_task.done():
@@ -1371,6 +1379,83 @@ class LeoApp:
             except Exception:  # noqa: BLE001 - the note must not fail delivery
                 _LOG.warning("schedule reminder note failed", extra={"task_id": getattr(task, "id", None)})
         return {"reminder": text}
+
+    async def _register_watcher_job(self) -> None:
+        """Put the judgment watcher on LEO's scheduler (idempotent on restart)."""
+        from ..watchers import register_watcher_schedule
+
+        config = getattr(self.settings.automation, "watcher", None)
+        if config is None:
+            return
+        await register_watcher_schedule(self.scheduler, config)
+
+    def _watcher_targets(self, config: Any) -> list[Any]:
+        """Resolve configured watcher destinations with the schedule resolver."""
+        from ..schedules.delivery import (
+            DeliveryResolutionError,
+            DeliveryResolver,
+            delivery_context_from_settings,
+        )
+
+        try:
+            context = delivery_context_from_settings(
+                self.settings,
+                adapters=getattr(getattr(self, "gateway", None), "adapters", None),
+            )
+            plan = DeliveryResolver(context).resolve_stored(config.delivery, lane="result")
+            return list(plan.targets)
+        except DeliveryResolutionError as exc:
+            _LOG.warning("watcher delivery target unresolved", extra={"error": str(exc)[:200]})
+            return []
+
+    async def _watcher_worker(self, task: Any, engine: Any, context: dict[str, Any]) -> Any:
+        """Run one watcher judgment pass through the durable task engine."""
+        from ..watchers import JudgmentWatcher, WatcherRunResult
+
+        config = getattr(self.settings.automation, "watcher", None)
+        if config is None or not bool(getattr(config, "enabled", True)):
+            result = WatcherRunResult(suppressed=True, reason="watcher disabled")
+        else:
+            targets = self._watcher_targets(config)
+            if not targets:
+                result = WatcherRunResult(suppressed=True, reason="no delivery target")
+            else:
+                watcher = JudgmentWatcher(
+                    config,
+                    model_client=self.router.complete,
+                    send=self._watcher_send(task, context, targets),
+                )
+                result = await watcher.run()
+        payload = result.as_dict()
+        evidence = [{
+            "source": "watcher", "kind": "judgment",
+            "claim": result.reason or f"sent {len(result.sent)} update(s)",
+            "task_id": getattr(task, "id", None),
+        }]
+        await engine.complete(
+            getattr(task, "id"), payload, evidence, note=result.reason or "watcher pass"
+        )
+        return payload
+
+    def _watcher_send(self, task: Any, context: dict[str, Any], targets: list[Any]) -> Any:
+        """Bind the watcher to the same channel delivery handler schedules use."""
+        async def send(text: str) -> str:
+            proofs: list[str] = []
+            for target in targets:
+                target_context = dict(context)
+                target_context.update(
+                    status="completed",
+                    delivery_lane="result",
+                    delivery_text_override=text,
+                    delivery_target=target.model_dump(mode="json"),
+                )
+                channel = str(getattr(target, "platform", "") or "")
+                address = getattr(target, "chat_id", "") or ""
+                proof = await self._channel_delivery(task, channel, address, target_context)
+                proofs.append(str(proof))
+            return ",".join(proofs)
+
+        return send
 
     async def _channel_delivery(self, task: Any, channel: str, target: Any, context: dict[str, Any]) -> Any:
         """Deliver a terminal task result to a channel target via the gateway."""
