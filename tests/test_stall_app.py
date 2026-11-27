@@ -212,6 +212,51 @@ async def test_photo_reaction_is_the_delivered_final_answer(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_answer_with_visible_next_steps_is_not_a_stall(monkeypatch):
+    """The plan may be in the visible text; it still cannot swallow the answer."""
+
+    class PhotoRouter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            return ModelResponse(
+                content="Cute cat! First, I'll check the PRs.",
+                model="fake", provider="fake", usage=Usage(estimated=True),
+            )
+
+    app = await _app(_settings())
+    sends: list[str] = []
+
+    async def fake_send(channel, target, text, **kwargs):
+        sends.append(text)
+        return {"success": True, "message_id": "visible-plan-77"}
+
+    monkeypatch.setattr(app.gateway, "send", fake_send)
+    router = PhotoRouter()
+    app.router = router
+    try:
+        result = await app._gateway_reply({
+            "channel": "telegram", "reply_target": "user-1", "text": "",
+            "conversation_id": "conv-visible-plan-77", "outbox_id": "outbox-77",
+            "idempotency_key": "idem-visible-plan-77",
+        })
+    finally:
+        await app.shutdown()
+
+    assert router.calls == 1, "no stall nudge after a delivered answer"
+    assert result["delivered"] is True
+    assert sends == ["Cute cat! First, I'll check the PRs."]
+    rows = await db.fetchall(
+        "SELECT content, metadata FROM messages "
+        "WHERE conversation_id='conv-visible-plan-77' AND role='assistant'"
+    )
+    assert rows and rows[-1]["content"] == "Cute cat! First, I'll check the PRs."
+    assert not json.loads(rows[-1]["metadata"] or "{}").get("stall_nudge")
+
+
+@pytest.mark.asyncio
 async def test_substantive_interim_reply_is_delivered_with_provider_id(monkeypatch):
     """If the turn must continue, the reply goes to chat before the nudge."""
 
@@ -307,6 +352,40 @@ async def test_undelivered_interim_answer_is_carried_into_final_text():
     assert router.calls == 2
     assert "Cute cat in the purple hedgehog bed" in result["content"]
     assert "Tests pass; the fix is live." in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_truncated_answer_with_visible_plan_is_carried_into_final_text():
+    """A visible plan after the answer must not strand the undelivered reply."""
+
+    class TruncatedRouter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                return ModelResponse(
+                    content="Cute cat! First, I'll check the PRs.",
+                    model="fake", provider="fake", finish_reason="length",
+                    usage=Usage(estimated=True),
+                )
+            return ModelResponse(
+                content="Checked the tracker; #76 is the open item.",
+                model="fake", provider="fake", usage=Usage(estimated=True),
+            )
+
+    app = await _app(_settings())
+    router = TruncatedRouter()
+    app.router = router
+    try:
+        result = await app.ask("photo", channel="cli")
+    finally:
+        await app.shutdown()
+
+    assert router.calls == 2, "a genuine truncation still gets one nudge"
+    assert "Cute cat! First, I'll check the PRs." in result["content"]
+    assert "Checked the tracker; #76 is the open item." in result["content"]
 
 
 @pytest.mark.asyncio

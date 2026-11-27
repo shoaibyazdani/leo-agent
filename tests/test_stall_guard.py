@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from leo.core.stall import looks_like_stall
+from leo.core.stall import is_direct_reply, looks_like_stall
 
 
 def test_a_normal_answer_is_not_a_stall() -> None:
@@ -45,6 +45,28 @@ def test_a_direct_answer_is_not_a_stall_even_with_planning_reasoning() -> None:
         "Cute cat.", "stop", [], reasoning_tail="Next: I will run a GitHub check"
     )
     assert not looks_like_stall("The fix is live and verified.", "stop", [])
+
+
+def test_an_answer_followed_by_visible_next_steps_is_a_direct_reply() -> None:
+    """A plan after the answer does not swallow the answer."""
+    for text in (
+        "Cute cat! First, I'll check the PRs.",
+        "Cute cat. Let me check the open PRs now.",
+        "Looks great. I'll open the PR.",
+        "The fix is live. Next: I will deploy it.",
+    ):
+        assert is_direct_reply(text), text
+        assert not looks_like_stall(text, "stop", []), text
+
+
+def test_leading_plans_and_progress_reports_are_not_direct_replies() -> None:
+    for text in (
+        "First, I'll check the PRs.",
+        "Done. Let me now check the parser.",
+        "Found the file. Let me now patch it.",
+        "Cute cat! Next:",
+    ):
+        assert not is_direct_reply(text), text
 
 
 def test_short_acknowledgements_can_still_be_stalls() -> None:

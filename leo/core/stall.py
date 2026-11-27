@@ -35,20 +35,44 @@ _IN_PROGRESS = re.compile(
     r"currently (?:working|checking|running|looking|doing)|"
     r"in progress|working on it|hang on|hold on)\b"
 )
+# A progress report is narration, not an answer: "Found the file. Let me now
+# patch it." still promises work and must not become a delivered reply.
+_WORK_NARRATION = re.compile(
+    r"(?is)^\s*(?:(?:i|we)(?:'ve|'m|'ll| am| are| have)?\s+)?"
+    r"(?:found|locat(?:ed|ing)|check(?:ed|ing)|look(?:ed|ing)|search(?:ed|ing)|"
+    r"read(?:ing)?|inspect(?:ed|ing)|retriev(?:ed|ing)|download(?:ed|ing)|"
+    r"pull(?:ed|ing)|ran|running|work(?:ed|ing)|patch(?:ed|ing)|"
+    r"fetch(?:ed|ing)|open(?:ed|ing))\b"
+)
+
+
+def _answers_before(prefix: str) -> bool:
+    """Whether text before a visible plan phrase is itself an answer."""
+    text = prefix.strip(" \t\r\n.,!?;:…\"'“”‘’()[]-")
+    if not text or len(text.split()) < 2:
+        return False
+    return not (
+        _GENERIC_ACK.match(text)
+        or _IN_PROGRESS.search(text)
+        or _WORK_NARRATION.match(text)
+    )
 
 
 def is_direct_reply(content: str) -> bool:
     """Whether visible text answers the user instead of announcing work.
 
     This is deliberately about the text the user can see. Private reasoning
-    is not a reply and must never turn an answer into a stall.
+    is not a reply and must never turn an answer into a stall. A plan phrase
+    only disqualifies the reply when nothing substantive precedes it: an
+    answer followed by visible next steps is still a direct reply.
     """
     text = str(content or "").strip()
     if not text or text.endswith((":", "…", "...")):
         return False
-    if _GENERIC_ACK.match(text) or _PLAN_TAIL.search(text) or _IN_PROGRESS.search(text):
+    if _GENERIC_ACK.match(text) or _IN_PROGRESS.search(text):
         return False
-    return True
+    plan = _PLAN_TAIL.search(text)
+    return plan is None or _answers_before(text[:plan.start()])
 
 
 def looks_like_stall(

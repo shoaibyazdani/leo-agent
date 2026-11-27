@@ -83,6 +83,7 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "uv.lock": {"1-": "only=long hex: lockfile integrity hashes, not credentials"},
     "tests/test_harden_config.py": {
         "280-281": "synthetic invalid-token parameter",
+        "285": "only=anthropic key: synthetic fixture at its current line",
         "430-458": "synthetic provider fixtures and hex fixture",
     },
     "tests/channels/test_bluebubbles.py": {"23": "test fixture", "25": "test fixture"},
@@ -143,7 +144,7 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "1047": "only=openai key|assigned secret: synthetic fixture at its current line",
         "1286": "only=openai key|assigned secret: synthetic fixture at its current line",
         "1373": "only=openai key|assigned secret: synthetic fixture at its current line",
-        # Insertions for the issue #77 tests shifted these known fixtures again.
+        # Insertions from follow-up issues shifted these known fixtures again.
         "113": "only=openai key: synthetic fixture at its current line",
         "128": "only=openai key: synthetic fixture at its current line",
         "706": "only=assigned secret: synthetic fixture at its current line",
@@ -158,9 +159,18 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
         "1084": "only=openai key|assigned secret: synthetic fixture at its current line",
         "1323": "only=openai key|assigned secret: synthetic fixture at its current line",
         "1410": "only=openai key|assigned secret: synthetic fixture at its current line",
-    },
-    "leo/tools/shell_policy.py": {
-        "671": "only=assigned secret: local variable naming a classifier helper result",
+        "709": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "726": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "776": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "854": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "871": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "932": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1003": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1046": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1056": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1087": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1326": "only=openai key|assigned secret: synthetic fixture at its current line",
+        "1413": "only=openai key|assigned secret: synthetic fixture at its current line",
     },
     "tests/test_tools_webhook.py": {"33": "test fixture"},
     "tests/channels/test_a2a.py": {"42": "test fixture"},
@@ -174,6 +184,16 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     "scripts/leo_conversation_observer.py": {
         "1607": "synthetic leak-token fixture used to verify redaction on disk",
         "728": "synthetic bearer fixture in an earlier revision (two pattern families)",
+    },
+    "tests/test_self_improvement.py": {
+        "146": "only=assigned secret: synthetic secret-refusal fixture",
+        "169": "only=assigned secret: synthetic secret-refusal fixture",
+    },
+    "junit.xml": {
+        "1": "only=anthropic key|stripe live key: generated pytest evidence containing synthetic fixture names",
+    },
+    "leo/tools/shell_policy.py": {
+        "671": "only=assigned secret: local variable naming a classifier helper result",
     },
     "tests/test_api.py": {
         "241": "test fixture", "345": "synthetic failure-message fixture",

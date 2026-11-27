@@ -611,7 +611,9 @@ def api_identifier(value: Any) -> str | None:
     if isinstance(number, bool) or not isinstance(number, (int, str)):
         return None
     digits = str(number).strip()
-    if not digits.isdigit() or len(digits) > 32:
+    if not digits.isascii() or not digits.isdigit() or len(digits) > 32:
+        return None
+    if int(digits) < 1:
         return None
     return f"#{digits}"
 

@@ -327,6 +327,9 @@ def test_api_identifier_never_uses_a_list_position():
     assert http_tools.api_identifier(issues) is None
     assert http_tools.api_identifier({"number": True}) is None
     assert http_tools.api_identifier({"number": "not-a-number"}) is None
+    assert http_tools.api_identifier({"number": 0}) is None
+    assert http_tools.api_identifier({"number": "0"}) is None
+    assert http_tools.api_identifier({"number": "²"}) is None  # isdigit but not int-able
     assert "number" in env_spec_description()  # tool tells the model where to look
 
 
