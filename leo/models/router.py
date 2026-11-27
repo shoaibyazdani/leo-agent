@@ -21,6 +21,7 @@ from ..contracts import (
     utcnow,
 )
 from ..logging import get_logger
+from ..task_scope import estimate_tool_spec_tokens
 from .mock import MockProvider
 from .provider import (
     ModelEmptyOutputError,
@@ -645,6 +646,11 @@ class ModelRouter:
             "estimated": bool(measured.estimated),
             "simulated": self.simulated,
             "task_category": classify_task(request),
+            # Explicit chars/4 estimate of the advertised specs. It is recorded
+            # beside the provider's own counts so scoping savings are measurable
+            # per call (and therefore per turn) without touching the provider.
+            "tool_spec_tokens": estimate_tool_spec_tokens(request.tools),
+            "tools_sent": len(request.tools or []),
             "attempt": attempt,
             "stream": stream,
             "reasoning_requested": getattr(provider, "last_reasoning_requested", None)

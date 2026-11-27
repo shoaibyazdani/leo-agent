@@ -177,9 +177,14 @@ async def skill_read(args: dict[str, Any], ctx: dict[str, Any]) -> Any:
             raise ValueError(f"file not found in skill {name!r}: {file_path}")
         result["file_path"] = file_path
         result["content"] = content
-        mark_skill_read(name, file_path)
+        target = file_path
     else:
-        mark_skill_read(name)
+        target = ""
+    # An automatic pre-turn recommendation reads the same documentation but is
+    # not a deliberate pre-write read by the operator: it must not unlock a
+    # later skill_manage patch on its own.
+    if not ctx.get("skip_read_mark"):
+        mark_skill_read(name, target if target else None)
     try:
         await skills.bump_usage(name, "views")
     except Exception:  # noqa: BLE001, S110 - telemetry must never fail a read

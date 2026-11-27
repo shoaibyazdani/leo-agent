@@ -224,6 +224,8 @@ async def model_usage(
     rows: list[dict[str, Any]] = []
     totals: dict[str, Any] = {"calls": 0, "input_tokens": 0, "output_tokens": 0,
                               "cost": 0.0, "by_source": {s: _bucket() for s in _TOKEN_SOURCES}}
+    recorded_spec_tokens = 0
+    spec_token_sum = 0
     for raw in report:
         item = _as_dict(raw)
         if provider_filter and str(item.get("provider") or "") != provider_filter:
@@ -239,6 +241,11 @@ async def model_usage(
 
         input_tokens = _count(item.get("input_tokens"))
         output_tokens = _count(item.get("output_tokens"))
+        has_spec_tokens = "tool_spec_tokens" in metadata
+        tool_spec_tokens = _count(metadata.get("tool_spec_tokens"))
+        if has_spec_tokens:
+            recorded_spec_tokens += 1
+            spec_token_sum += tool_spec_tokens
         cost = _number(item.get("cost"))
         totals["calls"] += 1
         totals["input_tokens"] += input_tokens
@@ -249,27 +256,33 @@ async def model_usage(
         bucket["input_tokens"] += input_tokens
         bucket["output_tokens"] += output_tokens
         bucket["cost"] = _number(bucket["cost"] + cost)
-        rows.append(
-            {
-                "id": _count(item.get("id")),
-                "timestamp": str(item.get("ts") or ""),
-                "provider": str(item.get("provider") or ""),
-                "model": str(item.get("model") or ""),
-                "task_id": item.get("task_id"),
-                "agent_id": item.get("agent_id"),
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "token_source": source,
-                "estimated": source == "estimated",
-                "latency_ms": _number(item.get("latency_ms")),
-                "cost": cost,
-                "success": bool(item.get("success")),
-                "task_category": metadata.get("task_category"),
-                "attempt": metadata.get("attempt"),
-                "stream": metadata.get("stream"),
-            }
-        )
+        row: dict[str, Any] = {
+            "id": _count(item.get("id")),
+            "timestamp": str(item.get("ts") or ""),
+            "provider": str(item.get("provider") or ""),
+            "model": str(item.get("model") or ""),
+            "task_id": item.get("task_id"),
+            "agent_id": item.get("agent_id"),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "token_source": source,
+            "estimated": source == "estimated",
+            "latency_ms": _number(item.get("latency_ms")),
+            "cost": cost,
+            "success": bool(item.get("success")),
+            "task_category": metadata.get("task_category"),
+            "attempt": metadata.get("attempt"),
+            "stream": metadata.get("stream"),
+        }
+        # Older records have no tool-spec accounting; do not invent zeros for
+        # them or change their shape.
+        if has_spec_tokens:
+            row["tool_spec_tokens"] = tool_spec_tokens
+            row["tools_sent"] = _count(metadata.get("tools_sent"))
+        rows.append(row)
 
+    if recorded_spec_tokens:
+        totals["tool_spec_tokens"] = spec_token_sum
     totals["cost"] = _number(totals["cost"])
     returned = rows[: int(args.get("limit", 20))]
     return {

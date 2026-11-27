@@ -41,6 +41,7 @@ from ..events import Event, EventBus
 from ..logging import get_logger
 from ..security.permissions import ApprovalRequired
 from ..skills.sanitize import scan_text
+from ..task_scope import cap_report
 from ..tools.skill_read_marks import reset_skill_read_marks
 from .prompts import (
     LEARN_SYSTEM_PROMPT,
@@ -91,6 +92,9 @@ class ReviewOutcome:
     error: str | None = None
     duration_ms: float = 0.0
     budget_exhausted: bool = False
+    # Bounded handoff produced when a hard cap stopped the review: what was
+    # done, what was left, and the options for continuing it.
+    progress_report: str = ""
 
 
 def _digest(value: Any) -> str:
@@ -454,12 +458,16 @@ class ReviewEngine:
         summary = ""
         rounds = 0
         budget_exhausted = False
+        pending_names: list[str] = []
+        cap_reason = ""
 
         async def loop() -> None:
-            nonlocal summary, rounds, budget_exhausted
+            nonlocal summary, rounds, budget_exhausted, pending_names, cap_reason
             for index in range(max_rounds):
+                pending_names = []
                 if self._estimate_tokens(messages, tool_specs) > max_input_tokens:
                     budget_exhausted = True
+                    cap_reason = "input token cap reached"
                     return
                 request = ModelRequest(
                     messages=list(messages),
@@ -542,6 +550,11 @@ class ReviewEngine:
                             ),
                         })
 
+                if index == max_rounds - 1:
+                    # The last round's results were executed but the model never
+                    # got a following call to synthesize them into an answer.
+                    pending_names = [_tool_call(raw)[1] for raw in raw_calls]
+
         try:
             await asyncio.wait_for(loop(), timeout=timeout)
         except TimeoutError:
@@ -559,6 +572,24 @@ class ReviewEngine:
                 error=_bounded(f"{type(exc).__name__}: {exc}", 400),
             )
 
+        rate_limited = [a for a in actions if a.get("decision") == "rate_limited"]
+        reasons = [
+            cap_reason,
+            "tool-round cap reached" if pending_names else "",
+            "per-task tool-call cap reached" if rate_limited else "",
+        ]
+        reason = "; ".join(part for part in reasons if part)
+        report = ""
+        if reason:
+            budget_exhausted = True
+            report = cap_report(
+                reason=reason,
+                done=[str(a.get("tool") or "") for a in actions],
+                unfinished=[
+                    "final synthesis of results from " + ", ".join(pending_names[:10])
+                ] if pending_names else [],
+                unfinished_label="unfinished work",
+            )
         self._count_actions(actions)
         return ReviewOutcome(
             review_id=review_id,
@@ -572,6 +603,7 @@ class ReviewEngine:
             staged=list(staged_writes),
             summary=summary,
             budget_exhausted=budget_exhausted,
+            progress_report=report,
         )
 
     async def _execute(
@@ -715,6 +747,7 @@ class ReviewEngine:
                 "summary": _safe_text(outcome.summary),
                 "error": _safe_text(outcome.error, 400) if outcome.error else None,
                 "budget_exhausted": outcome.budget_exhausted,
+                "progress_report": _safe_text(outcome.progress_report, 1_200),
                 "created_at": utcnow(),
             }
             path.write_text(
@@ -745,6 +778,7 @@ class ReviewEngine:
                         "artifact": outcome.artifact_path,
                         "rounds": outcome.rounds,
                         "budget_exhausted": outcome.budget_exhausted,
+                        "progress_report": _safe_text(outcome.progress_report, 1_200),
                     }, default=str),
                     outcome.conversation_id,
                 ),

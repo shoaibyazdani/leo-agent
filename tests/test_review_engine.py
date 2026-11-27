@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -288,6 +289,24 @@ async def test_tool_rounds_are_bounded(env):
     assert outcome.status == "completed"
     assert outcome.rounds == 2
     assert len(router.requests) == 2
+
+
+async def test_tool_round_cap_produces_a_progress_report(env):
+    conversation_id = await env.seed()
+    env.settings.learning.review.max_tool_rounds = 2
+    router = ScriptedRouter([
+        {"tool_calls": [_call("c1", "skill_list")]},
+        {"content": "working", "tool_calls": [_call("c2", "skill_list")]},
+    ])
+    outcome = await env.engine(router).run(conversation_id, explicit=True)
+    assert outcome.status == "completed"
+    assert outcome.rounds == 2
+    assert outcome.budget_exhausted is True
+    for phrase in ("Progress report:", "Done so far:", "Not finished:", "Next options:"):
+        assert phrase in outcome.progress_report
+    assert "skill_list" in outcome.progress_report
+    artifact = json.loads(Path(outcome.artifact_path).read_text(encoding="utf-8"))
+    assert artifact["progress_report"] == " ".join(outcome.progress_report.split())
 
 
 async def test_observe_spawns_after_the_interval(env):

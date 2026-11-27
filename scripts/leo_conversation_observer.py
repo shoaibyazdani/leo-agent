@@ -405,7 +405,7 @@ _BENIGN_KEY_NAMES = frozenset(
     }
 )
 _TOKEN_COUNT_KEY_RE = re.compile(
-    r"(?:prompt|completion|total|input|output|cached|reasoning|new|used|remaining|estimated)"
+    r"(?:prompt|completion|total|input|output|cached|reasoning|new|used|remaining|estimated|tool_spec)"
     r"[_-]tokens(?:[_-](?:count|counts))?"
 )
 _CAMEL_SPLIT_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
