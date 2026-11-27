@@ -3544,9 +3544,14 @@ class LeoApp:
                     "resume": True,
                     "objective_message_id": resume["objective_id"],
                 }
+            # A captionless photo arrives with text="". Storing that verbatim
+            # made every later turn replay an empty user message, which Beam-free
+            # rejects for the whole request. Keep a non-empty durable marker; the
+            # prompt below still receives the attachment description.
+            stored_text = text if str(text or "").strip() else "[empty message]"
             user_cursor = await db.execute(
                 "INSERT INTO messages(conversation_id,role,content,metadata,created_at) VALUES(?,?,?,?,?)",
-                (conversation_id, "user", text, json.dumps(metadata, default=str), utcnow()),
+                (conversation_id, "user", stored_text, json.dumps(metadata, default=str), utcnow()),
             )
             user_row_id = getattr(user_cursor, "lastrowid", None)
             # The user turn is durable before the stream opens: a client abort

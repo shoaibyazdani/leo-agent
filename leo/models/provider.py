@@ -1145,7 +1145,13 @@ class AnthropicProvider(BaseHTTPProvider):
                     content.append({"type": "text", "text": message.content})
                     messages.append({"role": "user", "content": content})
                 else:
-                    messages.append({"role": message.role, "content": message.content})
+                    content = message.content
+                    if message.role == "user" and not str(content or "").strip():
+                        # Beam-free: "a user message must contain an image or text
+                        # other than whitespace". Captionless photos used to save an
+                        # empty user row; every later turn replayed it and failed.
+                        content = "[empty message]"
+                    messages.append({"role": message.role, "content": content})
         return ("\n".join(system_parts) or None), messages
 
     def _body(self, request: ModelRequest, stream: bool) -> dict[str, Any]:
@@ -1411,6 +1417,14 @@ class OpenAIProvider(BaseHTTPProvider):
                     continue
                 declared.discard(tool_id)
             item: dict[str, Any] = {"role": message.role, "content": message.content}
+            if (
+                item["role"] == "user"
+                and not message.images
+                and not str(message.content or "").strip()
+            ):
+                # Do not replay a captionless photo's empty durable row as an
+                # invalid request; this is a display placeholder, not data loss.
+                item["content"] = "[empty message]"
             if message.name:
                 item["name"] = message.name
             if message.tool_call_id:
