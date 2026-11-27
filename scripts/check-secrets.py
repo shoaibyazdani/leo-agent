@@ -190,7 +190,12 @@ REVIEWED_ALLOWLIST: dict[str, dict[str, str]] = {
     },
     "tests/test_self_improvement.py": {
         "146": "only=assigned secret: synthetic secret-refusal fixture",
+        "147": "only=assigned secret: synthetic secret-refusal fixture at its current line",
         "169": "only=assigned secret: synthetic secret-refusal fixture",
+        "170": "only=assigned secret: synthetic secret-refusal fixture at its current line",
+    },
+    "junit.xml": {
+        "1": "only=anthropic key|stripe live key: generated pytest evidence containing synthetic fixture names",
     },
     "tests/test_api.py": {
         "241": "test fixture", "345": "synthetic failure-message fixture",
