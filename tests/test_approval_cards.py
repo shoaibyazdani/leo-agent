@@ -31,6 +31,7 @@ from leo.security.approval_cards import (
     ApprovalService,
     ScheduleBodySpec,
     card_from_row,
+    format_first_run,
     render_edit_body,
     render_schedule_body,
     schedule_terminal_text,
@@ -465,8 +466,8 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
         "results go to nowhere (saved to the job's history only)",
         "failure notices go to",
         "runs forever",
-        "default bounded catch-up after downtime",
-        "not pinned to a provider/model",
+        "missed runs are caught up, at most 10",
+        "uses the default model",
     ):
         assert fragment in body
 
@@ -480,7 +481,7 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
     assert "5 runs" in pinned
     assert "runs forever" not in pinned
     assert "skip missed runs (at most one run after downtime)" in pinned
-    assert "pinned to provider-x/model-y" in pinned
+    assert "always uses provider-x/model-y" in pinned
 
     paused = render_schedule_body(
         ScheduleBodySpec(
@@ -503,6 +504,44 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
     assert render_edit_body("Water", ["prompt: water -> tea"]) == (
         'Change "Water": prompt: water -> tea'
     )
+
+
+def test_first_run_renders_in_the_schedule_timezone() -> None:
+    """Regression: 28 Nov 2026 — a job set for 8am in Asia/Karachi showed its
+    first run as 03:00 UTC on the approval card."""
+    assert format_first_run("2026-11-29T03:00:00+00:00", "Asia/Karachi") == (
+        "Sun Nov 29 08:00 PKT"
+    )
+    assert format_first_run("2026-11-29T03:00:00+00:00") == "Sun Nov 29 03:00 UTC"
+    # An unknown timezone never breaks the card; it falls back to UTC.
+    assert format_first_run("2026-11-29T03:00:00+00:00", "No/Such") == (
+        "Sun Nov 29 03:00 UTC"
+    )
+    assert format_first_run(None, "Asia/Karachi") is None
+
+
+def test_card_body_uses_plain_language_for_defaults() -> None:
+    """Regression: 28 Nov 2026 — the approval card read like an internal spec
+    ("default bounded catch-up after downtime", "not pinned to a
+    provider/model", "telegram chat 525083981")."""
+    body = render_schedule_body(
+        ScheduleBodySpec(
+            name="Office", display="once at 9am",
+            first_run_at="2026-11-29T03:00:00+00:00",
+            timezone="Asia/Karachi", repeat_limit=1,
+            prompt="Aaj 9:00 AM tak pahunchna hai.",
+            delivery="telegram chat",
+        )
+    )
+    assert "first run Sun Nov 29 08:00 PKT" in body
+    assert "missed runs are caught up, at most 10" in body
+    assert "uses the default model" in body
+    assert "results go to telegram chat" in body
+    for jargon in (
+        "default bounded catch-up", "not pinned to a provider/model",
+        "03:00 UTC", "525083981",
+    ):
+        assert jargon not in body, jargon
 
 
 @pytest.mark.parametrize(

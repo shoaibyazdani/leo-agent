@@ -292,10 +292,24 @@ def at_or_after(instant: Any, now: datetime) -> bool:
     return now >= moment
 
 
-def format_first_run(value: Any) -> str | None:
+def format_first_run(value: Any, timezone_name: str | None = None) -> str | None:
+    """First run in the schedule's own timezone when known, else UTC.
+
+    A card is read by a human, so a job set for 8am in Asia/Karachi must not
+    show its first run as 03:00 UTC. An unknown timezone falls back to UTC
+    rather than breaking the card.
+    """
     moment = parse_instant(value)
     if moment is None:
         return None
+    if timezone_name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            local = moment.astimezone(ZoneInfo(str(timezone_name)))
+            return local.strftime("%a %b %d %H:%M %Z")
+        except Exception:  # noqa: BLE001 - a bad timezone must not break the card
+            pass
     return moment.strftime("%a %b %d %H:%M UTC")
 
 
@@ -343,6 +357,9 @@ class ScheduleBodySpec:
     attach_to_session: bool = False
     catch_up: bool | None = None
     pinned: bool = False
+    # IANA timezone the schedule is read in; the card shows the first run in
+    # it instead of UTC. None keeps the old UTC rendering.
+    timezone: str | None = None
     # Resolved at compile time from the operator-owned pinned target. The card
     # names it only when a pinned job actually locks one.
     pinned_provider: str | None = None
@@ -361,7 +378,7 @@ def render_schedule_body(spec: ScheduleBodySpec) -> str:
     if spec.paused:
         parts.append("created paused: it will not run until resumed")
     else:
-        first = format_first_run(spec.first_run_at)
+        first = format_first_run(spec.first_run_at, spec.timezone)
         if first:
             parts.append(f"first run {first}")
     if spec.repeat_limit is not None:
@@ -374,7 +391,7 @@ def render_schedule_body(spec: ScheduleBodySpec) -> str:
     elif spec.catch_up is True:
         parts.append("catch up on missed runs")
     else:
-        parts.append("default bounded catch-up after downtime")
+        parts.append("missed runs are caught up, at most 10")
     if spec.pinned:
         provider = str(spec.pinned_provider or "").strip()
         model = str(spec.pinned_model or "").strip()
@@ -384,9 +401,9 @@ def render_schedule_body(spec: ScheduleBodySpec) -> str:
             else f"model {model}" if model
             else "the current provider/model at creation"
         )
-        parts.append(f"pinned to {target}")
+        parts.append(f"always uses {target}")
     else:
-        parts.append("not pinned to a provider/model")
+        parts.append("uses the default model")
     head = f'Schedule "{spec.name}" ({", ".join(part for part in parts if part)}): '
 
     prompt = str(spec.prompt or "").strip()

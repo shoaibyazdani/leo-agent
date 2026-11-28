@@ -129,13 +129,15 @@ def test_room_requires_capability_and_a_resolved_room() -> None:
 def test_explicit_platform_chat_thread_and_origin_thread_adoption() -> None:
     explicit = _resolve("telegram:555:77")
     assert explicit.identities == (("telegram", "555", "77"),)
-    assert explicit.describe() == "telegram chat 555 thread 77"
+    assert explicit.describe() == "telegram chat, thread 77"
 
     adopted = _resolve("telegram:123")
     assert adopted.identities == (("telegram", "123", "5"),)
 
     no_adoption = _resolve("slack:123")
     assert no_adoption.identities == (("slack", "123", None),)
+    # A numeric chat id means nothing to the person reading the card.
+    assert no_adoption.describe() == "slack chat"
 
 
 def test_matrix_room_ids_keep_their_colons_in_explicit_and_token_targets() -> None:
