@@ -399,10 +399,28 @@ def _tool_defs() -> list[tuple[ToolSpec, Any]]:
             ToolSpec(
                 name="schedule_create",
                 description=(
-                    "Create a durable scheduled job. A new job is shown to the "
-                    "human for approval before it is saved; with no answerable "
-                    "surface it returns a durable approval_required proposal and "
-                    "creates nothing."
+                    "Schedule reminders, follow-ups and checks: once, a few "
+                    "times, or recurring. Good uses, each at the moment the "
+                    "help is needed: appointments and events get a heads-up "
+                    "with enough lead time to get there (the day before for "
+                    "a morning slot, a leave-by time with the route); trips "
+                    "get a few one-shots at the moments (online check-in "
+                    "when it opens, about 24h before departure, leave for "
+                    "the airport, arrival paperwork, getting from the "
+                    "airport to the hotel, the return flight); deadlines and "
+                    "things owed get a morning-of nudge; habits and goals "
+                    "get a handful of runs at sensible times, not a forever "
+                    "schedule; things to re-check get a few runs until they "
+                    "change. Most help is not forever-recurring: prefer a "
+                    "one-shot ('in 2h', an ISO time) or a few runs over an "
+                    "open-ended schedule, waking-hours times, and the least "
+                    "frequent cadence that helps unless the user gave one. "
+                    "A job drafts, reminds and checks; it never sends, buys "
+                    "or submits on the user's behalf. A new job is shown to "
+                    "the human for approval before it is saved; with no "
+                    "answerable surface it returns a durable "
+                    "approval_required proposal and creates nothing. A "
+                    "declined job is the human's answer: never retry it."
                 ),
                 category="automation",
                 risk=RiskLevel.LOW,

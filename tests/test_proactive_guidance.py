@@ -109,9 +109,11 @@ def test_guidance_pins_exact_time_and_clean_prompt() -> None:
     prompt leaked style instructions ("Keep it to 1-2 short lines, Roman
     Urdu mixed with English.") into the delivered reminder. Follow-up the
     same day: a 9pm interview reminder set for 9pm is useless — the stated
-    time is the EVENT time, kept exact in the prompt, while the reminder
-    fires before it by a lead judged from the activity (Hermes's practice:
-    a preflight job runs before the event and its prompt names the event).
+    time is the EVENT time, kept exact in the prompt, while the schedule is
+    the moment the help is needed. The framing is Teknium's (Hermes PR
+    #158289): appointments get a heads-up with enough lead time to get
+    there, trips get a few one-shots at the moments, deadlines get a
+    morning-of nudge — no fixed minute table.
     """
     line = next(
         part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
@@ -120,27 +122,55 @@ def test_guidance_pins_exact_time_and_clean_prompt() -> None:
     for token in (
         "event time",
         "keep it exact in the prompt",
-        "fires before the event",
-        "judge from the activity",
-        "set the schedule to the reminder time",
+        "moment the help is needed",
+        "enough lead time to get there",
+        "day before for a morning slot",
+        "leave-by time",
+        "few one-shots",
+        "check-in about 24h before",
+        "morning-of nudge",
         "name the event time in the prompt",
         "so the card shows both",
         "only the message to deliver",
         "never instructions about style",
     ):
         assert token in lowered, token
+    for forbidden in ("30 minutes before", "2 hours before"):
+        assert forbidden not in lowered, forbidden
 
 
 def test_guidance_splits_event_time_from_reminder_time() -> None:
     """Regression: 28 Nov 2026 — "i have interview on monday 9pm" produced
     a reminder AT 9pm, when the interview starts. An interview needs its
-    reminder before the event, a simple reminder does not."""
+    reminder before the event, a simple reminder does not — and the lead is
+    judged per use-case (Teknium, Hermes PR #158289), never a fixed table."""
     line = next(
         part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
     )
     lowered = line.lower()
-    assert "interview or meeting about 30 minutes before" in lowered
-    assert "simple reminder at the stated time" in lowered
+    assert "moment the help is needed" in lowered
+    assert "simple reminder fires at the stated time" in lowered
+    assert "30 minutes before" not in lowered
+
+
+def test_schedule_create_description_carries_teknium_good_uses() -> None:
+    """The timing judgment lives in the schedule_create tool description,
+    ported from Teknium's CRONJOB_SCHEMA (Hermes PR #158289): good uses,
+    each at the moment the help is needed."""
+    from leo.tools.automation_tools import _tool_defs
+
+    spec = next(spec for spec, _ in _tool_defs() if spec.name == "schedule_create")
+    lowered = spec.description.lower()
+    for token in (
+        "moment the help is needed",
+        "enough lead time to get there",
+        "day before for a morning slot",
+        "leave-by time",
+        "about 24h before departure",
+        "morning-of nudge",
+        "never retry it",
+    ):
+        assert token in lowered, token
 
 
 def test_guidance_stays_quiet_after_a_shown_card() -> None:
@@ -171,9 +201,13 @@ def test_granted_guidance_pins_exact_time_and_clean_prompt() -> None:
     for token in (
         "event time",
         "keep it exact in the prompt",
-        "fires before the event",
-        "judge from the activity",
-        "set the schedule to the reminder time",
+        "moment the help is needed",
+        "enough lead time to get there",
+        "day before for a morning slot",
+        "leave-by time",
+        "few one-shots",
+        "check-in about 24h before",
+        "morning-of nudge",
         "name the event time in the prompt",
         "only the message to deliver",
         "never instructions about style",
