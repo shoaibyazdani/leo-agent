@@ -104,6 +104,54 @@ def test_guidance_does_not_claim_an_autonomous_save() -> None:
         assert forbidden not in lowered, forbidden
 
 
+def test_guidance_pins_exact_time_and_clean_prompt() -> None:
+    """Regression: 28 Nov 2026 — a schedule moved 9am to 8am unasked, and the
+    prompt leaked style instructions ("Keep it to 1-2 short lines, Roman
+    Urdu mixed with English.") into the delivered reminder."""
+    line = next(
+        part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
+    )
+    lowered = line.lower()
+    for token in (
+        "exact time the user stated",
+        "never move it earlier or later without asking",
+        "only the message to deliver",
+        "never instructions about style",
+    ):
+        assert token in lowered, token
+
+
+def test_granted_guidance_pins_exact_time_and_clean_prompt() -> None:
+    """The live-grant variant creates schedules too, so it carries the same
+    two rules; a grant never widens what may be scheduled."""
+    from leo.core.app import _GRANTED_SCHEDULE_GUIDANCE
+
+    lowered = _GRANTED_SCHEDULE_GUIDANCE.lower()
+    for token in (
+        "exact time the user stated",
+        "never move it earlier or later without asking",
+        "only the message to deliver",
+        "never instructions about style",
+    ):
+        assert token in lowered, token
+
+
+def test_schedule_create_prompt_field_forbids_meta_instructions() -> None:
+    """The prompt field is what the model fills: it must say the field holds
+    only the message to deliver, never style/language/length/channel
+    instructions or a restated delivery target."""
+    from leo.tools.automation_tools import _tool_defs
+
+    spec = next(spec for spec, _ in _tool_defs() if spec.name == "schedule_create")
+    description = spec.input_schema["properties"]["prompt"]["description"].lower()
+    for token in (
+        "only the exact message to deliver",
+        "never instructions about style",
+        "delivery belongs in 'deliver'",
+    ):
+        assert token in description, token
+
+
 def test_proactive_mode_validates_like_other_automation_settings() -> None:
     assert AutomationConfig().proactive_mode == "offer"
     assert Settings.model_validate(

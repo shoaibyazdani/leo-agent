@@ -51,7 +51,13 @@ _FIELD_PROPERTIES: dict[str, dict[str, Any]] = {
     },
     "prompt": {
         "type": "string",
-        "description": "Self-contained task instruction run on each occurrence.",
+        "description": (
+            "Self-contained task instruction run on each occurrence. For a "
+            "reminder this is ONLY the exact message to deliver, in the "
+            "user's own words — never instructions about style, language, "
+            "length, channel, or delivery, and never a restatement of the "
+            "delivery target; delivery belongs in 'deliver'."
+        ),
     },
     "name": {"type": "string", "description": "Optional human-friendly name."},
     "repeat": {
