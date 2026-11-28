@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .. import db
+from ..logging import get_logger
 from .clock import Clock, SystemClock
 from .monitor import BASELINE_KEY, Monitor, MonitorError, MonitorResult
 from .scan import scan_text
@@ -37,6 +38,8 @@ _CONTEXT_BLOCK_CHARS = 2_000
 _CONTEXT_TOTAL_CHARS = 8_000
 _SKILL_TOTAL_CHARS = 12_000
 _NOTE_CHARS = 8_000
+
+_LOG = get_logger("schedules.execution")
 
 
 class ExecutionError(RuntimeError):
@@ -505,6 +508,17 @@ class ScheduleExecution:
             parts.append(f"{heading}\n\n{body}")
         if skill_blocks:
             parts.append(f"{skill_heading}\n\n" + "\n\n".join(skill_blocks))
+        # Nightly self-review is written without a card; the next scheduled run
+        # carries a bounded copy so the finding is actually surfaced to the user.
+        try:
+            from ..learning.self_improvement import recent_review_brief
+
+            review = await recent_review_brief()
+        except Exception as exc:  # noqa: BLE001 - context must not break a run
+            _LOG.warning("self-review brief unavailable: %s", exc)
+            review = ""
+        if review:
+            parts.append("Recent self-review (learned from failures):\n" + review)
         return "\n\n".join(parts)
 
     async def _context_block(

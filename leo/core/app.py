@@ -9,7 +9,7 @@ import os
 import re
 from collections import deque
 from collections.abc import Iterable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -308,6 +308,7 @@ class LeoApp:
         # Attached by initialize(); proposal-only self-evolution engines.
         self.healing: Any = None
         self.learning: Any = None
+        self.self_improvement: Any = None
         self.review: Any = None
         self.curator: Any = None
         self.consolidation: Any = None
@@ -797,6 +798,9 @@ class LeoApp:
         self.tasks.register_delivery("channel", self._channel_delivery)
         self.tasks.register_delivery("gateway", self._channel_delivery)
         self.tasks.register_default_delivery(self._channel_delivery)
+        # Nightly self-review is a durable scheduler job, registered directly:
+        # it is LEO's own maintenance, not a model-requested action or a card.
+        await self._register_self_improvement_schedule()
         # Durable outbox turns are driven by app.ask and answered via Gateway.send.
         self.gateway.set_reply_handler(self._gateway_reply)
         # An interrupt-class command (/stop) is handled at admission time, not
@@ -2072,6 +2076,28 @@ class LeoApp:
                     # ``chat.completed`` and ``run.finished``; subscribing to
                     # both would count one turn twice against the interval.
                     self._subscribe_evolution("chat.completed", self.review.observe)
+
+        try:
+            from ..learning.self_improvement import SelfImprovementEngine
+        except Exception as exc:  # noqa: BLE001 - optional module developed in parallel
+            _LOG.warning("self-improvement engine unavailable", extra={"error": str(exc)})
+        else:
+            try:
+                self.self_improvement = SelfImprovementEngine(
+                    self.skills, self.events, self.settings,
+                )
+            except Exception as exc:  # noqa: BLE001 - optional engine must not block boot
+                _LOG.warning("self-improvement could not be attached", extra={"error": str(exc)})
+                self.self_improvement = None
+            if self.self_improvement is not None:
+                services.update(
+                    self_improvement=self.self_improvement,
+                    learning_self_improvement=self.self_improvement,
+                )
+                # The engine observes only safe tool/turn metadata; an actor
+                # from another background engine never becomes a new rule.
+                self._subscribe_evolution("tool.called", self._on_self_improvement_tool)
+                self._subscribe_evolution("chat.completed", self._on_self_improvement_turn)
         self._evolution_attached = bool(self._evolution_subscriptions)
 
     def _detach_self_evolution(self) -> None:
@@ -2258,6 +2284,106 @@ class LeoApp:
             source=str(event.source or ""),
             kind="run",
         )
+
+    async def _on_self_improvement_tool(self, event: Event) -> None:
+        """Accumulate only successful, foreground tool calls as work evidence."""
+        engine = getattr(self, "self_improvement", None)
+        if engine is None or not getattr(engine, "enabled", False):
+            return
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        actor = str(payload.get("actor") or "")
+        if actor.startswith(("review:", "learning:", "selfheal:", "self-improvement:")):
+            return
+        if payload.get("success") is not True:
+            return
+        conversation_id = str(payload.get("conversation_id") or "")
+        if not conversation_id or self._is_harness_learning_source(
+            channel="", conversation_id=conversation_id
+        ):
+            return
+        try:
+            await engine.observe_tool_call(
+                str(payload.get("tool") or ""),
+                conversation_id=conversation_id,
+                call_id=str(payload.get("call_id") or ""),
+                actor=actor,
+            )
+        except Exception as exc:  # noqa: BLE001 - observation never breaks a turn
+            _LOG.warning("self-improvement tool observation failed: %s", exc)
+
+    async def _on_self_improvement_turn(self, event: Event) -> None:
+        """One terminal turn is one counted occurrence of a tool pattern."""
+        engine = getattr(self, "self_improvement", None)
+        if engine is None or not getattr(engine, "enabled", False):
+            return
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        conversation_id = str(payload.get("conversation_id") or "")
+        if not conversation_id:
+            return
+        try:
+            await engine.finish_turn(
+                conversation_id, source_id=event.id,
+                status=str(payload.get("status") or "completed"),
+            )
+        except Exception as exc:  # noqa: BLE001 - observation never breaks a turn
+            _LOG.warning("self-improvement turn observation failed: %s", exc)
+
+    async def _register_self_improvement_schedule(self) -> None:
+        """Register the nightly review defensively; maintenance must not block boot.
+
+        A bad ``nightly_cron``, a missing scheduler or a storage failure leaves
+        the rest of the app running. The review is optional maintenance, not a
+        dependency of the chat/turn path.
+        """
+        try:
+            from ..learning.self_improvement import (
+                NIGHTLY_SCHEDULE_NAME, NIGHTLY_WORKER,
+            )
+            from ..tasks.scheduler import every_interval, parse_cron
+
+            engine = getattr(self, "self_improvement", None)
+            if engine is None or not getattr(engine, "enabled", False):
+                return
+            cfg = getattr(getattr(self.settings, "learning", None), "self_improvement", None)
+            expression = str(getattr(cfg, "nightly_cron", "0 3 * * *") or "0 3 * * *")
+            if every_interval(expression) is None:
+                parse_cron(expression)  # invalid cron is logged, never fatal at boot
+
+            async def review_worker(task: Any, tasks_engine: Any) -> dict[str, Any]:
+                # An occurrence is anchored to its scheduled day, including a
+                # bounded catch-up after downtime; always review that day, not the
+                # day the app happened to restart.
+                metadata = getattr(task, "metadata", None) or {}
+                scheduled = str(metadata.get("scheduled_for") or "")[:10]
+                day = None
+                if scheduled:
+                    try:
+                        day = (datetime.fromisoformat(scheduled) - timedelta(days=1)).date().isoformat()
+                    except ValueError:
+                        day = None
+                result = await engine.nightly_review(day)
+                evidence = [{
+                    "source": "self_improvement_review",
+                    "claim": f"nightly note {result.get('id')} written for {result.get('day')}",
+                    "task_id": getattr(task, "id", None),
+                    "note_id": result.get("id"),
+                }]
+                await tasks_engine.complete(
+                    getattr(task, "id"), result, evidence, note="nightly self-review"
+                )
+                return result
+
+            self.tasks.register_worker(NIGHTLY_WORKER, review_worker)
+            await self.scheduler.register_cron(
+                NIGHTLY_SCHEDULE_NAME, expression,
+                "Review the day's stalls, dead letters, fallbacks, failed turns and expired approvals",
+                payload={"worker": NIGHTLY_WORKER, "source": "self-improvement"},
+            )
+        except Exception as exc:  # noqa: BLE001 - optional maintenance must not block boot
+            _LOG.warning(
+                "nightly self-review could not be registered",
+                extra={"error": str(exc)},
+            )
 
     async def _learning_history_has_real_source(self) -> bool:
         """Whether durable history contains a non-harness channel at all."""
@@ -2673,6 +2799,18 @@ class LeoApp:
                 status["consolidation"] = self.consolidation.status()
             except Exception as exc:  # noqa: BLE001 - health must stay available
                 _LOG.warning("consolidation status failed", extra={"error": str(exc)})
+        if getattr(self, "self_improvement", None) is not None:
+            try:
+                learned = await self.self_improvement.learned(limit=20)
+                status["self_improvement"] = {
+                    **self.self_improvement.status(),
+                    "attached": True,
+                    "learned": learned,
+                    "latest_review": await self.self_improvement.latest_review_note(),
+                }
+            except Exception as exc:  # noqa: BLE001 - health must stay available
+                _LOG.warning("self-improvement status failed", extra={"error": str(exc)})
+                status["self_improvement"] = {"attached": True, "status_error": str(exc)[:200]}
         return status
 
     CONVERSATION_HISTORY_LIMIT = 50
