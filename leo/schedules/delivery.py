@@ -299,6 +299,12 @@ class DeliveryPlan:
 
 
 def _configured_audience(target: DeliveryTarget) -> str:
+    """Human-readable audience for a persisted target.
+
+    A numeric chat id means nothing to the person reading the card, so the
+    card names the platform and chat, not the id. A thread id is kept: two
+    threads in one chat are genuinely different destinations.
+    """
     if target.kind == "local":
         return "local history only"
     if target.kind == "bot_chat":
@@ -307,8 +313,8 @@ def _configured_audience(target: DeliveryTarget) -> str:
         return f"room {target.room_id or target.chat_id}"
     platform = target.platform
     if target.thread_id:
-        return f"{platform} chat {target.chat_id} thread {target.thread_id}"
-    return f"{platform} chat {target.chat_id}"
+        return f"{platform} chat, thread {target.thread_id}"
+    return f"{platform} chat"
 
 
 def _target_token(target: DeliveryTarget) -> str:
@@ -790,7 +796,9 @@ class DeliveryResolver:
             chat_id=address,
             thread_id=thread,
         )
-        audience = f"{platform} chat {address}" + (f" thread {thread}" if thread else "")
+        # A numeric chat id means nothing to the person reading the card; the
+        # thread id is kept, two threads in one chat are different places.
+        audience = f"{platform} chat" + (f", thread {thread}" if thread else "")
         return DeliveryRoute(target=target, token=token, audience=audience, resolved_from="explicit")
 
     def _resolve_explicit(self, token: str) -> DeliveryRoute | None:

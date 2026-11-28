@@ -99,7 +99,10 @@ _PROACTIVE_SCHEDULE_GUIDANCE = (
     "SCHEDULING: If a concrete future moment is clearly user-authorized, call "
     "schedule_list first to see what already exists, prefer a one-shot or a "
     "finite run count, and call schedule_create only for that authorized "
-    "moment. A job is shown for approval before it is saved: describe it as "
+    "moment. Use the exact time the user stated; never move it earlier or "
+    "later without asking. The prompt holds only the message to deliver, "
+    "never instructions about style, language, length, channel, or delivery. "
+    "A job is shown for approval before it is saved: describe it as "
     "pending until the human answers, and never retry after a decline."
 )
 # A live create grant changes the truth the model must narrate: there is no
@@ -108,7 +111,10 @@ _GRANTED_SCHEDULE_GUIDANCE = (
     "SCHEDULING: This conversation has a live allowance for new schedules, so "
     "schedule_create saves immediately without showing a card. Call "
     "schedule_list first to see what already exists, create only a concrete "
-    "user-authorized moment, and say plainly that the job was saved."
+    "user-authorized moment, and say plainly that the job was saved. Use the "
+    "exact time the user stated; never move it earlier or later without "
+    "asking. The prompt holds only the message to deliver, never "
+    "instructions about style, language, length, channel, or delivery."
 )
 # A turn with no human at the gate must never see scheduling guidance or a
 # create grant, even when it inherited an interactive conversation. These are

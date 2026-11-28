@@ -95,8 +95,10 @@ absolute; a naive one-shot uses the configured profile clock.
 
 ## Consent and the fail-closed divergence
 
-Create cards show the validated job, exact first run, normalized repeat, full
-literal prompt and every delivery/execution field. Choices are `once`,
+Create cards show the validated job in short human lines: exact first run,
+normalized repeat, full literal prompt and delivery, plus any non-default
+execution field. Default execution values are omitted from the text; the card
+stays bound to the full canonical spec by its proposal digest. Choices are `once`,
 `session`, `always`, `deny`; edits use `Allow`/`Deny` (`once`, `deny`). A card is
 bound to one canonical proposal digest and config revision, is shown before it
 can be resolved, and expires at the earlier of the approval timeout and the

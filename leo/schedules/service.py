@@ -1315,6 +1315,7 @@ class ScheduleService:
                 pinned=spec.execution.pinned,
                 pinned_provider=spec.execution.provider,
                 pinned_model=spec.execution.model,
+                timezone=spec.expression.timezone,
                 delivery=delivery_description(result.delivery_plan.describe()),
                 failure_delivery=delivery_description(
                     result.failure_delivery_plan.describe()
