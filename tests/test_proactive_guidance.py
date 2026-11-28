@@ -107,18 +107,40 @@ def test_guidance_does_not_claim_an_autonomous_save() -> None:
 def test_guidance_pins_exact_time_and_clean_prompt() -> None:
     """Regression: 28 Nov 2026 — a schedule moved 9am to 8am unasked, and the
     prompt leaked style instructions ("Keep it to 1-2 short lines, Roman
-    Urdu mixed with English.") into the delivered reminder."""
+    Urdu mixed with English.") into the delivered reminder. Follow-up the
+    same day: a 9pm interview reminder set for 9pm is useless — the stated
+    time is the EVENT time, kept exact in the prompt, while the reminder
+    fires before it by a lead judged from the activity (Hermes's practice:
+    a preflight job runs before the event and its prompt names the event).
+    """
     line = next(
         part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
     )
     lowered = line.lower()
     for token in (
-        "exact time the user stated",
-        "never move it earlier or later without asking",
+        "event time",
+        "keep it exact in the prompt",
+        "fires before the event",
+        "judge from the activity",
+        "set the schedule to the reminder time",
+        "name the event time in the prompt",
+        "so the card shows both",
         "only the message to deliver",
         "never instructions about style",
     ):
         assert token in lowered, token
+
+
+def test_guidance_splits_event_time_from_reminder_time() -> None:
+    """Regression: 28 Nov 2026 — "i have interview on monday 9pm" produced
+    a reminder AT 9pm, when the interview starts. An interview needs its
+    reminder before the event, a simple reminder does not."""
+    line = next(
+        part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
+    )
+    lowered = line.lower()
+    assert "interview or meeting about 30 minutes before" in lowered
+    assert "simple reminder at the stated time" in lowered
 
 
 def test_guidance_stays_quiet_after_a_shown_card() -> None:
@@ -147,8 +169,12 @@ def test_granted_guidance_pins_exact_time_and_clean_prompt() -> None:
 
     lowered = _GRANTED_SCHEDULE_GUIDANCE.lower()
     for token in (
-        "exact time the user stated",
-        "never move it earlier or later without asking",
+        "event time",
+        "keep it exact in the prompt",
+        "fires before the event",
+        "judge from the activity",
+        "set the schedule to the reminder time",
+        "name the event time in the prompt",
         "only the message to deliver",
         "never instructions about style",
     ):
