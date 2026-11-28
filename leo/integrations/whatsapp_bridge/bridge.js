@@ -301,6 +301,22 @@ function pushMessage(message) {
   resolveMessageWaiters();
 }
 
+// WhatsApp turns the sender's ticks blue only once this device sends a read
+// receipt. Baileys' automatic receipts stay off (markOnlineOnConnect is false,
+// which forces every inbound receipt to type 'inactive'), so each accepted
+// message is acknowledged explicitly here. readMessages() already downgrades to
+// 'read-self' when the account hides read receipts. Cosmetic: never fatal.
+async function markRead(key) {
+  const sock = socket;
+  if (!sock || typeof sock.readMessages !== 'function') return;
+  if (state.phase !== 'connected' || !state.linked) return;
+  try {
+    await withTimeout(sock.readMessages([key]), 5_000);
+  } catch {
+    // A failed receipt must never disturb message delivery.
+  }
+}
+
 function handleMessagesUpsert(payload) {
   if (!payload || !Array.isArray(payload.messages)) return;
   // 'notify' is a live message; 'append' is history/offline. Both are safe to
@@ -354,6 +370,13 @@ function handleMessagesUpsert(payload) {
         is_group: chat.endsWith('@g.us'),
       });
       stats.accepted += 1;
+      // Fire-and-forget: a receipt must not delay handing the message on.
+      void markRead({
+        remoteJid: chat,
+        id,
+        fromMe: false,
+        ...(isJid(key.participant) ? { participant: key.participant } : {}),
+      });
     } catch {
       // One malformed message must never break the socket or the stream.
       stats.error += 1;

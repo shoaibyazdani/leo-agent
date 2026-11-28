@@ -81,7 +81,7 @@ PROTOCOL = "whatsapp-bridge/1"
 _APP_REPO_ROOT = Path(__file__).resolve().parents[3]
 _PACKAGE_DIR = Path(__file__).resolve().parent
 # SHA-256 of the shipped bridge.js. Recompute when bridge.js is changed.
-_BRIDGE_JS_SHA256 = "b4322176717f4429be16fc8dc316e543f38e5582ab014a579bc98f8bfdb078e1"
+_BRIDGE_JS_SHA256 = "3ddbf675236f073db9c9da7e828b993c1419697af02873c2b5a6058003fdf1aa"
 _BRIDGE_SCRIPT_MAX_BYTES = 1_000_000
 _NODE_COMMAND_ALLOWLIST = frozenset({"node"})
 # Only the first bytes of `node --version` are read; a hostile binary cannot
