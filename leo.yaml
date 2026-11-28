@@ -436,3 +436,11 @@ automation:
     github_repos:
       - shoaibyazdani/leo-agent
     github_token_env: GITHUB_TOKEN
+
+server:
+  # Channel turns answered at the same time. Each turn belongs to one
+  # conversation; turns in the SAME conversation still run one at a time, in
+  # admission order, so a slow chat cannot reorder or interleave its replies.
+  # 1 restores the old fully serial drain; 4 is the shipped default (max 32).
+  # `leo serve --worker --concurrency N` overrides this for that process.
+  concurrency: 4

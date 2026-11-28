@@ -16,6 +16,7 @@ brain: no admission is answered twice.
 from __future__ import annotations
 
 import asyncio
+import weakref
 
 import httpx
 import pytest
@@ -133,7 +134,82 @@ async def test_a_single_loop_still_works(monkeypatch):
     assert answered == 1
 
 
+async def test_run_worker_clamps_concurrency(monkeypatch):
+    """A direct caller cannot spawn more loops than the CLI or drain can."""
+    from leo.config import MAX_TURN_CONCURRENCY
+    from leo.gateway import worker as worker_module
+
+    store = GatewayStore()
+    worker_module, original, _ = _wire(monkeypatch, store, _Brain(), concurrency=1)
+    started: list[str] = []
+
+    async def fake_loop(client, app, me, **kwargs) -> int:
+        started.append(me)
+        return 0
+
+    monkeypatch.setattr(worker_module, "_claim_loop", fake_loop)
+    try:
+        answered = await _run(worker_module, _Brain(), wait_seconds=0.0, once=True,
+                              concurrency=999)
+    finally:
+        worker_module.GatewayClient = original
+
+    assert answered == 0
+    assert len(started) == MAX_TURN_CONCURRENCY, started
+    assert len(set(started)) == MAX_TURN_CONCURRENCY, "loop identities must be unique"
+
+
 # ------------------------------------------------------------------ lease ceiling
+async def test_cancelling_the_lock_wait_cancels_the_keepalive(monkeypatch):
+    """An admission nobody answers must not keep renewing its lease."""
+    from leo.gateway import worker as worker_module
+
+    admission = {"admission_id": "adm_wait", "channel": "telegram", "subject": "1",
+                 "conversation_id": None, "payload": {"text": "hello"}}
+    started = asyncio.Event()
+    renewals: list[asyncio.Task] = []
+
+    async def fake_keep_lease(*args, **kwargs) -> None:
+        renewals.append(asyncio.current_task())
+        started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(worker_module, "_keep_lease", fake_keep_lease)
+
+    class _Client:
+        async def claim(self, worker, *, lease_seconds=30, wait_seconds=25):
+            return dict(admission)
+
+    held = asyncio.Lock()
+    await held.acquire()  # a longer turn of this same conversation owns the lock
+    locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+    locks["adm_wait"] = held  # no conversation_id → outbox id fallback
+    loop = asyncio.create_task(
+        worker_module._claim_loop(
+            _Client(), _Brain(), "w1", wait_seconds=0.0, lease_seconds=30,
+            once=True, turn_max_seconds=60.0, conversation_locks=locks,
+        ),
+        name="claim-under-test",
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.sleep(0)  # let the loop reach the blocked lock.acquire()
+        assert not loop.done()
+        loop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop
+    finally:
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+        held.release()
+
+    assert len(renewals) == 1
+    assert renewals[0].cancelled(), "keepalive outlived the cancelled lock wait"
+    leaked = [task for task in asyncio.all_tasks()
+              if task.get_name() == "leo-lease" and not task.done()]
+    assert not leaked, leaked
+
+
 async def test_renewal_stops_after_the_maximum_lifetime(monkeypatch):
     """A stuck turn must stop renewing, so its lease can expire and be retried."""
     from leo.gateway import worker as worker_module
@@ -228,3 +304,88 @@ async def test_a_stuck_turn_is_visible_in_attempts(bad):
     assert claimed is not None
     assert row["queue"]["claimed"] == 1
     assert admission_id
+
+
+async def test_worker_loops_keep_one_turn_per_conversation(monkeypatch):
+    """More claim loops mean more chats in parallel, never two turns in one chat."""
+    from leo import db
+
+    store = GatewayStore()
+    await store.save_route("telegram", "1", "conv-same")
+    ids: list[str] = []
+    for index, text in enumerate(("first", "second")):
+        admission_id, _ = await store.admit(
+            channel="telegram", subject="1",
+            payload=payload(str(index), text),
+        )
+        ids.append(admission_id)
+    for index, admission_id in enumerate(ids):
+        await db.execute(
+            "UPDATE gateway_queue SET created_at=? WHERE admission_id=?",
+            (f"2026-01-01T00:00:0{index}+00:00", admission_id),
+        )
+
+    class OrderedBrain(_Brain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[str] = []
+            self.active = 0
+            self.peak_overlap = 0
+
+        async def ask(self, text, channel=None, subject=None, conversation_id=None):
+            self.seen.append(str(text))
+            self.active += 1
+            self.peak_overlap = max(self.peak_overlap, self.active)
+            await asyncio.sleep(0.05)
+            self.active -= 1
+            return {"content": f"answer:{text}", "conversation_id": conversation_id}
+
+    brain = OrderedBrain()
+    worker_module, original, _ = _wire(monkeypatch, store, brain, concurrency=2)
+    try:
+        answered = await _run(worker_module, brain, wait_seconds=0.0, once=True,
+                              concurrency=2)
+    finally:
+        worker_module.GatewayClient = original
+
+    assert answered == 2
+    assert brain.seen == ["first", "second"]
+    assert brain.peak_overlap == 1, "two worker loops ran turns of one chat together"
+
+
+async def test_rows_without_a_route_do_not_share_one_lock(monkeypatch):
+    """With no conversation_id the fallback key is the admission id, per row."""
+    store = GatewayStore()
+    for index, text in enumerate(("first", "second")):
+        await store.admit(channel="telegram", subject=str(index),
+                          payload=payload(str(index), text))
+
+    class NoRouteBrain(_Brain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.both_started = asyncio.Event()
+
+        async def ask(self, text, channel=None, subject=None, conversation_id=None):
+            assert conversation_id is None
+            self.asked.append(str(text))
+            self._in_flight_count = getattr(self, "_in_flight_count", 0) + 1
+            if self._in_flight_count == 2:
+                self.both_started.set()
+            try:
+                # Deterministic overlap check: both turns must be live at once.
+                await asyncio.wait_for(self.both_started.wait(), timeout=1.0)
+            finally:
+                self._in_flight_count -= 1
+            return {"content": f"answer:{text}", "conversation_id": conversation_id}
+
+    brain = NoRouteBrain()
+    worker_module, original, _ = _wire(monkeypatch, store, brain, concurrency=2)
+    try:
+        answered = await _run(worker_module, brain, wait_seconds=0.0, once=True,
+                              concurrency=2)
+    finally:
+        worker_module.GatewayClient = original
+
+    assert answered == 2
+    assert sorted(brain.asked) == ["first", "second"]
+    assert brain.both_started.is_set(), "conversation-less rows serialized behind one key"

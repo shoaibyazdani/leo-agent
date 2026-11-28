@@ -49,10 +49,10 @@ def make_gateway(**kwargs: Any) -> Gateway:
     )
 
 
-def msg(text: str, message_id: str) -> NormalizedMessage:
+def msg(text: str, message_id: str, *, conversation: str = "chat-1") -> NormalizedMessage:
     return NormalizedMessage(
         channel="fake", sender="Shoaib", sender_id="u1",
-        conversation_ref="chat-1", text=text, message_id=message_id,
+        conversation_ref=conversation, text=text, message_id=message_id,
     )
 
 
@@ -153,3 +153,188 @@ async def test_the_sweep_never_reclaims_a_turn_that_is_still_running(outbox_db) 
 
     assert await gateway.recover_stale_outbox(older_than_seconds=2400.0) == 0
     assert (await gateway.outbox_stats())["processing"] == 1
+
+
+# ------------------------------------------------------- per-conversation drain
+def _delivered() -> dict[str, Any]:
+    return {"status": "sent", "success": True, "delivered": True}
+
+
+async def _order_rows(*texts: str) -> None:
+    """Pin claim order: created_at can tie when rows arrive in one event loop."""
+    for index, text in enumerate(texts):
+        await db.execute(
+            "UPDATE gateway_outbox SET created_at=? WHERE text=?",
+            (f"2026-01-01T00:00:{index:02d}+00:00", text),
+        )
+
+
+@pytest.mark.asyncio
+async def test_distinct_conversations_run_in_parallel(outbox_db) -> None:
+    """Different chats must overlap; the old single loop queued them."""
+    gateway = make_gateway(concurrency=4)
+    for index in range(3):
+        await gateway.receive(
+            msg(f"chat-{index}", f"m-parallel-{index}", conversation=f"conv-{index}")
+        )
+    await _order_rows("chat-0", "chat-1", "chat-2")
+
+    started: list[str] = []
+    all_started = asyncio.Event()
+
+    async def consumer(payload: dict[str, Any]) -> dict[str, Any]:
+        started.append(str(payload["text"]))
+        if len(started) == 3:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=1.0)
+        return _delivered()
+
+    summary = await gateway.drain_outbox(consumer, limit=10)
+
+    assert sorted(started) == ["chat-0", "chat-1", "chat-2"]
+    assert all_started.is_set(), "three chats did not start their turns together"
+    assert summary["processed"] == 3
+
+
+@pytest.mark.asyncio
+async def test_ten_chats_can_all_overlap_when_configured(outbox_db) -> None:
+    """Acceptance case: ten distinct chats, ten simultaneous turns."""
+    gateway = make_gateway(concurrency=10)
+    for index in range(10):
+        await gateway.receive(
+            msg(f"chat-{index}", f"m-ten-{index}", conversation=f"conv-{index}")
+        )
+    await _order_rows(*[f"chat-{index}" for index in range(10)])
+
+    started: list[str] = []
+    all_started = asyncio.Event()
+
+    async def consumer(payload: dict[str, Any]) -> dict[str, Any]:
+        started.append(str(payload["text"]))
+        if len(started) == 10:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=1.0)
+        return _delivered()
+
+    summary = await gateway.drain_outbox(consumer, limit=10)
+
+    assert all_started.is_set(), "ten chats did not all start before any answered"
+    assert summary["processed"] == 10
+
+
+@pytest.mark.asyncio
+async def test_one_conversation_stays_serial_and_ordered(outbox_db) -> None:
+    """Bounded fan-out may not interleave two turns of the same chat."""
+    gateway = make_gateway(concurrency=4)
+    for index in range(3):
+        await gateway.receive(msg(f"m{index}", f"m-serial-{index}", conversation="same-chat"))
+    await _order_rows("m0", "m1", "m2")
+
+    seen: list[str] = []
+    active = 0
+    peak = 0
+
+    async def consumer(payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        seen.append(str(payload["text"]))
+        await asyncio.sleep(0.02)
+        active -= 1
+        return _delivered()
+
+    summary = await gateway.drain_outbox(consumer, limit=10)
+
+    assert seen == ["m0", "m1", "m2"], "same-chat turns ran out of order"
+    assert peak == 1, "two turns of one conversation overlapped"
+    assert summary["processed"] == 3
+
+
+@pytest.mark.asyncio
+async def test_fan_out_is_bounded_by_configured_concurrency(outbox_db) -> None:
+    """Two slots, five chats: all answered, never more than two at once."""
+    gateway = make_gateway(concurrency=2)
+    for index in range(5):
+        await gateway.receive(
+            msg(f"job-{index}", f"m-bound-{index}", conversation=f"chat-{index}")
+        )
+    await _order_rows(*[f"job-{index}" for index in range(5)])
+
+    active = 0
+    peak = 0
+
+    async def consumer(payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return _delivered()
+
+    summary = await gateway.drain_outbox(consumer, limit=10)
+
+    assert summary["processed"] == 5
+    assert peak == 2, f"expected exactly two slots in use, saw {peak}"
+
+
+@pytest.mark.asyncio
+async def test_a_per_call_concurrency_override_bounds_the_drain(outbox_db) -> None:
+    """A caller can narrow the gateway's default without changing the service."""
+    gateway = make_gateway(concurrency=4)
+    for index in range(3):
+        await gateway.receive(
+            msg(f"one-{index}", f"m-override-{index}", conversation=f"chat-{index}")
+        )
+    await _order_rows("one-0", "one-1", "one-2")
+
+    active = 0
+    peak = 0
+
+    async def consumer(payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return _delivered()
+
+    summary = await gateway.drain_outbox(consumer, limit=10, concurrency=1)
+
+    assert summary["processed"] == 3
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_a_hung_turn_does_not_delay_another_conversation(outbox_db) -> None:
+    """Only the stuck chat waits out the per-row timeout."""
+    gateway = make_gateway()
+    await gateway.receive(msg("hangs", "m-isolate-1", conversation="slow-chat"))
+    await gateway.receive(msg("fast", "m-isolate-2", conversation="fast-chat"))
+    await _order_rows("hangs", "fast")
+
+    events: list[tuple[str, str]] = []
+    hang_ended = asyncio.Event()
+    fast_started_while_hung = False
+
+    async def consumer(payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal fast_started_while_hung
+        text = str(payload["text"])
+        events.append(("start", text))
+        if text == "fast":
+            fast_started_while_hung = not hang_ended.is_set()
+        try:
+            if text == "hangs":
+                await asyncio.sleep(1.0)
+            events.append(("end", text))
+        finally:
+            if text == "hangs":
+                hang_ended.set()
+        return _delivered()
+
+    summary = await gateway.drain_outbox(consumer, limit=10, per_row_timeout=0.2)
+
+    assert ("start", "hangs") in events
+    assert fast_started_while_hung, "the fast turn waited for the hung turn's cap"
+    assert ("end", "hangs") not in events, "the hung turn was allowed to finish"
+    assert ("end", "fast") in events
+    assert summary["processed"] == 1 and summary["failed"] == 1

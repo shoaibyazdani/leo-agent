@@ -121,6 +121,56 @@ def test_serve_rejects_out_of_range_port(monkeypatch, fake_uvicorn) -> None:
 
 
 # ---------------------------------------------------------------------------
+# serve --worker: concurrency default comes from config, flag overrides it
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_worker(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    calls: list[Any] = []
+
+    def fake_run(url: str, **kwargs: Any) -> None:
+        calls.append((url, kwargs))
+
+    monkeypatch.setattr(cli_mod, "_serve_worker", fake_run)
+    return calls
+
+
+def test_serve_worker_takes_concurrency_from_config(monkeypatch, fake_worker) -> None:
+    settings = Settings()
+    settings.server.concurrency = 7
+    monkeypatch.setitem(cli_mod._state, "settings", settings)
+
+    result = _invoke("serve", "--worker", "--gateway-url", "http://gateway")
+
+    assert result.exit_code == 0, result.output
+    assert fake_worker == [(
+        "http://gateway",
+        {"once": False, "concurrency": 7, "turn_max_seconds": 1800.0},
+    )]
+
+
+def test_serve_worker_flag_overrides_configured_concurrency(monkeypatch, fake_worker) -> None:
+    settings = Settings()
+    settings.server.concurrency = 7
+    monkeypatch.setitem(cli_mod._state, "settings", settings)
+
+    result = _invoke("serve", "--worker", "--gateway-url", "http://gateway",
+                     "--concurrency", "2")
+
+    assert result.exit_code == 0, result.output
+    assert fake_worker[0][1]["concurrency"] == 2
+
+
+def test_serve_worker_rejects_zero_concurrency(monkeypatch, fake_worker) -> None:
+    result = _invoke("serve", "--worker", "--gateway-url", "http://gateway",
+                     "--concurrency", "0")
+
+    assert result.exit_code != 0
+    assert fake_worker == []
+
+
+# ---------------------------------------------------------------------------
 # Missing ids / invalid commands produce JSON errors, never tracebacks
 # ---------------------------------------------------------------------------
 
