@@ -1701,3 +1701,90 @@ def test_package_and_bridge_contract():
     if node:
         check = subprocess.run([node, "--check", str(BRIDGE_DIR / "bridge.js")], capture_output=True, timeout=30)
         assert check.returncode == 0, check.stderr.decode("utf-8", "replace")
+
+
+# --- Read receipts: an accepted message must be acknowledged once ------------
+
+_BRIDGE_HARNESS_RECEIPT_EPILOGUE = r"""
+const reads = [];
+socket = {
+  ev: makeEv(), end() {}, user: {},
+  readMessages: async (keys) => { reads.push(keys); },
+};
+state.phase = 'connected';
+state.linked = true;
+const inbound = (id, text) => ({
+  type: 'notify',
+  messages: [{
+    key: { id, remoteJid: '15551234567@s.whatsapp.net', fromMe: false },
+    message: { conversation: text },
+    messageTimestamp: 1700000000,
+  }],
+});
+handleMessagesUpsert(inbound('MSG1', 'hello'));
+await new Promise((resolve) => setTimeout(resolve, 20));
+if (reads.length !== 1) throw new Error('expected one read receipt, got ' + reads.length);
+if (reads[0].length !== 1) throw new Error('receipt batch must hold exactly one key');
+const receipt = reads[0][0];
+if (receipt.id !== 'MSG1') throw new Error('receipt carried the wrong message id');
+if (receipt.remoteJid !== '15551234567@s.whatsapp.net') throw new Error('receipt carried the wrong chat');
+if (receipt.fromMe !== false) throw new Error('receipt must be for an inbound message');
+
+// Not connected: never claim a read we cannot send.
+state.phase = 'idle';
+handleMessagesUpsert(inbound('MSG2', 'while offline'));
+await new Promise((resolve) => setTimeout(resolve, 20));
+if (reads.length !== 1) throw new Error('a receipt was sent while not connected');
+
+// A failing receipt must never break ingestion.
+state.phase = 'connected';
+socket = {
+  ev: makeEv(), end() {}, user: {},
+  readMessages: async () => { throw new Error('receipt failed'); },
+};
+handleMessagesUpsert(inbound('MSG3', 'third'));
+await new Promise((resolve) => setTimeout(resolve, 20));
+process.stdout.write('READ_RECEIPTS_OK\n');
+"""
+
+
+def test_inbound_messages_are_marked_read(tmp_path: Path):
+    """A delivered message must be acknowledged so the sender's ticks turn blue.
+
+    Baileys' automatic receipts stay off (markOnlineOnConnect: false makes every
+    inbound receipt type 'inactive'), so the bridge sends readMessages() itself.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    session_dir = tmp_path / "alice"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "owner.json").write_text(json.dumps({"owner_id": "alice"}), encoding="utf-8")
+
+    source = (BRIDGE_DIR / "bridge.js").read_text(encoding="utf-8")
+    if source.startswith("#!"):
+        source = source.split("\n", 1)[1]
+    source = re.sub(r"^import .*;\s*$", "", source, flags=re.MULTILINE)
+    source = source.replace("await import('@whiskeysockets/baileys')", "baileysStub")
+    assert "await import(" not in source
+    harness = tmp_path / "bridge_receipt_harness.mjs"
+    harness.write_text(
+        _BRIDGE_HARNESS_PRELUDE + source + _BRIDGE_HARNESS_RECEIPT_EPILOGUE,
+        encoding="utf-8",
+    )
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "LEO_WHATSAPP_BRIDGE_TOKEN": "a" * 40,
+        "LEO_WHATSAPP_ACTOR": "alice",
+        "LEO_WHATSAPP_SESSION_ROOT": str(tmp_path),
+        "LEO_WHATSAPP_SESSION_DIR": str(session_dir),
+        "LEO_WHATSAPP_BRIDGE_FD": "3",
+        "LEO_WHATSAPP_BRIDGE_PORT": "12345",
+    }
+    result = subprocess.run(
+        [node, str(harness)], cwd=str(tmp_path), env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "READ_RECEIPTS_OK" in result.stdout, result.stdout + result.stderr
