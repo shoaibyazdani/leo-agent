@@ -11,7 +11,7 @@ import pytest
 
 from leo import db
 from leo.config import Settings
-from leo.contracts import RiskLevel, ToolCall, ToolSpec
+from leo.contracts import RiskLevel, RiskReason, ToolCall, ToolSpec
 from leo.events import EventBus
 from leo.security.permissions import ApprovalRequired, PermissionManagerImpl
 from leo.tools.approval_tools import register, register_operator
@@ -380,7 +380,10 @@ async def test_wait_for_approval_times_out_without_killing_the_turn(env):
     assert not env.executed
 
 
-async def _shell_decision(env, reviewer, reason: str = "unclassified command (rsvg-convert)"):
+async def _shell_decision(
+    env, reviewer,
+    reason=RiskReason("unclassified command (rsvg-convert)", trustable=True),
+):
     env.permissions.set_reviewer(reviewer)
     return await env.permissions.authorize(
         "operator", "tool:shell", str(env.settings.root.resolve()), RiskLevel.HIGH,
@@ -450,3 +453,118 @@ async def test_auto_reviewer_failure_falls_back_to_a_human(env):
     decision = await _shell_decision(env, reviewer)
 
     assert decision.requires_approval is True and decision.approval_id
+
+
+async def test_auto_reviewer_never_reaches_a_high_classifier_reason(env):
+    """An interpreter flagged HIGH by the classifier stays with the human."""
+    calls = []
+
+    async def reviewer(**kwargs):
+        calls.append(kwargs)
+        return "allow", "local test run"
+
+    env.permissions.set_reviewer(reviewer)
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", str(env.settings.root.resolve()), RiskLevel.HIGH,
+        risk_reason=RiskReason("python runs arbitrary code", trustable=False),
+        review_command="python -c 'print(1)'",
+    )
+
+    assert decision.requires_approval is True
+    assert calls == []
+
+
+@pytest.mark.parametrize("reason", [
+    "git history or remote rewrite",
+    "hardline blocklist: filesystem root wipe (rm -rf /)",
+    "sudo escalates privileges",
+    "command substitution",
+    "redirection outside allowed roots",
+    "unparseable command",
+])
+async def test_auto_reviewer_keeps_hardline_reasons_with_the_human(env, reason):
+    calls = []
+
+    async def reviewer(**kwargs):
+        calls.append(kwargs)
+        return "allow", ""
+
+    decision = await _shell_decision(env, reviewer, reason=reason)
+
+    assert decision.requires_approval is True
+    assert calls == []
+
+
+async def test_expiry_is_durable_and_emits_an_explicit_event(env):
+    seen = []
+
+    async def on_expired(event):
+        seen.append(event.payload)
+
+    env.permissions.events.subscribe("approval.expired", on_expired)
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", str(env.settings.root.resolve()), RiskLevel.HIGH,
+        risk_reason=RiskReason("unclassified command (rsvg-convert)", trustable=True),
+        command_preview="rsvg-convert -z 2 -o girl.png girl.svg",
+        task_id="conv-1",
+    )
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await db.execute(
+        "UPDATE approvals SET created_at=?, expires_at=? WHERE id=?",
+        (old, old, decision.approval_id),
+    )
+
+    assert await env.permissions.expire_approval_if_stale(decision.approval_id) is True
+    row = await db.fetchone("SELECT status FROM approvals WHERE id=?", (decision.approval_id,))
+    assert row["status"] == "expired"
+    assert seen and seen[0]["command"].startswith("rsvg-convert")
+    assert seen[0]["reason"] and "not run" in seen[0]["reason"]
+    assert await env.permissions.expire_approval_if_stale(decision.approval_id) is False
+
+
+async def test_startup_recovers_a_card_whose_timer_died_with_the_loop(env):
+    """A restart re-evaluates stored deadlines and still shows the notice."""
+    seen = []
+    env.permissions.events.subscribe("approval.expired", lambda event: seen.append(event.payload))
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", str(env.settings.root.resolve()), RiskLevel.HIGH,
+        risk_reason=RiskReason("ordinary command", trustable=True),
+        command_preview="rsvg-convert in.png out.png", task_id="restart-1",
+    )
+    assert decision.requires_approval is True
+    stored = await db.fetchone("SELECT expires_at FROM approvals WHERE id=?", (decision.approval_id,))
+    assert stored["expires_at"], "the deadline must be durable, not only a loop timer"
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await db.execute(
+        "UPDATE approvals SET created_at=?, expires_at=? WHERE id=?",
+        (old, old, decision.approval_id),
+    )
+    # A fresh manager has no in-memory timer: only the durable row survives.
+    restarted = PermissionManagerImpl(env.settings, env.permissions.events)
+
+    assert await restarted.recover_pending_expiries() == 1
+    row = await db.fetchone("SELECT status FROM approvals WHERE id=?", (decision.approval_id,))
+    assert row["status"] == "expired"
+    assert seen and seen[0]["approval_id"] == decision.approval_id
+    assert seen[0]["command"] == "rsvg-convert in.png out.png"
+    assert seen[0]["reason"] and "not run" in seen[0]["reason"]
+
+
+async def test_startup_rearms_a_card_that_is_still_live(env):
+    decision = await env.permissions.authorize(
+        "operator", "tool:shell", str(env.settings.root.resolve()), RiskLevel.HIGH,
+        risk_reason=RiskReason("ordinary command", trustable=True),
+        command_preview="pytest -q", task_id="restart-2",
+    )
+    restarted = PermissionManagerImpl(env.settings, env.permissions.events)
+
+    assert await restarted.recover_pending_expiries() == 0
+    row = await db.fetchone("SELECT status FROM approvals WHERE id=?", (decision.approval_id,))
+    assert row["status"] == "pending"
+    assert decision.approval_id in restarted._expiry_handles
+
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await db.execute(
+        "UPDATE approvals SET expires_at=? WHERE id=?", (old, decision.approval_id)
+    )
+    assert await restarted.expire_approval_if_stale(decision.approval_id) is True

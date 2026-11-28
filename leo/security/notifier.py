@@ -53,11 +53,14 @@ from .notices import (
     REVIEW_FAILED_PREFIX,
     REVIEW_STAGED_PREFIX,
 )
-from .permissions import reason_is_trustable
+from .permissions import delegation_allowed
 
 _LOG = get_logger("security.notifier")
 
 REQUESTED_TOPIC = "approval.requested"
+# An approval nobody answered must end in an explicit operator-visible message,
+# not a card that quietly ages out while the turn stalls.
+EXPIRED_TOPIC = "approval.expired"
 # A shell/desktop banner is a notification, never a card presentation or proof
 # that the human can answer. The event carries bounded copy and no authority.
 SCHEDULE_NOTIFICATION_TOPIC = "schedule.notification"
@@ -166,6 +169,7 @@ class ApprovalNotifier:
             return False
         if not self._subscribed:
             self.events.subscribe(REQUESTED_TOPIC, self._on_requested)
+            self.events.subscribe(EXPIRED_TOPIC, self._on_expired)
             for topic in REVIEW_TOPICS:
                 self.events.subscribe(topic, self._on_review)
             self._subscribed = True
@@ -179,6 +183,7 @@ class ApprovalNotifier:
     def stop(self) -> None:
         if self._subscribed and self.events is not None:
             self.events.unsubscribe(REQUESTED_TOPIC, self._on_requested)
+            self.events.unsubscribe(EXPIRED_TOPIC, self._on_expired)
             for topic in REVIEW_TOPICS:
                 self.events.unsubscribe(topic, self._on_review)
         self._subscribed = False
@@ -268,6 +273,48 @@ class ApprovalNotifier:
             f"deny:    leo approval deny {approval_id}",
         ]
         return "\n".join(lines)
+
+    @staticmethod
+    def _expired_message(payload: dict[str, Any]) -> str:
+        """Say what was waiting, and that nothing was decided or executed."""
+        approval_id = str(payload.get("approval_id") or "?")
+        action = str(payload.get("action") or "?")
+        command = str(payload.get("command") or "").strip()
+        reason = str(payload.get("risk_reason") or "").strip()
+        lines = [
+            "⏰ Approval expired — no decision was made",
+            f"action: {action}",
+        ]
+        if command:
+            lines.append(f"command: `{command[:400]}`")
+        if reason:
+            lines.append(f"why: {reason[:200]}")
+        lines += [
+            f"id: {approval_id}",
+            "The action was not run. Ask for it again to get a fresh card.",
+        ]
+        return "\n".join(lines)
+
+    async def _on_expired(self, event: Event) -> None:
+        """Announce a timed-out card; this handler never resolves anything."""
+        resolved = self._resolved()
+        if resolved is None:
+            return
+        channel, target = resolved
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        text = self._expired_message(payload)
+        try:
+            adapter = self.gateway._adapter(channel)  # noqa: SLF001 - same package
+            await self._send_notice(adapter, target, text, None, plain=False)
+        except Exception as exc:  # noqa: BLE001 - an announcement must never break a turn
+            self._failed += 1
+            _LOG.warning("approval expiry notice failed", extra={
+                "channel": channel,
+                "approval_id": payload.get("approval_id"),
+                "error": str(exc),
+            })
+            return
+        self._sent += 1
 
     # -- handler -----------------------------------------------------------
     async def _still_actionable(self, approval_id: str) -> bool:
@@ -421,10 +468,14 @@ class ApprovalNotifier:
                     trust_days=float(
                         getattr(self.settings.security, "workspace_trust_days", 30) or 30
                     ),
-                    # A destructive/credential/arbitrary-code call is not covered
-                    # by a workspace trust, so do not offer a button that would lie.
-                    allow_workspace_trust=reason_is_trustable(
-                        payload.get("risk_reason")
+                    # A HIGH classifier reason cannot be covered by any grant,
+                    # including the exact-command one. Do not offer buttons that
+                    # would be refused on tap.
+                    allow_command_grant=delegation_allowed(
+                        action, payload.get("risk_trustable")
+                    ),
+                    allow_workspace_trust=delegation_allowed(
+                        action, payload.get("risk_trustable")
                     ),
                     # manual mode ignores grants, so offering trust buttons there
                     # would promise something the resolver will not honor.
@@ -589,6 +640,7 @@ class ApprovalNotifier:
 
 __all__ = [
     "ApprovalNotifier",
+    "EXPIRED_TOPIC",
     "REQUESTED_TOPIC",
     "SCHEDULE_NOTIFICATION_TOPIC",
     "REVIEW_TOPICS",

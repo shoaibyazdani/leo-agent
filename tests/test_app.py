@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from leo.config import ModelConfig, ModelProviderConfig, Settings
+from leo.contracts import RiskLevel, RiskReason
 from leo.core import LeoApp
 
 
@@ -63,3 +64,68 @@ async def test_memory_persists_across_app_restarts(mock_settings: Settings) -> N
     found = await second.search.search("dark mode", limit=3)
     assert any(m.id == record.id for m in found)
     await second.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_calls_run_before_a_call_that_may_wait(mock_settings: Settings) -> None:
+    """A pending card must not hold up unrelated steps in the same batch."""
+    mock_settings.security.wait_for_approval = True
+    app = LeoApp(mock_settings)
+    await app.initialize()
+    calls = [
+        {"id": "gated", "name": "shell", "arguments": {"command": "git push --force origin main"}},
+        {"id": "safe", "name": "read_file", "arguments": {"path": "README.md"}},
+        {"id": "also-gated", "name": "shell", "arguments": {"command": "rm -rf build"}},
+    ]
+
+    ordered = await app._safe_calls_before_wait(calls)
+
+    assert [call["id"] for call in ordered] == ["safe", "gated", "also-gated"]
+    # The original batch is untouched: provider pairing still follows the ids.
+    assert [call["id"] for call in calls] == ["gated", "safe", "also-gated"]
+    await app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_no_approval_wait_keeps_the_models_order(mock_settings: Settings) -> None:
+    mock_settings.security.wait_for_approval = True
+    mock_settings.security.approval_mode = "off"  # no HIGH call will hold
+    app = LeoApp(mock_settings)
+    await app.initialize()
+    calls = [
+        {"id": "high", "name": "shell", "arguments": {"command": "git push --force origin main"}},
+        {"id": "safe", "name": "read_file", "arguments": {"path": "README.md"}},
+    ]
+
+    assert [c["id"] for c in await app._safe_calls_before_wait(calls)] == ["high", "safe"]
+    await app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_reviewable_call_does_not_trigger_a_reorder(
+    mock_settings: Settings, monkeypatch
+) -> None:
+    """A smart reviewer may answer the call, so no human wait is predicted."""
+    import leo.core.app as app_module
+
+    mock_settings.security.wait_for_approval = True
+    mock_settings.security.approval_mode = "smart"
+    mock_settings.security.reviewer_enabled = True
+    app = LeoApp(mock_settings)
+    await app.initialize()
+
+    async def reviewer(**_kwargs):
+        return "allow", "fine"
+
+    app.permissions.set_reviewer(reviewer)
+    monkeypatch.setattr(
+        app_module, "assess_call",
+        lambda *_a, **_k: (RiskLevel.HIGH, RiskReason("localhost request", trustable=True)),
+    )
+    calls = [
+        {"id": "maybe", "name": "shell", "arguments": {"command": "curl http://localhost"}},
+        {"id": "safe", "name": "read_file", "arguments": {"path": "README.md"}},
+    ]
+
+    assert [c["id"] for c in await app._safe_calls_before_wait(calls)] == ["maybe", "safe"]
+    await app.shutdown()

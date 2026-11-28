@@ -25,7 +25,7 @@ from pathlib import Path, PurePath
 from typing import Any, Mapping
 
 from ..config import Settings
-from ..contracts import RiskLevel
+from ..contracts import RiskLevel, RiskReason
 
 # ``leo.tools`` imports the executor, which imports this package: the shell
 # policy is imported at call time so neither side needs the other at import.
@@ -75,8 +75,23 @@ def assess_call(
     arguments: Mapping[str, Any],
     default: RiskLevel,
     settings: Settings,
+) -> tuple[RiskLevel, RiskReason]:
+    """Return ``(risk, reason)`` for one tool call.
+
+    As in the shell classifier, the delegation decision is attached to the
+    reason instead of being guessed from its wording by the approval layer.
+    """
+    risk, reason = _assess_call(tool, arguments, default, settings)
+    return risk, RiskReason(reason, trustable=risk is not RiskLevel.HIGH)
+
+
+def _assess_call(
+    tool: str,
+    arguments: Mapping[str, Any],
+    default: RiskLevel,
+    settings: Settings,
 ) -> tuple[RiskLevel, str]:
-    """Return ``(risk, reason)`` for one tool call."""
+    """Classify one tool call before the trust flag is attached."""
     name = str(tool or "")
 
     if name == "shell":

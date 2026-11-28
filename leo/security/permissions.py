@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import hmac
 import json
 import re
+import shlex
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,11 +16,11 @@ from typing import Any
 
 from .. import db
 from ..config import Settings
-from ..contracts import Decision, RiskLevel, new_id, surface_capabilities
+from ..contracts import Decision, RiskLevel, RiskReason, new_id, surface_capabilities
 from ..logging import get_logger
 from ..events import Event, EventBus
 from ..schedules.clock import Clock, SystemClock
-from .approval_buttons import ALWAYS_ARG_SCOPED_ACTIONS
+from .approval_buttons import ALWAYS_ARG_SCOPED_ACTIONS, SESSION_GRANT_SECONDS
 from .approval_cards import (
     APPROVAL_CARD_PROTOCOL_VERSION,
     DECLINE_MESSAGES,
@@ -64,22 +66,86 @@ def _bounded_deny_reason(value: Any) -> str:
     return text[:_MAX_DENY_REASON_CHARS]
 
 
-# A workspace trust is for ordinary development commands. Destructive,
-# credential, privilege, arbitrary-code, outbound and self-modifying work keeps
-# asking even when the workspace is trusted.
-_DANGEROUS_REASON = re.compile(
-    r"(?i)("
-    r"destruct|credential|privilege|escalat|power/unit|remote rewrite|force|"
-    r"recursive permission|removes an installed|key/keystore|private key|"
-    r"outside allowed roots|unparseable|arbitrary code|hardline|substitution|"
-    r"shell policy manual|shell disabled"
-    r")"
-)
+# Whether a grant or a smart-review verdict may answer a call is decided by the
+# classifier and carried as data (``RiskReason.trustable``). It is never derived
+# from reason wording here: a newly worded HIGH reason used to open a hole in
+# the floor as soon as it did not match a substring list.
+def reason_is_trustable(reason: Any) -> bool:
+    """True only when the classifier explicitly marked this reason trustable.
+
+    Plain strings and missing reasons fail closed. HIGH classifier outcomes are
+    always tagged untrustable, so no HIGH reason can reach a reviewer, a trust,
+    a pattern grant or a remembered approval.
+    """
+    return isinstance(reason, RiskReason) and reason.trustable
 
 
-def reason_is_trustable(reason: str | None) -> bool:
-    """True when a workspace trust may cover a HIGH call for this reason."""
-    return not _DANGEROUS_REASON.search(str(reason or ""))
+def delegation_allowed(action: str, trustable: bool | None) -> bool:
+    """Whether a stored/pending call may be answered by a grant.
+
+    Shell/terminal authority lives in command text, so a structured ``True`` is
+    required. Other actions keep their resource-scoped grant semantics; a
+    classifier that explicitly marked the reason untrustable still blocks them.
+    """
+    if str(action or "") in ALWAYS_ARG_SCOPED_ACTIONS:
+        return trustable is True
+    return trustable is not False
+
+
+def trust_flag(reason: Any) -> bool | None:
+    """Extract the classifier's delegation flag, or None when it was not given."""
+    return reason.trustable if isinstance(reason, RiskReason) else None
+
+
+def metadata_trustable(action: str, metadata: Any) -> bool:
+    """Read the delegation flag persisted on an approval card."""
+    flag = metadata.get("risk_trustable") if isinstance(metadata, Mapping) else None
+    return delegation_allowed(action, flag)
+
+
+_GRANT_SCOPE_PATTERN = "pattern"
+_GRANT_SCOPE_DIRECTORY = "directory"
+_GRANT_SCOPE_STANDING = "standing"
+_GRANT_SCOPE_CONVERSATION = "conversation"
+_STANDING_EXPIRY = "9999-12-31T23:59:59+00:00"
+_EXPIRY_GRACE_SECONDS = 2.0
+_MAX_PATTERN_CHARS = 300
+
+
+def _normalise_pattern(pattern: Any) -> str:
+    """Validate an operator-supplied command pattern (``pytest *``, ``git *``)."""
+    text = " ".join(str(pattern or "").split())
+    if not text or len(text) > _MAX_PATTERN_CHARS or "\x00" in text:
+        raise ValueError("a command pattern must be a bounded, non-empty string")
+    if text.strip() in {"*", "**", "* *"}:
+        raise ValueError("a command pattern must name a program, not match everything")
+    return text
+
+
+def _command_pattern(command: Any) -> str | None:
+    """Derive the 'kind of work' grant from one approved command."""
+    try:
+        tokens = shlex.split(str(command or ""))
+    except ValueError:
+        return None
+    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return None
+    name = tokens[0]
+    if not re.fullmatch(r"[A-Za-z0-9_./-]{1,80}", name):
+        return None
+    return f"{name} *"
+
+
+def _pattern_matches(command: str, pattern: str) -> bool:
+    """``pytest *`` covers both ``pytest -q`` and bare ``pytest``."""
+    text = " ".join(str(command or "").split())
+    if not text:
+        return False
+    if fnmatch.fnmatchcase(text, pattern):
+        return True
+    return pattern.endswith(" *") and text == pattern[:-2]
 
 
 def arguments_digest(arguments: Any) -> str | None:
@@ -162,6 +228,10 @@ class PermissionManagerImpl:
         self._reviewer: Callable[..., Awaitable[tuple[str, str]]] | None = None
         # (action, command, workspace) -> (expires_at, verdict, note)
         self._review_cache: dict[tuple[str, str, str], tuple[float, str, str]] = {}
+        # Bounded expiry timers for command approvals. A timer is a loop handle,
+        # not a long-lived task: closing a loop drops it silently.
+        self._expiry_handles: dict[str, asyncio.TimerHandle] = {}
+        self._expiry_tasks: set[asyncio.Task[Any]] = set()
         # Phase 5 registers the one ScheduleService commit callback here. It is
         # invoked inside the same transaction as the decision + grant + audit,
         # so a failed schedule write rolls the approval back with it.
@@ -297,11 +367,16 @@ class PermissionManagerImpl:
         current_digest = context.get("arguments_digest")
         if not current_digest and context.get("arguments") is not None:
             current_digest = arguments_digest(context.get("arguments"))
-        risk_reason = str(context.get("risk_reason") or "")
+        risk_reason_value = context.get("risk_reason")
+        risk_reason = str(risk_reason_value or "")
+        risk_trustable = trust_flag(risk_reason_value)
         command_preview = str(context.get("command_preview") or "")
         # The reviewer needs the real command, but it must not be persisted in
         # the approval metadata: pop it before that mapping is built.
         review_command = str(context.pop("review_command", "") or "")
+        grant_command = review_command or command_preview
+        task_id = str(context.get("task_id") or context.get("conversation_id") or "").strip()
+        conversation_id = str(context.get("conversation_id") or "").strip()
         verified_approval = False
         if supplied_approval:
             row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (supplied_approval,))
@@ -340,13 +415,17 @@ class PermissionManagerImpl:
             allowed and not violation and risk is RiskLevel.HIGH and not verified_approval
             and self.settings.security.high_risk_requires_approval
             and self.settings.security.approval_mode != "off"
-            and await self._has_live_grant(action, resource, current_digest, risk_reason)
+            and await self._has_live_grant(
+                action, resource, current_digest, risk_reason_value,
+                command=grant_command, task_id=task_id,
+                conversation_id=conversation_id,
+            )
         ):
             allowed, reason, grant_applied = True, "approval grant", True
 
         # Smart mode asks a cheap model to review an otherwise-uncovered HIGH
-        # shell call before a human is bothered. A destructive/credential/
-        # arbitrary-code reason never reaches the reviewer.
+        # shell call before a human is bothered. Ordinary interpreters and
+        # unclassified dev commands reach it; hardline reasons never do.
         review_answered = False
         if (
             allowed and not grant_applied and risk is RiskLevel.HIGH
@@ -354,8 +433,8 @@ class PermissionManagerImpl:
             and self.settings.security.approval_mode == "smart"
             and self.settings.security.reviewer_enabled
             and self._reviewer is not None
-            and action in {"tool:shell", "tool:terminal"}
-            and reason_is_trustable(risk_reason)
+            and action in ALWAYS_ARG_SCOPED_ACTIONS
+            and reason_is_trustable(risk_reason_value)
             and review_command.strip()
         ):
             verdict, note = await self._review(
@@ -383,17 +462,29 @@ class PermissionManagerImpl:
                 metadata["arguments_digest"] = current_digest
             if risk_reason:
                 metadata["risk_reason"] = risk_reason
+            if risk_trustable is not None:
+                metadata["risk_trustable"] = risk_trustable
             if command_preview:
                 metadata["command_preview"] = command_preview
+            timeout = float(
+                getattr(self.settings.security, "approval_timeout_seconds", 900) or 900
+            )
+            created = self._now()
+            # Persist the deadline with the card so a restart can re-evaluate it
+            # instead of leaving a pending row with no live timer.
+            deadline = created + timedelta(seconds=max(0.0, timeout) + _EXPIRY_GRACE_SECONDS)
             await db.execute(
-                "INSERT INTO approvals(id,created_at,status,actor,action,resource,risk,reason,requested_by,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO approvals(id,created_at,expires_at,status,actor,action,resource,risk,reason,requested_by,metadata) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    approval_id, self._now_iso(), "pending", actor, action, resource, risk.value,
+                    approval_id, created.isoformat(), deadline.isoformat(), "pending",
+                    actor, action, resource, risk.value,
                     "high-risk action requires explicit approval", actor,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
             )
             allowed, requires_approval, reason = False, True, "approval required"
+            self._schedule_expiry(approval_id, timeout)
             if self.events:
                 await self.events.emit(
                     "approval.requested",
@@ -407,6 +498,7 @@ class PermissionManagerImpl:
                     # exact command shown.
                     **({"arguments_digest": current_digest} if current_digest else {}),
                     **({"risk_reason": risk_reason} if risk_reason else {}),
+                    **({"risk_trustable": risk_trustable is True}),
                     **({"command": command_preview} if command_preview else {}),
                 )
 
@@ -437,6 +529,153 @@ class PermissionManagerImpl:
             (self._now_iso(), approval_id),
         )
         return cursor.rowcount == 1
+
+    # -- bounded approval expiry ------------------------------------------
+    def _cancel_expiry(self, approval_id: str) -> None:
+        handle = self._expiry_handles.pop(str(approval_id), None)
+        if handle is not None:
+            handle.cancel()
+
+    def _schedule_expiry(self, approval_id: str, timeout: float) -> None:
+        """Arm one timed expiry; later than the waiter so a timeout reads honestly.
+
+        The executor's own bounded wait ends at the configured timeout. The
+        expiry marker fires just after it, so the operator gets an explicit
+        "what was waiting" notice without turning a pending card into an expired
+        row underneath a still-waiting turn.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no loop: the caller has no wait to expire
+            return
+        delay = max(1.0, float(timeout)) + _EXPIRY_GRACE_SECONDS
+        self._expiry_handles[str(approval_id)] = loop.call_later(
+            delay, self._expiry_due, str(approval_id)
+        )
+
+    def _expiry_due(self, approval_id: str) -> None:
+        self._expiry_handles.pop(approval_id, None)
+        try:
+            task = asyncio.create_task(self.expire_approval_if_stale(approval_id))
+        except RuntimeError:  # loop closed between the timer and the callback
+            return
+        self._expiry_tasks.add(task)
+        task.add_done_callback(self._expiry_tasks.discard)
+
+    def _approval_deadline(self, row: Any) -> datetime | None:
+        """Deadline stored on the card, or the legacy created-at derived one."""
+        deadline: datetime | None = None
+        try:
+            keys = row.keys()
+        except AttributeError:  # pragma: no cover - sqlite rows expose keys()
+            keys = ()
+        if "expires_at" in keys:
+            try:
+                stored = datetime.fromisoformat(str(row["expires_at"] or ""))
+                deadline = stored if stored.tzinfo else stored.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                pass
+        if deadline is None:
+            try:
+                created = datetime.fromisoformat(str(row["created_at"]))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                timeout = float(
+                    getattr(self.settings.security, "approval_timeout_seconds", 900) or 900
+                )
+                deadline = created + timedelta(seconds=max(0.0, timeout))
+            except (TypeError, ValueError):
+                return None
+        return deadline
+
+    async def recover_pending_expiries(self) -> int:
+        """Expire stale cards and re-arm live ones after a restart.
+
+        ``call_later`` handles die with the loop, but the deadline is durable on
+        the approval row. Called at startup once the notifier is listening, so
+        an operator still gets the explicit "nothing was run" notice for a card
+        that timed out while the process was down. Returns the number expired.
+        """
+        rows = await db.fetchall(
+            "SELECT id FROM approvals WHERE status='pending' ORDER BY created_at"
+        )
+        expired = 0
+        for row in rows or []:
+            approval_id = str(row["id"])
+            if await self.expire_approval_if_stale(approval_id):
+                expired += 1
+                continue
+            live = await db.fetchone(
+                "SELECT id,created_at,expires_at FROM approvals WHERE id=? AND status='pending'",
+                (approval_id,),
+            )
+            deadline = self._approval_deadline(live) if live is not None else None
+            if deadline is None:
+                continue
+            remaining = (deadline - self._now()).total_seconds()
+            if remaining > 0:
+                # _schedule_expiry adds the grace again; subtract it here so the
+                # re-armed timer lands on the stored deadline, not later.
+                self._schedule_expiry(approval_id, max(0.0, remaining - _EXPIRY_GRACE_SECONDS))
+        return expired
+
+    async def expire_approval_if_stale(self, approval_id: str) -> bool:
+        """Mark a timed-out command approval expired and tell the operator.
+
+        Only a still-pending row past its own deadline changes. The event is
+        emitted with the exact command, action and risk reason so the notifier
+        can say what was left waiting instead of letting the card vanish into a
+        silent stall. Returns True when this call expired the card.
+        """
+        row = await db.fetchone("SELECT * FROM approvals WHERE id=?", (str(approval_id),))
+        if row is None or str(row["status"]) != "pending":
+            self._cancel_expiry(approval_id)
+            return False
+        deadline = self._approval_deadline(row)
+        if deadline is None or self._now() < deadline:
+            return False
+        now = self._now_iso()
+        async with db.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE approvals SET status='expired', resolved_at=?, "
+                "metadata=json_set(COALESCE(metadata,'{}'),'$.resolved_by',?,"
+                "'$.outcome',?) WHERE id=? AND status='pending'",
+                (now, "system:expiry", "timeout", str(approval_id)),
+            )
+            if cursor.rowcount != 1:
+                return False
+            risk = RiskLevel(str(row["risk"]))
+            await self._audit(
+                "system:expiry", str(row["action"]), row["resource"], risk,
+                Decision(
+                    allowed=False,
+                    reason="approval expired: the operator did not decide in time",
+                    risk=risk, approval_id=str(approval_id),
+                ),
+                metadata={"approval_id": str(approval_id), "outcome": "timeout"},
+            )
+        self._cancel_expiry(approval_id)
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        details = metadata if isinstance(metadata, Mapping) else {}
+        if self.events:
+            await self.events.emit(
+                "approval.resolved", approval_id=str(approval_id),
+                status="expired", resolver="system:expiry",
+            )
+            await self.events.emit(
+                "approval.expired",
+                approval_id=str(approval_id),
+                action=str(row["action"]),
+                resource=row["resource"],
+                risk=str(row["risk"]),
+                command=str(details.get("command_preview") or ""),
+                risk_reason=str(details.get("risk_reason") or ""),
+                reason="approval expired: the action was not run",
+            )
+        return True
 
     async def _review(
         self,
@@ -489,53 +728,120 @@ class PermissionManagerImpl:
         except ValueError:
             return False
 
+    @staticmethod
+    def _grant_metadata(row: Any) -> dict[str, Any]:
+        try:
+            value = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError, KeyError):
+            return {}
+        return value if isinstance(value, Mapping) else {}
+
+    async def _live_workspace_trust(self, resource: str | None) -> bool:
+        """Whether shell/terminal work in this workspace is currently trusted."""
+        if self.settings.security.approval_mode == "manual":
+            return False
+        rows = await db.fetchall(
+            "SELECT resource FROM approval_grants WHERE action IN (?,?) "
+            "AND scope='workspace' AND revoked_at IS NULL AND expires_at > ?",
+            ("tool:shell", "tool:terminal", self._now_iso()),
+        )
+        return any(self._workspace_contains(str(item["resource"]), resource) for item in rows or [])
+
     async def _has_live_grant(
         self,
         action: str,
         resource: str | None,
         arguments_digest: str | None = None,
-        risk_reason: str | None = None,
+        risk_reason: Any = None,
+        *,
+        command: str = "",
+        task_id: str = "",
+        conversation_id: str = "",
     ) -> bool:
         """True when an unexpired grant covers this call.
 
-        Path tools are keyed on ``(action, resource)``; shell/terminal on the
-        exact arguments digest. A third scope, a **workspace trust**, covers
-        ordinary shell commands in one workspace for its lifetime — but never a
-        destructive, credential, privilege, arbitrary-code or self-modifying
-        command. ``manual`` mode ignores every grant.
+        Scopes, narrowest first:
+
+        * exact shell arguments digest (the original "This command" button),
+        * command pattern/prefix (``pytest *``, ``git *``), optionally standing,
+        * tool + directory (path tools), optionally standing,
+        * workspace trust for ordinary shell/terminal work,
+        * one remembered approval kind per task/conversation.
+
+        Hardline reasons never consult any of them: destructive, credential,
+        privilege, outbound and self-modifying work keeps asking every time.
+        ``manual`` mode ignores every grant.
         """
         if self.settings.security.approval_mode == "manual":
             return False
+        # The hardline floor lives here as well as in the reviewer gate: every
+        # grant scope (exact command, pattern, trust, remembered kind) obeys the
+        # classifier's explicit delegation flag. Wording is never consulted.
+        if not delegation_allowed(action, trust_flag(risk_reason)):
+            return False
         try:
+            now = self._now_iso()
             if action in ALWAYS_ARG_SCOPED_ACTIONS:
                 digest = str(arguments_digest or "").strip()
                 if digest:
                     exact = await db.fetchone(
                         "SELECT id FROM approval_grants WHERE action=? AND resource=? "
-                        "AND expires_at > ? LIMIT 1",
-                        (action, _grant_scope(action, digest), self._now_iso()),
+                        "AND revoked_at IS NULL AND expires_at > ? LIMIT 1",
+                        (action, _grant_scope(action, digest), now),
                     )
                     if exact is not None:
                         return True
-                if not reason_is_trustable(risk_reason):
-                    return False
+                text = str(command or "").strip()
                 rows = await db.fetchall(
-                    "SELECT resource FROM approval_grants WHERE action=? "
-                    "AND scope='workspace' AND expires_at > ?",
-                    (action, self._now_iso()),
+                    "SELECT action,resource,metadata,conversation_id FROM approval_grants "
+                    "WHERE action IN (?,?) AND scope IN (?,?,?) "
+                    "AND revoked_at IS NULL AND expires_at > ?",
+                    ("tool:shell", "tool:terminal", _GRANT_SCOPE_PATTERN,
+                     _GRANT_SCOPE_STANDING, _GRANT_SCOPE_CONVERSATION, now),
                 )
                 for item in rows or []:
-                    if self._workspace_contains(str(item["resource"]), resource):
+                    subject = str(item["conversation_id"] or "")
+                    if subject and subject not in {task_id, conversation_id}:
+                        continue
+                    meta = self._grant_metadata(item)
+                    if meta.get("kind") == "directory":
+                        continue
+                    pattern = " ".join(str(meta.get("pattern") or item["resource"] or "").split())
+                    if not pattern or pattern in {"*", "**"} or len(pattern) > _MAX_PATTERN_CHARS:
+                        continue
+                    boundary = str(meta.get("workspace") or "")
+                    if boundary and not self._workspace_contains(boundary, resource):
+                        continue
+                    if text and _pattern_matches(text, pattern):
                         return True
-                return False
+                return await self._live_workspace_trust(resource)
             if resource is None or str(resource).strip() == "":
                 return False
             row = await db.fetchone(
                 "SELECT id FROM approval_grants WHERE action=? AND resource IS ? "
-                "AND expires_at > ? LIMIT 1",
-                (action, resource, self._now_iso()),
+                "AND revoked_at IS NULL AND expires_at > ? LIMIT 1",
+                (action, resource, now),
             )
-            return row is not None
+            if row is not None:
+                return True
+            rows = await db.fetchall(
+                "SELECT resource,metadata,conversation_id FROM approval_grants "
+                "WHERE action=? AND scope IN (?,?,?) "
+                "AND revoked_at IS NULL AND expires_at > ?",
+                (action, _GRANT_SCOPE_DIRECTORY, _GRANT_SCOPE_STANDING,
+                 _GRANT_SCOPE_CONVERSATION, now),
+            )
+            for item in rows or []:
+                subject = str(item["conversation_id"] or "")
+                if subject and subject not in {task_id, conversation_id}:
+                    continue
+                meta = self._grant_metadata(item)
+                if meta.get("kind") == "pattern":
+                    continue
+                directory = str(meta.get("directory") or item["resource"] or "")
+                if directory and self._workspace_contains(directory, resource):
+                    return True
+            return False
         except Exception:  # noqa: BLE001 - a grant lookup must never crash a decision
             return False
 
@@ -552,10 +858,10 @@ class PermissionManagerImpl:
 
         Path tools store their resource. Shell/terminal store the canonical
         arguments digest, so "Always" covers the exact command shown and no
-        other shell command. A grant that names neither is refused.
+        other shell command. A grant that names neither is refused. In a
+        trusted workspace the lifetime is extended to the configured trust
+        window instead of the short 8-hour session default.
         """
-        from datetime import timedelta
-
         digest = str(arguments_digest or "").strip()
         if action in ALWAYS_ARG_SCOPED_ACTIONS:
             if not digest:
@@ -568,9 +874,14 @@ class PermissionManagerImpl:
                 raise ValueError("a session grant needs a resource to scope it")
             stored_resource = str(resource)
             digest = ""
+        lifetime = max(60, int(seconds))
+        if await self._live_workspace_trust(resource):
+            lifetime = max(lifetime, int(
+                float(getattr(self.settings.security, "workspace_trust_days", 30) or 30) * 86400
+            ))
         grant_id = new_id("grn")
         created = self._now_iso()
-        expires = (datetime.fromisoformat(created) + timedelta(seconds=max(60, int(seconds)))).isoformat()
+        expires = (datetime.fromisoformat(created) + timedelta(seconds=lifetime)).isoformat()
         metadata = json.dumps({"arguments_digest": digest}) if digest else "{}"
         await db.execute(
             "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,granted_by,scope,metadata) "
@@ -591,9 +902,8 @@ class PermissionManagerImpl:
     ) -> str:
         """Trust ordinary shell/terminal work in one workspace for a bounded time.
 
-        Destructive, credential, privilege, arbitrary-code and self-modifying
-        commands are excluded by :func:`reason_is_trustable`; the hardline and
-        deny-glob floors still apply before this is consulted.
+        Every HIGH classifier reason is excluded by :func:`delegation_allowed`;
+        the hardline and deny-glob floors still apply before this is consulted.
         """
         from datetime import timedelta
 
@@ -617,15 +927,141 @@ class PermissionManagerImpl:
             )
         return grant_id
 
+    async def grant_command_pattern(
+        self,
+        pattern: str,
+        *,
+        granted_by: str,
+        workspace: str | None = None,
+        action: str = "tool:shell",
+        seconds: int | None = None,
+        standing: bool = False,
+    ) -> str:
+        """Authorize a command family (``pytest *``, ``git *``) in one workspace.
+
+        Hardline reasons are still checked on every call, so a broad git grant
+        cannot absorb a force push. ``standing=True`` creates a first-class
+        authorisation with no expiry; every grant remains revocable by id
+        through :meth:`revoke_grant`.
+        """
+        if str(action) not in ALWAYS_ARG_SCOPED_ACTIONS:
+            raise ValueError("a command pattern applies to shell/terminal only")
+        value = _normalise_pattern(pattern)
+        boundary = str(
+            Path(str(workspace or self.settings.root)).expanduser().resolve()
+        )
+        lifetime = int(seconds if seconds is not None else SESSION_GRANT_SECONDS)
+        if not standing and await self._live_workspace_trust(workspace):
+            lifetime = max(lifetime, int(
+                float(getattr(self.settings.security, "workspace_trust_days", 30) or 30) * 86400
+            ))
+        created = self._now()
+        expires = (
+            _STANDING_EXPIRY if standing
+            else (created + timedelta(seconds=max(60, lifetime))).isoformat()
+        )
+        grant_id = new_id("grn")
+        scope = _GRANT_SCOPE_STANDING if standing else _GRANT_SCOPE_PATTERN
+        metadata = json.dumps({
+            "kind": "pattern", "pattern": value, "workspace": boundary,
+        }, ensure_ascii=False)
+        await db.execute(
+            "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,"
+            "granted_by,scope,metadata) VALUES(?,?,?,?,?,?,?,?)",
+            (grant_id, created.isoformat(), expires, str(action), value,
+             str(granted_by), scope, metadata),
+        )
+        if self.events:
+            await self.events.emit(
+                "approval.granted", grant_id=grant_id, action=str(action),
+                resource=value, granted_by=str(granted_by), scope=scope,
+            )
+        return grant_id
+
+    async def grant_directory(
+        self,
+        action: str,
+        directory: str | None,
+        *,
+        granted_by: str,
+        seconds: int | None = None,
+        standing: bool = False,
+    ) -> str:
+        """Authorize one tool for every resource inside a directory.
+
+        Unlike an exact-resource session grant this covers future files in the
+        same tree. It never crosses the directory boundary and never waives a
+        path rule. Standing directory grants are revocable like any other.
+        """
+        action_name = str(action or "").strip()
+        if not action_name:
+            raise ValueError("a directory grant needs a tool action")
+        if action_name in ALWAYS_ARG_SCOPED_ACTIONS:
+            raise ValueError("use a command pattern for shell/terminal grants")
+        if directory is None or not str(directory).strip():
+            raise ValueError("a directory grant needs a directory to scope it")
+        boundary = str(Path(str(directory)).expanduser().resolve())
+        lifetime = int(seconds if seconds is not None else SESSION_GRANT_SECONDS)
+        if not standing and await self._live_workspace_trust(boundary):
+            lifetime = max(lifetime, int(
+                float(getattr(self.settings.security, "workspace_trust_days", 30) or 30) * 86400
+            ))
+        created = self._now()
+        expires = (
+            _STANDING_EXPIRY if standing
+            else (created + timedelta(seconds=max(60, lifetime))).isoformat()
+        )
+        grant_id = new_id("grn")
+        scope = _GRANT_SCOPE_STANDING if standing else _GRANT_SCOPE_DIRECTORY
+        metadata = json.dumps({"kind": "directory", "directory": boundary}, ensure_ascii=False)
+        await db.execute(
+            "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,"
+            "granted_by,scope,metadata) VALUES(?,?,?,?,?,?,?,?)",
+            (grant_id, created.isoformat(), expires, action_name, boundary,
+             str(granted_by), scope, metadata),
+        )
+        if self.events:
+            await self.events.emit(
+                "approval.granted", grant_id=grant_id, action=action_name,
+                resource=boundary, granted_by=str(granted_by), scope=scope,
+            )
+        return grant_id
+
+    async def grant_standing(
+        self,
+        kind: str,
+        value: str,
+        *,
+        granted_by: str,
+        action: str | None = None,
+        workspace: str | None = None,
+    ) -> str:
+        """Grant a persistent authorisation: ``pattern`` or ``directory``.
+
+        The operator-facing entry point for a standing allowance. It stores a
+        revocable grant row with no expiry; :meth:`revoke_grant` withdraws it.
+        """
+        mode = str(kind or "").strip().lower()
+        if mode == "pattern":
+            return await self.grant_command_pattern(
+                value, granted_by=granted_by, workspace=workspace,
+                action=str(action or "tool:shell"), standing=True,
+            )
+        if mode == "directory":
+            return await self.grant_directory(
+                str(action or ""), value, granted_by=granted_by, standing=True,
+            )
+        raise ValueError("a standing grant must be a 'pattern' or 'directory'")
+
     async def list_grants(self, *, include_expired: bool = False) -> list[dict[str, Any]]:
-        """List live approval grants (a workspace trust is one of these)."""
+        """List live approval grants (trust, patterns and standing grants too)."""
         sql = (
-            "SELECT id,created_at,expires_at,action,resource,granted_by,scope "
-            "FROM approval_grants"
+            "SELECT id,created_at,expires_at,action,resource,granted_by,scope,"
+            "metadata,conversation_id FROM approval_grants"
         )
         params: tuple[Any, ...] = ()
         if not include_expired:
-            sql += " WHERE expires_at > ?"
+            sql += " WHERE expires_at > ? AND revoked_at IS NULL"
             params = (self._now_iso(),)
         sql += " ORDER BY created_at DESC"
         rows = await db.fetchall(sql, params)
@@ -1388,6 +1824,71 @@ class PermissionManagerImpl:
                 )
         return revoked
 
+    async def _remember_approval(self, row: Any, resolver: str) -> None:
+        """Remember one approved kind of work for this task/conversation.
+
+        The memory is a narrow, expiring grant keyed to the task id the executor
+        passes on every call. A shell approval becomes a program-prefix pattern
+        (``pytest *``), a path approval becomes a directory grant. Hardline
+        approvals are never remembered, so "approve once" for a destructive
+        command never turns into standing authority by accident.
+        """
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, Mapping):
+            return
+        task_id = str(
+            metadata.get("task_id") or metadata.get("conversation_id") or ""
+        ).strip()
+        if not task_id:
+            return
+        action = str(row["action"] or "")
+        if not metadata_trustable(action, metadata):
+            return
+        resource = str(row["resource"] or "")
+        if action in ALWAYS_ARG_SCOPED_ACTIONS:
+            pattern = _command_pattern(metadata.get("command_preview") or "")
+            if pattern is None:
+                return
+            stored_resource, meta = pattern, {
+                "kind": "pattern", "pattern": pattern,
+                "workspace": resource or str(self.settings.root),
+            }
+        else:
+            if not resource:
+                return
+            try:
+                directory = str(Path(resource).expanduser().resolve().parent)
+            except (OSError, RuntimeError, ValueError):
+                return
+            stored_resource, meta = directory, {
+                "kind": "directory", "directory": directory,
+            }
+        seconds = int(
+            getattr(self.settings.security, "conversation_grant_seconds", SESSION_GRANT_SECONDS)
+            or SESSION_GRANT_SECONDS
+        )
+        created = self._now()
+        grant_id = new_id("grn")
+        await db.execute(
+            "INSERT INTO approval_grants(id,created_at,expires_at,action,resource,"
+            "granted_by,scope,metadata,conversation_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                grant_id, created.isoformat(),
+                (created + timedelta(seconds=max(60, seconds))).isoformat(),
+                action, stored_resource, str(resolver), _GRANT_SCOPE_CONVERSATION,
+                json.dumps(meta, ensure_ascii=False), task_id,
+            ),
+        )
+        if self.events:
+            await self.events.emit(
+                "approval.granted", grant_id=grant_id, action=action,
+                resource=stored_resource, granted_by=str(resolver),
+                scope=_GRANT_SCOPE_CONVERSATION, conversation_id=task_id,
+            )
+
     async def resolve_approval(self, approval_id: str, approved: bool, resolver: str = "user") -> Decision:
         resolver_name = str(resolver).strip()
         if resolver_name.startswith("chat:"):
@@ -1420,6 +1921,7 @@ class PermissionManagerImpl:
                 raise KeyError(f"unknown approval: {approval_id}")
             if row["status"] != "pending":
                 raise ValueError(f"approval already {row['status']}")
+            remember_row = dict(row)
             status = "approved" if approved else "denied"
             update = await conn.execute(
                 "UPDATE approvals SET status=?, resolved_at=?, "
@@ -1446,6 +1948,16 @@ class PermissionManagerImpl:
                           "requested_by": requested_by},
             )
 
+        self._cancel_expiry(approval_id)
+        if approved:
+            # The row is still available after the transaction closed; the
+            # conversation grant is written separately so a failure to remember
+            # never rolls back the human's decision.
+            try:
+                await self._remember_approval(remember_row, resolver_name)
+            except Exception:  # noqa: BLE001 - memory is an optimisation
+                _LOG.warning("could not remember approval kind", extra={
+                    "approval_id": approval_id})
         if self.events:
             await self.events.emit("approval.resolved", approval_id=approval_id, status=status, resolver=resolver_name)
         return decision
