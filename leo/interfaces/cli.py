@@ -38,6 +38,12 @@ console = Console()
 _state: dict[str, Any] = {}
 
 
+def _model_presets() -> dict[str, Any]:
+    from ..models.presets import PRESETS
+
+    return dict(PRESETS)
+
+
 def _settings() -> Settings:
     if "settings" not in _state:
         _state["settings"] = Settings.load()
@@ -111,9 +117,186 @@ def _is_loopback_host(host: str) -> bool:
 
 
 @cli.command()
-def doctor() -> None:
-    """Initialize and show health of the local LEO instance."""
-    show(run(ready().health))
+def doctor(
+    as_json: bool = typer.Option(
+        False, "--json", help="print the unchanged health JSON snapshot"
+    ),
+    fix: bool = typer.Option(False, "--fix", help="apply safe repairs and recheck"),
+    config: str | None = typer.Option(None, "--config", help="config file to diagnose"),
+) -> None:
+    """Run pass/fail diagnostics; exits non-zero if any check fails."""
+    if as_json:
+        show(run(ready().health))
+        return
+    from ..doctor import run_diagnostics
+
+    settings = Settings.load(config) if config else Settings.load()
+    results = run_diagnostics(settings, config_path=config, fix=fix)
+    for item in results:
+        status = "PASS" if item.ok else "FAIL"
+        marker = " (fixed)" if item.fixed else ""
+        typer.echo(f"{status} {item.name}: {item.detail}{marker}")
+    passed = sum(1 for item in results if item.ok)
+    typer.echo(f"{passed}/{len(results)} checks passed")
+    if passed != len(results):
+        raise typer.Exit(1)
+
+
+@cli.command()
+def onboard(
+    mode: str = typer.Option("quick", "--mode", help="quick or advanced setup"),
+    quick: bool = typer.Option(False, "--quick", help="alias for --mode quick"),
+    advanced: bool = typer.Option(False, "--advanced", help="alias for --mode advanced"),
+    provider: str | None = typer.Option(None, "--provider", help="provider preset"),
+    key: str | None = typer.Option(
+        None, "--key", help="API key (hidden prompt is safer; only stored in the env file)"
+    ),
+    key_env: str | None = typer.Option(None, "--key-env", help="env-var NAME for the key"),
+    base_url: str | None = typer.Option(None, "--base-url", help="override the preset endpoint"),
+    model: str | None = typer.Option(None, "--model", help="exact default model id"),
+    fallback: list[str] = typer.Option([], "--fallback", help="fallback model id (repeatable)"),
+    vision_model: str | None = typer.Option(None, "--vision-model", help="vision model id"),
+    channel: list[str] = typer.Option(
+        [], "--channel", help="telegram or whatsapp (repeatable, or 'both')"
+    ),
+    telegram_owner: list[str] = typer.Option(
+        [], "--telegram-owner", help="allowed Telegram sender id (repeatable)"
+    ),
+    whatsapp_owner: list[str] = typer.Option(
+        [], "--whatsapp-owner", help="allowed WhatsApp sender (repeatable)"
+    ),
+    no_service: bool = typer.Option(False, "--no-service", help="skip service installation"),
+    skip_probe: bool = typer.Option(
+        False, "--skip-probe", help="offline/lab use only: skip the live key check"
+    ),
+    config: str = typer.Option("leo.yaml", "--config", help="config file to update"),
+    env_file: str | None = typer.Option(None, "--env-file", help="private env file for keys"),
+    yes: bool = typer.Option(False, "--yes", help="accept QuickStart defaults without prompts"),
+    skip_doctor: bool = typer.Option(
+        False, "--skip-doctor", help="finish before diagnostics (automation only)"
+    ),
+) -> None:
+    """Set up a provider, models, channels and a boot service, then run doctor."""
+    from ..models.catalog import fetch_catalog
+    from ..onboarding_wizard import (
+        WizardAnswers,
+        apply_env_file,
+        run_wizard as run_onboard_wizard,
+    )
+
+    env_path = env_file
+    env_values = apply_env_file(env_path)
+
+    def choose(label: str, options: tuple[str, ...], default: str) -> str:
+        rendered = "/".join(options)
+        while True:
+            answer = typer.prompt(f"{label} [{rendered}]", default=default).strip().lower()
+            if answer in options:
+                return answer
+            typer.echo(f"choose one of: {rendered}")
+
+    requested_mode = "advanced" if advanced else ("quick" if quick else mode)
+    if advanced and quick:
+        fail("--quick and --advanced are mutually exclusive", code=2)
+        return
+    chosen_mode = requested_mode if yes else choose("Setup mode", ("quick", "advanced"), requested_mode)
+    presets_ = _model_presets()
+    chosen_provider = provider or (
+        "openrouter" if yes else typer.prompt(
+            f"Provider preset ({', '.join(presets_)})", default="openrouter"
+        )
+    )
+    chosen_provider = str(chosen_provider).strip().lower()
+    template = presets_.get(chosen_provider)
+    if template is None:
+        fail(f"unknown provider preset: {chosen_provider}", code=2)
+        return
+    env_name = key_env or template.get("api_key_env")
+    secret = key or (
+        os.getenv(env_name) if env_name else None
+    ) or (env_values.get(env_name) if env_name else None)
+    if not yes and not secret and template.get("api_key_env"):
+        secret = typer.prompt(
+            f"API key for {env_name} (hidden; stored only in the env file)",
+            hide_input=True,
+        )
+    chosen_model = model
+    chosen_fallbacks = list(fallback)
+    chosen_vision = vision_model
+    if not yes and chosen_mode == "advanced" and not chosen_model:
+        listed = fetch_catalog(
+            str(template.get("base_url") or ""), api_key=secret,
+            kind=str(template.get("kind") or "openai-compatible"),
+        )
+        if listed.ok and listed.models:
+            for index, item in enumerate(listed.models[:20], start=1):
+                typer.echo(f"  {index:2}. {item}")
+            chosen_model = typer.prompt("Default model id")
+            more = typer.prompt("Fallback model ids (comma-separated; blank for none)", default="")
+            chosen_fallbacks = [x.strip() for x in more.split(",") if x.strip()]
+            chosen_vision = typer.prompt(
+                "Vision model id (blank to use the default)", default=""
+            ) or None
+
+    selected_channels = list(channel)
+    if not yes and not selected_channels:
+        raw = typer.prompt(
+            "Channels [none/telegram/whatsapp/both]", default="none"
+        ).strip().lower()
+        selected_channels = [] if raw == "none" else [raw]
+    owners = {
+        "telegram": list(telegram_owner),
+        "whatsapp": list(whatsapp_owner),
+    }
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN") or env_values.get("TELEGRAM_BOT_TOKEN")
+    whatsapp_token = os.getenv("WHATSAPP_CLOUD_TOKEN") or env_values.get("WHATSAPP_CLOUD_TOKEN")
+    phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID") or env_values.get("WHATSAPP_PHONE_NUMBER_ID")
+    if not yes:
+        if "telegram" in selected_channels or "both" in selected_channels:
+            telegram_token = telegram_token or typer.prompt(
+                "Telegram bot token (hidden)", hide_input=True
+            )
+            if not owners["telegram"]:
+                raw = typer.prompt("Allowed Telegram sender ids (comma-separated)")
+                owners["telegram"] = [x.strip() for x in raw.split(",") if x.strip()]
+        if "whatsapp" in selected_channels or "both" in selected_channels:
+            whatsapp_token = whatsapp_token or typer.prompt(
+                "WhatsApp cloud token (hidden)", hide_input=True
+            )
+            phone_id = phone_id or typer.prompt("WhatsApp phone number id")
+            if not owners["whatsapp"]:
+                raw = typer.prompt("Allowed WhatsApp senders (comma-separated)")
+                owners["whatsapp"] = [x.strip() for x in raw.split(",") if x.strip()]
+
+    answers = WizardAnswers(
+        mode=chosen_mode,
+        preset=chosen_provider,
+        api_key=secret,
+        api_key_env=key_env,
+        base_url=base_url,
+        model=chosen_model,
+        fallback_models=chosen_fallbacks,
+        vision_model=chosen_vision,
+        channels=selected_channels,
+        channel_owners=owners,
+        telegram_token=telegram_token,
+        whatsapp_token=whatsapp_token,
+        whatsapp_phone_id=phone_id,
+        install_service=not no_service,
+        skip_probe=skip_probe,
+    )
+    result = run_onboard_wizard(
+        answers,
+        config_path=config,
+        env_file=env_path,
+        catalog=fetch_catalog,
+    )
+    if not result.ok:
+        fail(f"onboarding failed: {result.error}")
+        return
+    show(result.as_dict())
+    if not skip_doctor:
+        doctor(config=config)
 
 
 @cli.command()
@@ -547,8 +730,66 @@ def model_add(
 
 
 @model_app.command("list")
-def model_list() -> None:
-    show({name: provider.model_dump(mode="json") for name, provider in _settings().models.providers.items()})
+def model_list(
+    all_models: bool = typer.Option(
+        False, "--all", help="fetch each provider's live model catalog"
+    ),
+    provider: str | None = typer.Option(None, "--provider", help="only this configured slot"),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="always fetch live catalogs (the default for --all)"
+    ),
+) -> None:
+    """List configured slots, or --all for the providers' live catalogs."""
+    slots = _settings().models.providers
+    if provider and provider not in slots:
+        fail(f"unknown provider slot: {provider}")
+        return
+    if not all_models:
+        show({
+            name: item.model_dump(mode="json")
+            for name, item in slots.items() if provider in (None, name)
+        })
+        return
+
+    from ..models.catalog import fetch_catalog
+
+    details: dict[str, Any] = {}
+    errors: list[dict[str, str]] = []
+    every_model: list[str] = []
+    for name, item in slots.items():
+        if provider and name != provider:
+            continue
+        if item.kind == "mock" or not item.base_url:
+            details[name] = {
+                "source": "configured",
+                "models": [item.model] if item.model else [],
+                "detail": "no live catalog endpoint",
+            }
+            continue
+        key = os.getenv(item.api_key_env) if item.api_key_env else None
+        catalog = fetch_catalog(
+            item.base_url, api_key=key, kind=item.kind,
+            timeout=float(item.timeout_seconds or 8.0),
+            extra_headers=dict(item.extra_headers or {}),
+        )
+        if catalog.ok and catalog.models:
+            models = list(catalog.models)
+            source = "live"
+        else:
+            models = []
+            source = "unavailable"
+            errors.append({"provider": name, "detail": catalog.detail})
+        details[name] = {"source": source, "models": models, "detail": catalog.detail}
+        for value in models:
+            if value not in every_model:
+                every_model.append(value)
+    show({
+        "all": True,
+        "refreshed": True,  # --all always fetches; --refresh is a compatibility alias
+        "providers": details,
+        "models": every_model,
+        "errors": errors,
+    })
 
 
 @model_app.command("status")

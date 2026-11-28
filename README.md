@@ -4,7 +4,38 @@ A modular, provider-independent personal AI platform: durable tasks, layered
 memory, multi-agent delegation, native tools/skills, integrations and a local
 CLI/API/dashboard.
 
-## Quick start (local-only)
+## Quick Install
+
+macOS / Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shoaibyazdani/leo-agent/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/shoaibyazdani/leo-agent/main/install.ps1 | iex
+```
+
+The installer detects the OS, creates a private virtualenv, installs LEO and
+runs `leo onboard`. The wizard walks through provider, key, models, channels
+and a boot service, then runs `leo doctor`. Non-secret settings go to
+`leo.yaml`; keys go only to `~/.config/leo/env` (mode `0600`) and are never
+printed. The installers do not download or execute third-party installers:
+they use `uv` if present, otherwise the system Python 3.11+.
+
+From an existing checkout use `sh install.sh` or
+`powershell -ExecutionPolicy Bypass -File install.ps1`. Set
+`LEO_SKIP_ONBOARD=1` (or pass `-SkipOnboard`) to skip the wizard, then run
+`leo onboard` yourself.
+
+After setup, `leo doctor` runs seven pass/fail checks and exits non-zero on
+failure; `leo doctor --fix` applies safe repairs, and `leo doctor --json`
+prints the compact health snapshot. `leo model list --all` reads the live
+provider catalog.
+
+### Quick start (local-only)
 
 ```bash
 git clone https://github.com/shoaibyazdani/leo-agent.git
@@ -13,9 +44,9 @@ sh install.sh
 leo
 ```
 
-`sh install.sh` creates the Python 3.12 virtualenv with `uv`, installs LEO,
-initializes local state and puts a `leo` launcher on your PATH. After that,
-bare `leo` opens the terminal chat.
+`sh install.sh` creates the virtualenv, installs LEO, initializes local state
+and puts a `leo` launcher on your PATH. After that, bare `leo` opens the
+terminal chat.
 
 Manual install (already have a checkout):
 

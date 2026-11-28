@@ -1,36 +1,67 @@
 #!/bin/sh
 # LEO installer — macOS / Linux.
 #
-# One command sets everything up, then `leo` opens the terminal chat.
-#   sh install.sh
+# Run from a checkout:   sh install.sh
+# For the one-command form, see the README Quick Install section.
 #
-# Requirements: git checkout of this repository and `uv`
-# (curl -LsSf https://astral.sh/uv/install.sh | sh).
+# This script never downloads or executes a third-party installer. It uses
+# `uv` if it is already installed, otherwise the system Python.
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_url=${LEO_REPO_URL:-https://github.com/shoaibyazdani/leo-agent.git}
+install_dir=${LEO_INSTALL_DIR:-$HOME/.local/share/leo-agent}
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+case $(uname -s) in
+    Linux)  os_name=Linux ;;
+    Darwin) os_name=macOS ;;
+    *)      os_name=$(uname -s) ;;
+esac
+echo "→ detected $os_name"
+
+is_leo_checkout() {
+    [ -f "$1/pyproject.toml" ] && grep -q '^name = "leo-agent-os"' "$1/pyproject.toml"
+}
+
+if is_leo_checkout "$script_dir"; then
+    repo_dir=$script_dir
+elif is_leo_checkout "$install_dir"; then
+    repo_dir=$install_dir
+else
+    echo "→ fetching LEO source into $install_dir"
+    mkdir -p "$(dirname -- "$install_dir")"
+    git clone --depth 1 "$repo_url" "$install_dir"
+    repo_dir=$install_dir
+fi
 cd "$repo_dir"
 
-if ! command -v uv >/dev/null 2>&1; then
-    echo "uv is required. Install it with:" >&2
-    echo "  curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+if command -v uv >/dev/null 2>&1; then
+    echo "→ creating/updating .venv with uv"
+    if [ ! -x .venv/bin/python ]; then
+        uv venv --python 3.12 .venv
+    fi
+    uv pip install --python .venv/bin/python -e .
+elif command -v python3 >/dev/null 2>&1; then
+    if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+        echo "Python 3.11+ is required (or install uv to provision Python 3.12)." >&2
+        exit 1
+    fi
+    echo "→ creating/updating .venv with python3"
+    if [ ! -x .venv/bin/python ]; then
+        python3 -m venv .venv
+    fi
+    .venv/bin/python -m pip install --upgrade pip >/dev/null
+    .venv/bin/python -m pip install -e .
+else
+    echo "Neither uv nor python3 is available; install Python 3.11+ and retry." >&2
     exit 1
 fi
 
-if [ -x .venv/bin/python ]; then
-    echo "→ using the existing .venv"
-else
-    echo "→ creating .venv (Python 3.12)"
-    uv venv --python 3.12 .venv
-fi
-
-echo "→ installing LEO"
-uv pip install --python .venv/bin/python -e .
-
 echo "→ initializing local state"
+mkdir -p "$HOME/.config/leo"
 ./.venv/bin/python -m leo.interfaces.cli init >/dev/null
 
-bindir="${LEO_BIN_DIR:-$HOME/.local/bin}"
+bindir=${LEO_BIN_DIR:-$HOME/.local/bin}
 mkdir -p "$bindir"
 launcher="$bindir/leo"
 cat > "$launcher" <<LAUNCHER
@@ -41,6 +72,7 @@ env_file="\${LEO_ENV_FILE:-\$HOME/.config/leo/env}"
 if [ -f "\$env_file" ]; then
     . "\$env_file"
 fi
+cd "\$repo" || exit 1
 exec "\$repo/.venv/bin/python" -m leo.interfaces.cli "\$@"
 LAUNCHER
 chmod +x "$launcher"
@@ -51,19 +83,9 @@ case ":$PATH:" in
     *) echo "Add $bindir to PATH (e.g. in ~/.zshrc: export PATH=\"$bindir:\$PATH\")" ;;
 esac
 
-cat <<'DONE'
-
-Done. Start LEO with:
-
-    leo
-
-That opens the terminal chat. Flows:
-  - `leo --help`           all commands
-  - `leo model presets`    provider presets (openrouter, groq, deepseek, ollama, …)
-  - `leo model add`        add a provider (env-var NAME for the key, never the key)
-  - `leo serve`            dashboard + API on http://127.0.0.1:8765
-
-Model credentials: put `export OPENROUTER_API_KEY=...` style lines in
-~/.config/leo/env (or set them in your shell) and add the provider with
-`leo model add <name> --preset <preset> --model <model-id>`.
-DONE
+if [ "${LEO_SKIP_ONBOARD:-0}" = "1" ]; then
+    echo "→ onboarding skipped; run: leo onboard"
+else
+    echo "→ starting onboarding"
+    exec "$launcher" onboard "$@"
+fi

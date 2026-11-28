@@ -64,7 +64,7 @@ def test_fresh_home_cli_chat_memory_and_tasks_survive_restart(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    health = _cli(tmp_path, "doctor")
+    health = _cli(tmp_path, "doctor", "--json")
     assert '"status": "ok"' in health
     assert str(tmp_path / "data" / "leo.db") in health
 
