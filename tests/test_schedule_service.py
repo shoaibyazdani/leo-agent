@@ -1074,8 +1074,8 @@ async def test_create_card_discloses_catch_up_pinned_target_and_unlimited_runs(e
     )
     body = out["card"]["body"]
     assert "runs forever" in body
-    assert "skip missed runs (at most one run after downtime)" in body
-    assert "always uses provider-x/model-y" in body
+    assert "Skips missed runs (at most one run after downtime)" in body
+    assert "Always uses provider-x/model-y" in body
 
 
 async def test_service_rejects_a_skill_the_live_registry_does_not_know(env):

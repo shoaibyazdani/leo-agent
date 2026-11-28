@@ -454,22 +454,25 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
         )
     )
     for fragment in (
-        'Schedule "Brief" (every day at 8am, first run Wed Nov 25 08:00 UTC,',
-        "Summarize updates.",
+        "every day at 8am — first run Wed Nov 25 08:00 UTC, runs forever",
+        '"Summarize updates."',
         "(skills: maps)",
         "(after running script collect.py)",
-        "checks URL https://example.com/price first each run",
-        "runs in /workspace/brief",
-        "reads output of source-job",
-        "toolsets: none",
-        "copied into the chat's history",
-        "results go to nowhere (saved to the job's history only)",
-        "failure notices go to",
-        "runs forever",
-        "missed runs are caught up, at most 10",
-        "uses the default model",
+        "Checks https://example.com/price first each run.",
+        "Runs in /workspace/brief.",
+        "Reads output of source-job.",
+        "Toolsets: none.",
+        "Copied into the chat's history.",
+        "Results go to nowhere (saved to the job's history only).",
+        "Failure notices go to no destination",
     ):
         assert fragment in body
+    # Defaults stay out of the text; the job name is an internal handle.
+    for absent in (
+        'Schedule "Brief"', "missed runs are caught up",
+        "uses the default model",
+    ):
+        assert absent not in body, absent
 
     pinned = render_schedule_body(
         ScheduleBodySpec(
@@ -480,8 +483,8 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
     )
     assert "5 runs" in pinned
     assert "runs forever" not in pinned
-    assert "skip missed runs (at most one run after downtime)" in pinned
-    assert "always uses provider-x/model-y" in pinned
+    assert "Skips missed runs (at most one run after downtime)" in pinned
+    assert "Always uses provider-x/model-y" in pinned
 
     paused = render_schedule_body(
         ScheduleBodySpec(
@@ -498,8 +501,8 @@ def test_schedule_body_renderer_is_literal_complete_and_honest() -> None:
             no_agent=True, first_run_at="2026-11-25T09:00:00+00:00",
         )
     )
-    assert script_only.startswith('Schedule "Check"')
-    assert "runs script check.py" in script_only
+    assert 'Schedule "Check"' not in script_only
+    assert "Runs script check.py." in script_only
 
     assert render_edit_body("Water", ["prompt: water -> tea"]) == (
         'Change "Water": prompt: water -> tea'
@@ -520,28 +523,25 @@ def test_first_run_renders_in_the_schedule_timezone() -> None:
     assert format_first_run(None, "Asia/Karachi") is None
 
 
-def test_card_body_uses_plain_language_for_defaults() -> None:
-    """Regression: 28 Nov 2026 — the approval card read like an internal spec
-    ("default bounded catch-up after downtime", "not pinned to a
-    provider/model", "telegram chat 525083981")."""
+def test_card_body_reads_like_a_message_to_a_human() -> None:
+    """Regression: 28 Nov 2026 — the approval card was one dense parenthetical
+    of internal fields ("default bounded catch-up after downtime",
+    "not pinned to a provider/model", "telegram chat 525083981"). The same
+    job now reads as three short lines."""
     body = render_schedule_body(
         ScheduleBodySpec(
-            name="Office", display="once at 9am",
+            name="oneshot-0900-early-office-1129", display="once at 9am",
             first_run_at="2026-11-29T03:00:00+00:00",
             timezone="Asia/Karachi", repeat_limit=1,
             prompt="Aaj 9:00 AM tak pahunchna hai.",
             delivery="telegram chat",
         )
     )
-    assert "first run Sun Nov 29 08:00 PKT" in body
-    assert "missed runs are caught up, at most 10" in body
-    assert "uses the default model" in body
-    assert "results go to telegram chat" in body
-    for jargon in (
-        "default bounded catch-up", "not pinned to a provider/model",
-        "03:00 UTC", "525083981",
-    ):
-        assert jargon not in body, jargon
+    assert body == (
+        "Once, Sun Nov 29 08:00 PKT\n"
+        '"Aaj 9:00 AM tak pahunchna hai."\n'
+        "Results go to telegram chat."
+    )
 
 
 @pytest.mark.parametrize(

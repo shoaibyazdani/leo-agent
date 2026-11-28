@@ -369,29 +369,79 @@ class ScheduleBodySpec:
 
 
 def render_schedule_body(spec: ScheduleBodySpec) -> str:
-    """Render the complete literal create-card body (never truncated here).
+    """Render the create-card body as short human lines (never truncated here).
 
-    The body is stored verbatim on the card. Surface size limits may later make
-    a card deny-only, but the stored text is always the full text.
+    One fact per line, defaults omitted: a person approving a job needs to
+    know what it does, when it runs, and where the result goes. The default
+    catch-up policy and an unpinned model never change that decision, so
+    they stay out of the text; anything non-default still shows. The body
+    is stored verbatim on the card. Surface size limits may later make a
+    card deny-only, but the stored text is always the full text.
     """
-    parts: list[str] = [str(spec.display or "").strip()]
+    lines: list[str] = []
+
+    # When it runs.
     if spec.paused:
-        parts.append("created paused: it will not run until resumed")
+        display = str(spec.display or "").strip()
+        head = (
+            f"{display} — created paused: it will not run until resumed"
+            if display
+            else "Created paused: it will not run until resumed"
+        )
     else:
         first = format_first_run(spec.first_run_at, spec.timezone)
-        if first:
-            parts.append(f"first run {first}")
+        if spec.repeat_limit == 1:
+            head = f"Once, {first}" if first else (str(spec.display or "").strip() or "Once")
+        else:
+            head = str(spec.display or "").strip()
+            if first:
+                head = f"{head} — first run {first}" if head else f"First run {first}"
     if spec.repeat_limit is not None:
-        count = int(spec.repeat_limit)
-        parts.append(f"{count} run{'' if count == 1 else 's'}")
+        if not (spec.repeat_limit == 1 and not spec.paused):
+            count = int(spec.repeat_limit)
+            head += f", {count} run{'' if count == 1 else 's'}"
+    elif head:
+        head += ", runs forever"
     else:
-        parts.append("runs forever")
+        head = "Runs forever"
+    lines.append(head)
+
+    # What it does.
+    prompt = str(spec.prompt or "").strip()
+    script = str(spec.script or "").strip()
+    pieces: list[str] = []
+    if spec.no_agent:
+        if script:
+            pieces.append(f"Runs script {script}.")
+        elif prompt:
+            pieces.append(f'"{prompt}"')
+    elif prompt:
+        pieces.append(f'"{prompt}"')
+        if spec.skills:
+            pieces.append(f"(skills: {', '.join(str(item) for item in spec.skills)})")
+        if script:
+            pieces.append(f"(after running script {script})")
+    elif script:
+        pieces.append(f"Runs script {script}.")
+    if pieces:
+        lines.append(" ".join(pieces))
+
+    # Only the extras that change behavior.
+    if str(spec.monitor or "").strip():
+        lines.append(f"Checks {str(spec.monitor).strip()} first each run.")
+    if str(spec.workdir or "").strip():
+        lines.append(f"Runs in {str(spec.workdir).strip()}.")
+    if spec.context_from:
+        lines.append(f"Reads output of {', '.join(str(item) for item in spec.context_from)}.")
+    if spec.enabled_toolsets is not None:
+        toolsets = [str(item) for item in spec.enabled_toolsets if str(item).strip()]
+        lines.append("Toolsets: " + (", ".join(toolsets) if toolsets else "none") + ".")
+    if spec.attach_to_session:
+        lines.append("Copied into the chat's history.")
     if spec.catch_up is False:
-        parts.append("skip missed runs (at most one run after downtime)")
+        lines.append("Skips missed runs (at most one run after downtime).")
     elif spec.catch_up is True:
-        parts.append("catch up on missed runs")
-    else:
-        parts.append("missed runs are caught up, at most 10")
+        lines.append("Catches up missed runs.")
     if spec.pinned:
         provider = str(spec.pinned_provider or "").strip()
         model = str(spec.pinned_model or "").strip()
@@ -401,44 +451,13 @@ def render_schedule_body(spec: ScheduleBodySpec) -> str:
             else f"model {model}" if model
             else "the current provider/model at creation"
         )
-        parts.append(f"always uses {target}")
-    else:
-        parts.append("uses the default model")
-    head = f'Schedule "{spec.name}" ({", ".join(part for part in parts if part)}): '
+        lines.append(f"Always uses {target}.")
 
-    prompt = str(spec.prompt or "").strip()
-    script = str(spec.script or "").strip()
-    pieces: list[str] = []
-    if spec.no_agent:
-        if script:
-            pieces.append(f"runs script {script}")
-        elif prompt:
-            pieces.append(prompt)
-    elif prompt:
-        pieces.append(prompt)
-        if spec.skills:
-            pieces.append(f"(skills: {', '.join(str(item) for item in spec.skills)})")
-        if script:
-            pieces.append(f"(after running script {script})")
-    elif script:
-        pieces.append(f"runs script {script}")
-
-    body = head + " ".join(pieces) if pieces else head.rstrip()
-    if str(spec.monitor or "").strip():
-        body += f"; checks URL {str(spec.monitor).strip()} first each run"
-    if str(spec.workdir or "").strip():
-        body += f"; runs in {str(spec.workdir).strip()}"
-    if spec.context_from:
-        body += f"; reads output of {', '.join(str(item) for item in spec.context_from)}"
-    if spec.enabled_toolsets is not None:
-        toolsets = [str(item) for item in spec.enabled_toolsets if str(item).strip()]
-        body += "; toolsets: " + (", ".join(toolsets) if toolsets else "none")
-    if spec.attach_to_session:
-        body += "; copied into the chat's history"
-    body += f"; results go to {spec.delivery}"
+    # Where the result goes.
+    lines.append(f"Results go to {spec.delivery}.")
     if spec.failure_delivery and spec.failure_delivery != spec.delivery:
-        body += f"; failure notices go to {spec.failure_delivery}"
-    return body
+        lines.append(f"Failure notices go to {spec.failure_delivery}.")
+    return "\n".join(line for line in lines if line.strip())
 
 
 def render_edit_body(name: str, changes: Sequence[str]) -> str:
