@@ -121,6 +121,25 @@ def test_guidance_pins_exact_time_and_clean_prompt() -> None:
         assert token in lowered, token
 
 
+def test_guidance_stays_quiet_after_a_shown_card() -> None:
+    """Regression: 28 Nov 2026 — after a schedule card was shown, the model
+    sent a second message repeating the store summary. The card already
+    states the job, the time, and that nothing is created unless answered,
+    so the guidance tells the model to say nothing further when the tool
+    result carries a card, and to describe the job as pending only when
+    there is no card."""
+    line = next(
+        part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
+    )
+    lowered = line.lower()
+    for token in (
+        "when the tool result carries a card",
+        "say nothing further about the pending job",
+        "when there is no card, describe the job as pending",
+    ):
+        assert token in lowered, token
+
+
 def test_granted_guidance_pins_exact_time_and_clean_prompt() -> None:
     """The live-grant variant creates schedules too, so it carries the same
     two rules; a grant never widens what may be scheduled."""

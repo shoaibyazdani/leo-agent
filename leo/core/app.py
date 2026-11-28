@@ -102,8 +102,11 @@ _PROACTIVE_SCHEDULE_GUIDANCE = (
     "moment. Use the exact time the user stated; never move it earlier or "
     "later without asking. The prompt holds only the message to deliver, "
     "never instructions about style, language, length, channel, or delivery. "
-    "A job is shown for approval before it is saved: describe it as "
-    "pending until the human answers, and never retry after a decline."
+    "A job is shown for approval before it is saved: when the tool result "
+    "carries a card, say nothing further about the pending job — the card "
+    "already states the job, the time, and that nothing is created unless "
+    "answered. When there is no card, describe the job as pending until "
+    "the human answers, and never retry after a decline."
 )
 # A live create grant changes the truth the model must narrate: there is no
 # card to wait for. It never widens what may be scheduled.
