@@ -296,21 +296,23 @@ async def test_model_create_on_answerable_surface_presents_one_card(env):
     assert proposal["status"] == "pending" and proposal["active_name"] == "water"
 
 
-async def test_model_create_on_incapable_surface_fails_closed(env):
+async def test_model_create_on_incapable_surface_saves_at_once(env):
+    """Hermes (Teknium PR #158289): where no card can be shown, the job
+    saves at once, audited."""
     created = await run(env, "schedule_create", {
         "name": "cli-job", "schedule": "1h", "prompt": "Check.",
     }, turn=_chat_turn("cli"))
     assert created.success, created.error
     out = created.output
-    assert out["status"] == "approval_required"
+    assert out["status"] == "created"
     assert out["approval_id"] is None and out["card"] is None
-    assert await db.fetchone("SELECT id FROM schedules WHERE name='cli-job'") is None
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='cli-job'") is not None
     assert await db.fetchall("SELECT id FROM approvals") == []
     proposal = await db.fetchone(
         "SELECT status, active_name FROM schedule_proposals WHERE id=?",
         (out["proposal_id"],),
     )
-    assert proposal["status"] == "pending" and proposal["active_name"] == "cli-job"
+    assert proposal["status"] == "committed" and proposal["active_name"] == "cli-job"
 
 
 async def test_model_delete_requires_an_edit_card(env):

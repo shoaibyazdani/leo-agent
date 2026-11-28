@@ -323,7 +323,9 @@ def test_schedule_docs_match_the_shipped_capability_matrix() -> None:
 def test_schedule_docs_qualify_the_no_card_rule_and_legacy_approval_backfill() -> None:
     text = (ROOT / "docs" / "SCHEDULES.md").read_text(encoding="utf-8")
     lowered = " ".join(text.lower().split())
-    assert "only exception to the no-card rule" in lowered
+    assert "where no card can be shown" in lowered
+    assert "saves at once" in lowered
+    assert "no-card save" in lowered
     assert "live schedule create grant" in lowered
     assert "never covers edits, scheduled, unattended or delegated-agent" in lowered
     migration = text.split("## Migration, rollback and replay", 1)[1].split("\n## ", 1)[0]

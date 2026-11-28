@@ -112,19 +112,23 @@ accepted: no interactive ask-for-reason flow is implemented on Telegram. Real
 free-text reasons are captured on web, TUI and API only: a web prompt, TUI's
 `/deny <id> [reason]`, or the API's `deny_reason` field.
 
-LEO does **not** port the source project's no-card auto-save. A model create or
-semantic edit without an answerable surface returns a durable
-`approval_required` proposal with zero schedule rows and zero approval rows;
-an operator can still resolve it later. Trusted direct operator scheduling
-(create/patch/delete over HTTP, operator CLI, dashboard) stays unasked but
-audited as `api:<authenticated-principal>` or `operator:<surface>`.
+LEO follows the source project's no-card rule (Hermes, Teknium PR #158289):
+where no card can be shown, a model create or semantic edit saves at once,
+audited as `no-card save` / `no-card edit`, and a removal happens at once,
+audited as `no-card removal` — there is no approval wait and no durable
+proposal to resolve later. The model is not told to create jobs unasked on
+those surfaces, so the save only happens for a job the conversation actually
+asked for. A pending proposal replayed on a surface with no card still
+returns `approval_required` — the save-at-once rule applies to fresh creates
+and edits, not to a proposal the human has not answered. Trusted direct operator scheduling (create/patch/delete over HTTP,
+operator CLI, dashboard) stays unasked but audited as
+`api:<authenticated-principal>` or `operator:<surface>`.
 
-The only exception to the no-card rule for model creates is a **live schedule
-create grant** covering the current principal/profile or conversation. Such a
-grant makes `schedule_create` save immediately with no card, in interactive
-turns only; it never covers edits, scheduled, unattended or delegated-agent
-turns. Prompts are reworded while a grant is live so the model does not describe
-an immediate save as pending approval.
+A live schedule create grant still makes `schedule_create` save immediately
+with no card, in interactive turns only — it is what skips the card on an
+answerable surface. It never covers edits, scheduled, unattended or
+delegated-agent turns. Prompts are reworded while a grant is live so the
+model does not describe an immediate save as pending approval.
 
 ## Delivery grammar
 
@@ -198,7 +202,7 @@ rewrite can receive a card. Unknown surfaces are incapable by default.
 
 Electron adds a notification-only IPC: a notification never carries approval
 authority. Notifier-blind, send-only and split gateways that do not advertise
-the card protocol produce `approval_required` proposals instead of cards.
+the card protocol save at once, audited, instead of showing a card.
 
 ## Security hardening
 

@@ -298,7 +298,10 @@ class _ClaimingScheduleRouter:
         )
 
 
-async def test_app_final_answer_is_corrected_after_an_approval_required_create() -> None:
+async def test_app_final_answer_keeps_a_true_success_claim_after_a_no_card_create() -> None:
+    """Hermes (Teknium PR #158289): on a surface with no card, the job
+    saves at once — so the model's success claim is true and the
+    truthful-answer guard leaves it alone."""
     settings = Settings()
     settings.models = ModelConfig(
         default="mock",
@@ -313,10 +316,11 @@ async def test_app_final_answer_is_corrected_after_an_approval_required_create()
         await app.shutdown()
 
     content = answer["content"]
-    assert "Done" not in content
-    assert "not created yet" in content
+    assert "Done" in content
+    assert "not created yet" not in content
     assert "Water" in content
-    # The store is the truth: nothing was written.
-    assert await db.fetchone("SELECT id FROM schedules WHERE name='Water'") is None
+    # The store is the truth: the job was written.
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='Water'") is not None
     assert await db.fetchall("SELECT id FROM approvals") == []
-    assert len(await db.fetchall("SELECT id FROM schedule_proposals")) == 1
+    proposal = await db.fetchone("SELECT status FROM schedule_proposals")
+    assert proposal["status"] == "committed"

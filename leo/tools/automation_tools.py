@@ -2,8 +2,8 @@
 
 Every mutation goes through :class:`leo.schedules.service.ScheduleService`; no
 tool writes a schedule row directly. A model create/edit/remove either presents
-a durable consent card on an answerable surface or fails closed to an
-``approval_required`` proposal with no schedule write. Read-only calls and
+a durable consent card on an answerable surface or — where no card can be shown
+(Hermes, Teknium PR #158289) — saves at once, audited. Read-only calls and
 manual run/cancel never invent execution evidence.
 
 Schemas are neutral and closed (``additionalProperties=false``). Provider,
@@ -417,9 +417,8 @@ def _tool_defs() -> list[tuple[ToolSpec, Any]]:
                     "frequent cadence that helps unless the user gave one. "
                     "A job drafts, reminds and checks; it never sends, buys "
                     "or submits on the user's behalf. A new job is shown to "
-                    "the human for approval before it is saved; with no "
-                    "answerable surface it returns a durable "
-                    "approval_required proposal and creates nothing. A "
+                    "the human for approval before it is saved; where no "
+                    "card can be shown it saves at once, audited. A "
                     "declined job is the human's answer: never retry it."
                 ),
                 category="automation",

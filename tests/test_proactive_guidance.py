@@ -95,7 +95,7 @@ def test_guidance_does_not_claim_an_autonomous_save() -> None:
     for token in (
         "schedule_list first", "one-shot", "a few runs",
         "without waiting to be asked", "pending until the human answers",
-        "never retry after a decline",
+        "say plainly that it was saved", "never retry after a decline",
     ):
         assert token in lowered, token
     for forbidden in (
@@ -204,7 +204,7 @@ def test_guidance_stays_quiet_after_a_shown_card() -> None:
     states the job, the time, and that nothing is created unless answered,
     so the guidance tells the model to say nothing further when the tool
     result carries a card, and to describe the job as pending only when
-    there is no card."""
+    the tool result says approval_required without a card."""
     line = next(
         part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
     )
@@ -212,7 +212,7 @@ def test_guidance_stays_quiet_after_a_shown_card() -> None:
     for token in (
         "when the tool result carries a card",
         "say nothing further about the pending job",
-        "when there is no card, describe the job as pending",
+        "approval_required without a card, describe the job as pending",
     ):
         assert token in lowered, token
 
