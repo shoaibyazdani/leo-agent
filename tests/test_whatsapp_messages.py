@@ -194,3 +194,39 @@ async def test_message_runner_refuses_an_unlinked_session(monkeypatch):
 
     with pytest.raises(whatsapp_msg.LinkUnavailable):
         await run_message_agent("owner", allow=["15551234567"])
+
+
+def test_the_serve_process_cannot_restart_itself(monkeypatch) -> None:
+    """A self-restart kills the WhatsApp turn before it can send its answer.
+
+    Live 2026-11-28: "why not replying" → model asks shell to restart
+    leo-whatsapp → systemd stops the process 5 s later → no reply, fresh listener.
+    """
+    from leo.config import Settings
+    from leo.tools.shell_policy import preflight
+
+    settings = Settings()
+    monkeypatch.setenv("LEO_WHATSAPP_SERVE", "1")
+
+    for command in (
+        "systemctl restart leo-whatsapp.service",
+        "sudo systemctl restart leo-agent.service leo-whatsapp.service; sleep 6",
+        "service leo-whatsapp restart",
+        "systemctl try-restart leo-whatsapp",
+    ):
+        reason = preflight("shell", {"command": command}, settings)
+        assert reason and "inside its own turn" in reason, command
+
+    # Diagnosis and the OTHER service stay available.
+    assert preflight("shell", {"command": "systemctl is-active leo-whatsapp.service"}, settings) is None
+    assert preflight("shell", {"command": "systemctl restart leo-agent.service"}, settings) is None
+
+
+def test_outside_the_serve_process_the_guard_is_inactive(monkeypatch) -> None:
+    from leo.config import Settings
+    from leo.tools.shell_policy import preflight
+
+    monkeypatch.delenv("LEO_WHATSAPP_SERVE", raising=False)
+    assert preflight(
+        "shell", {"command": "systemctl restart leo-whatsapp.service"}, Settings()
+    ) is None

@@ -173,6 +173,9 @@ async def run_message_agent(
 ) -> MessageServeResult:
     """Serve the linked session until cancelled (Ctrl+C) or the link ends."""
     ensure_ready()
+    # A dedicated serve process: its shell tool must refuse commands that kill
+    # this very listener before the turn can deliver an answer.
+    os.environ["LEO_WHATSAPP_SERVE"] = "1"
     if not allow_all and not [_digits(item) for item in allow if _digits(item)]:
         raise LinkUnavailable(
             "Refusing to answer WhatsApp messages without an allowlist. "

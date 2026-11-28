@@ -15,6 +15,7 @@ LEO process's privileges, exactly as a local terminal does.
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import shlex
 from pathlib import Path, PurePath
@@ -253,6 +254,21 @@ def preflight(tool_name: str, arguments: dict[str, object], settings: Settings) 
     for pattern in shell.deny_commands:
         if fnmatch.fnmatch(command.strip(), pattern):
             return f"command denied by security.deny_commands: {pattern}"
+    if os.getenv("LEO_WHATSAPP_SERVE") == "1":
+        # This command runs INSIDE leo-whatsapp. Restarting that unit kills the
+        # current turn before its answer can be sent, so the operator gets silence
+        # and systemd starts a fresh listener a few seconds later. Diagnose freely,
+        # but manage this service from Telegram or a real shell.
+        for segment in _split_segments(command):
+            if (
+                re.search(r"\b(?:systemctl|service)\b", segment)
+                and re.search(r"\b(?:restart|stop|try-restart|reload-or-restart|kill)\b", segment)
+                and re.search(r"\bleo-whatsapp(?:\.service)?\b", segment)
+            ):
+                return (
+                    "refusing to stop leo-whatsapp from inside its own turn; "
+                    "restart it from Telegram or the shell"
+                )
     return None
 
 
