@@ -275,7 +275,7 @@ async def test_edit_card_commit_cas_and_revision_bump(env):
     card = out["card"]
     assert card["kind"] == KIND_SCHEDULE_EDIT
     assert card["choices"] == ["once", "deny"]
-    assert "prompt changed" in card["body"]
+    assert "prompt: a -> b" in card["body"]
 
     resolved = await _resolve(
         env, card["approval_id"], choice="once", digest=card["proposal_digest"]

@@ -97,6 +97,7 @@ def test_mixed_pending_and_denied_outcomes_still_get_the_summary() -> None:
     answer = enforce_truthful_answer("Done — I created both schedules.", outcomes)
     assert "not created yet" in answer
     assert "not created — denied" in answer
+    assert "Tell them in one line what you wanted to schedule, and do not retry it." in answer
 
 
 def test_successful_outcomes_never_rewrite_the_answer() -> None:

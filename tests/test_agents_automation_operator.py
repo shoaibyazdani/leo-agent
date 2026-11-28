@@ -336,7 +336,7 @@ async def test_update_uses_one_canonical_card_and_no_double_gate(env) -> None:
     assert out["status"] == "approval_required"
     assert out["card"]["kind"] == "schedule_edit"
     assert out["card"]["choices"] == ["once", "deny"]
-    assert "prompt changed" in out["card"]["body"]
+    assert "prompt: first -> second" in out["card"]["body"]
     assert await db.fetchall(
         "SELECT id FROM approvals WHERE action=?", (APPROVAL_ACTION,)
     ) == []

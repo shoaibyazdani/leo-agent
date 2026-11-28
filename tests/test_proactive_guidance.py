@@ -93,8 +93,9 @@ def test_guidance_does_not_claim_an_autonomous_save() -> None:
     )
     lowered = line.lower()
     for token in (
-        "schedule_list first", "one-shot", "finite run", "user-authorized",
-        "pending until the human answers", "never retry after a decline",
+        "schedule_list first", "one-shot", "a few runs",
+        "without waiting to be asked", "pending until the human answers",
+        "never retry after a decline",
     ):
         assert token in lowered, token
     for forbidden in (
@@ -137,6 +138,30 @@ def test_guidance_pins_exact_time_and_clean_prompt() -> None:
         assert token in lowered, token
     for forbidden in ("30 minutes before", "2 hours before"):
         assert forbidden not in lowered, forbidden
+
+
+def test_guidance_uses_tekniums_trigger_and_proactive_line() -> None:
+    """Teknium's guidance (Hermes PR #158289): the model creates a job that
+    would help when the user mentions something time-bound or worth watching,
+    without waiting to be asked — and schedules nothing for a past moment, a
+    hypothetical, someone else's plans, or when the user said not to."""
+    line = next(
+        part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
+    )
+    lowered = line.lower()
+    for token in (
+        "time-bound or worth watching",
+        "trip, appointment, deadline, habit",
+        "reply they owe",
+        "price or page to re-check",
+        "for a job that would help without waiting to be asked",
+        "usually a one-shot or a few runs",
+        "schedule nothing for a past moment",
+        "hypothetical",
+        "someone else's plans",
+        "when the user said not to set reminders",
+    ):
+        assert token in lowered, token
 
 
 def test_guidance_splits_event_time_from_reminder_time() -> None:

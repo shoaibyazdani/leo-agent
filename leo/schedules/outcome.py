@@ -316,7 +316,14 @@ def summary_line(outcome: ScheduleOutcome) -> str:
 
 def truthful_summary(outcomes: list[ScheduleOutcome]) -> str:
     lines = [summary_line(item) for item in outcomes]
-    return "\n".join(lines) + "\n\nNo schedule was created or changed unless the line above says so."
+    text = "\n".join(lines) + "\n\nNo schedule was created or changed unless the line above says so."
+    # Teknium's decline/timeout copy (Hermes PR #158289): a decline is an
+    # answer — the model says in one line what it wanted and never retries.
+    if any(item.status == "denied" for item in outcomes):
+        text += "\nTell them in one line what you wanted to schedule, and do not retry it."
+    elif any(item.status in ("timed_out", "expired") for item in outcomes):
+        text += "\nDo not retry it."
+    return text
 
 
 def enforce_truthful_answer(content: str, outcomes: list[ScheduleOutcome]) -> str:
