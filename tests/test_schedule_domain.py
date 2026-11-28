@@ -45,6 +45,27 @@ def _spec(**overrides) -> ScheduleSpec:
     return ScheduleSpec(**values)
 
 
+def test_changes_between_lists_old_and_new() -> None:
+    """Teknium (Hermes PR #158289): a 'Change this job?' card lists each
+    change as old -> new, never just 'changed'."""
+    from leo.schedules.proposals import changes_between
+
+    changes = changes_between(
+        _spec(),
+        _spec(
+            prompt="Drink tea instead.",
+            delivery=[DeliveryTarget(kind="local", platform="local", chat_id="cli")],
+            execution=ExecutionSpec(script="check.py", script_args=["--fast"]),
+            catch_up=False,
+        ),
+    )
+    assert "prompt: Remind the user to drink water. -> Drink tea instead." in changes
+    assert "delivery: telegram:123 -> local:cli" in changes
+    assert "script: none -> check.py" in changes
+    assert "catch-up: none -> false" in changes
+    assert not any("changed" in item and "->" not in item for item in changes)
+
+
 def test_canonical_json_is_order_independent_and_compact() -> None:
     left = {"b": [2, 1], "a": {"y": None, "x": "é"}}
     right = {"a": {"x": "é", "y": None}, "b": [2, 1]}

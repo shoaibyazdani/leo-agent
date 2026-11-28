@@ -316,7 +316,14 @@ def summary_line(outcome: ScheduleOutcome) -> str:
 
 def truthful_summary(outcomes: list[ScheduleOutcome]) -> str:
     lines = [summary_line(item) for item in outcomes]
-    return "\n".join(lines) + "\n\nNo schedule was created or changed unless the line above says so."
+    text = "\n".join(lines) + "\n\nNo schedule was created or changed unless the line above says so."
+    # Teknium's decline/timeout copy (Hermes PR #158289): a decline is an
+    # answer — the model says in one line what it wanted and never retries.
+    if any(item.status == "denied" for item in outcomes):
+        text += "\nTell them in one line what you wanted to schedule, and do not retry it."
+    elif any(item.status in ("timed_out", "expired") for item in outcomes):
+        text += "\nDo not retry it."
+    return text
 
 
 def enforce_truthful_answer(content: str, outcomes: list[ScheduleOutcome]) -> str:
@@ -326,10 +333,24 @@ def enforce_truthful_answer(content: str, outcomes: list[ScheduleOutcome]) -> st
     contains any non-success schedule outcome and the answer either claims
     success or says nothing recognisably truthful about the gate, the answer is
     replaced by the per-outcome store summary.
+
+    Exception: when every unfinished outcome is a card already shown to the
+    human (approval_required/pending with an approval id), the card IS the
+    message — it states the job, the time, and that nothing is created unless
+    answered — so the answer is silenced instead of replaced. The gateway
+    sends nothing for an empty answer, the durable record still holds the
+    pending state, and a false success claim is still swallowed, never shown.
+    When no card was shown (no approval id), the proposal is invisible
+    without text, so the store summary still speaks for it.
     """
     bad = [item for item in outcomes if not item.successful]
     if not bad:
         return content
+    if all(
+        item.status in ("approval_required", "pending") and item.approval_id
+        for item in bad
+    ):
+        return ""
     text = str(content or "")
     lowered = text.lower()
     claims_success = any(token in lowered for token in _CLAIM_TOKENS)

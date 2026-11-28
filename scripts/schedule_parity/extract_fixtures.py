@@ -734,7 +734,7 @@ def extract_consent(source_root: Path) -> dict[str, Any]:
             name: function_record(source, tree, name)
             for name in ("_approval_when", "_approval_task", "_audience", "_ask_schedule_card", "_approve_new_job", "_edit_fingerprint", "_approve_job_edit")
         },
-        "leo_divergence": "No answerable surface means durable approval_required with no schedule write and no approval row; operator resolution revalidates and commits.",
+        "leo_divergence": "No answerable surface means the job saves at once, audited (Hermes, Teknium PR #158289); a card is shown only where one can be answered.",
     }
 
 

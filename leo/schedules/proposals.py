@@ -13,6 +13,7 @@ this module only builds domain objects and derives human-readable edit copy.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -307,8 +308,37 @@ def remove_digest(spec: ScheduleSpec, schedule_id: str, base_revision: int) -> s
     )
 
 
+def _value_text(value: Any) -> str:
+    """One value on an edit card, old -> new (Teknium: each change lists old
+    and new, never just 'changed')."""
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _targets_text(targets: Sequence[DeliveryTarget]) -> str:
+    parts = []
+    for target in targets:
+        if target.label:
+            parts.append(str(target.label))
+        elif target.chat_id:
+            parts.append(f"{target.platform}:{target.chat_id}")
+        elif target.room_id:
+            parts.append(f"room:{target.room_id}")
+        elif target.profile:
+            parts.append(f"bot-chat:{target.profile}")
+        else:
+            parts.append(str(target.kind))
+    return ", ".join(parts) if parts else "nowhere"
+
+
 def changes_between(base: ScheduleSpec, new: ScheduleSpec) -> list[str]:
-    """Human-readable edit copy for an allow/deny card."""
+    """Human-readable edit copy for an allow/deny card: every change lists
+    old -> new, as Teknium's 'Change this job?' card does."""
     changes: list[str] = []
     if base.name != new.name:
         changes.append(f"name: {base.name} -> {new.name}")
@@ -319,26 +349,41 @@ def changes_between(base: ScheduleSpec, new: ScheduleSpec) -> list[str]:
             f"schedule: {display_expression(base)} -> {display_expression(new)}"
         )
     if base.prompt != new.prompt:
-        changes.append("prompt changed")
+        changes.append(f"prompt: {base.prompt} -> {new.prompt}")
     if base.repeat_limit != new.repeat_limit:
         changes.append(
             f"runs: {_repeat_text(base.repeat_limit)} -> {_repeat_text(new.repeat_limit)}"
         )
     if _targets_semantic(base.delivery) != _targets_semantic(new.delivery):
-        changes.append("delivery target changed")
+        changes.append(
+            f"delivery: {_targets_text(base.delivery)} -> {_targets_text(new.delivery)}"
+        )
     if _targets_semantic(base.failure_delivery) != _targets_semantic(new.failure_delivery):
-        changes.append("failure delivery target changed")
+        changes.append(
+            "failure delivery: "
+            f"{_targets_text(base.failure_delivery)} -> {_targets_text(new.failure_delivery)}"
+        )
     old_execution = base.execution.model_dump(mode="json")
     new_execution = new.execution.model_dump(mode="json")
     for key in sorted(set(old_execution) | set(new_execution)):
         if old_execution.get(key) != new_execution.get(key):
-            changes.append(f"{key} changed")
+            changes.append(
+                f"{key}: {_value_text(old_execution.get(key))} -> "
+                f"{_value_text(new_execution.get(key))}"
+            )
     if bool(base.paused) != bool(new.paused):
-        changes.append("paused state changed")
+        changes.append(
+            f"paused: {_value_text(bool(base.paused))} -> {_value_text(bool(new.paused))}"
+        )
     if base.paused_reason != new.paused_reason:
-        changes.append("paused reason changed")
+        changes.append(
+            f"paused reason: {_value_text(base.paused_reason)} -> "
+            f"{_value_text(new.paused_reason)}"
+        )
     if base.catch_up != new.catch_up:
-        changes.append("catch-up changed")
+        changes.append(
+            f"catch-up: {_value_text(base.catch_up)} -> {_value_text(new.catch_up)}"
+        )
     return changes or ["configuration changed"]
 
 

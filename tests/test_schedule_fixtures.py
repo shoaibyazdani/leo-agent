@@ -278,7 +278,7 @@ def test_golden_cards_are_literal_complete_and_schema_closed():
     ):
         assert fragment in extras
     assert "nothing was saved." in contract["decline_messages"]["stale_create"]
-    assert "no schedule write and no approval row" in contract["leo_divergence"]
+    assert "saves at once" in contract["leo_divergence"]
 
 
 def test_golden_card_schema_rejects_unregistered_card_and_job_fields():

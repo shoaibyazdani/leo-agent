@@ -93,8 +93,9 @@ def test_guidance_does_not_claim_an_autonomous_save() -> None:
     )
     lowered = line.lower()
     for token in (
-        "schedule_list first", "one-shot", "finite run", "user-authorized",
-        "pending until the human answers", "never retry after a decline",
+        "schedule_list first", "one-shot", "a few runs",
+        "without waiting to be asked", "pending until the human answers",
+        "say plainly that it was saved", "never retry after a decline",
     ):
         assert token in lowered, token
     for forbidden in (
@@ -107,16 +108,111 @@ def test_guidance_does_not_claim_an_autonomous_save() -> None:
 def test_guidance_pins_exact_time_and_clean_prompt() -> None:
     """Regression: 28 Nov 2026 — a schedule moved 9am to 8am unasked, and the
     prompt leaked style instructions ("Keep it to 1-2 short lines, Roman
-    Urdu mixed with English.") into the delivered reminder."""
+    Urdu mixed with English.") into the delivered reminder. Follow-up the
+    same day: a 9pm interview reminder set for 9pm is useless — the stated
+    time is the EVENT time, kept exact in the prompt, while the schedule is
+    the moment the help is needed. The framing is Teknium's (Hermes PR
+    #158289): appointments get a heads-up with enough lead time to get
+    there, trips get a few one-shots at the moments, deadlines get a
+    morning-of nudge — no fixed minute table.
+    """
     line = next(
         part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
     )
     lowered = line.lower()
     for token in (
-        "exact time the user stated",
-        "never move it earlier or later without asking",
+        "event time",
+        "keep it exact in the prompt",
+        "moment the help is needed",
+        "enough lead time to get there",
+        "day before for a morning slot",
+        "leave-by time",
+        "few one-shots",
+        "check-in about 24h before",
+        "morning-of nudge",
+        "name the event time in the prompt",
+        "so the card shows both",
         "only the message to deliver",
         "never instructions about style",
+    ):
+        assert token in lowered, token
+    for forbidden in ("30 minutes before", "2 hours before"):
+        assert forbidden not in lowered, forbidden
+
+
+def test_guidance_uses_tekniums_trigger_and_proactive_line() -> None:
+    """Teknium's guidance (Hermes PR #158289): the model creates a job that
+    would help when the user mentions something time-bound or worth watching,
+    without waiting to be asked — and schedules nothing for a past moment, a
+    hypothetical, someone else's plans, or when the user said not to."""
+    line = next(
+        part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
+    )
+    lowered = line.lower()
+    for token in (
+        "time-bound or worth watching",
+        "trip, appointment, deadline, habit",
+        "reply they owe",
+        "price or page to re-check",
+        "for a job that would help without waiting to be asked",
+        "usually a one-shot or a few runs",
+        "schedule nothing for a past moment",
+        "hypothetical",
+        "someone else's plans",
+        "when the user said not to set reminders",
+    ):
+        assert token in lowered, token
+
+
+def test_guidance_splits_event_time_from_reminder_time() -> None:
+    """Regression: 28 Nov 2026 — "i have interview on monday 9pm" produced
+    a reminder AT 9pm, when the interview starts. An interview needs its
+    reminder before the event, a simple reminder does not — and the lead is
+    judged per use-case (Teknium, Hermes PR #158289), never a fixed table."""
+    line = next(
+        part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
+    )
+    lowered = line.lower()
+    assert "moment the help is needed" in lowered
+    assert "simple reminder fires at the stated time" in lowered
+    assert "30 minutes before" not in lowered
+
+
+def test_schedule_create_description_carries_teknium_good_uses() -> None:
+    """The timing judgment lives in the schedule_create tool description,
+    ported from Teknium's CRONJOB_SCHEMA (Hermes PR #158289): good uses,
+    each at the moment the help is needed."""
+    from leo.tools.automation_tools import _tool_defs
+
+    spec = next(spec for spec, _ in _tool_defs() if spec.name == "schedule_create")
+    lowered = spec.description.lower()
+    for token in (
+        "moment the help is needed",
+        "enough lead time to get there",
+        "day before for a morning slot",
+        "leave-by time",
+        "about 24h before departure",
+        "morning-of nudge",
+        "never retry it",
+    ):
+        assert token in lowered, token
+
+
+def test_guidance_stays_quiet_after_a_shown_card() -> None:
+    """Regression: 28 Nov 2026 — after a schedule card was shown, the model
+    sent a second message repeating the store summary. The card already
+    states the job, the time, and that nothing is created unless answered,
+    so the guidance tells the model to say nothing further when the tool
+    result carries a card, and to describe the job as pending only when
+    the tool result says approval_required without a card."""
+    line = next(
+        part for part in _prompt("telegram").split("\n\n") if part.startswith(GUIDANCE_START)
+    )
+    lowered = line.lower()
+    for token in (
+        "when the tool result carries a card",
+        "say nothing further about the pending job",
+        "approval_required without a card, describe the job as pending",
     ):
         assert token in lowered, token
 
@@ -128,8 +224,16 @@ def test_granted_guidance_pins_exact_time_and_clean_prompt() -> None:
 
     lowered = _GRANTED_SCHEDULE_GUIDANCE.lower()
     for token in (
-        "exact time the user stated",
-        "never move it earlier or later without asking",
+        "event time",
+        "keep it exact in the prompt",
+        "moment the help is needed",
+        "enough lead time to get there",
+        "day before for a morning slot",
+        "leave-by time",
+        "few one-shots",
+        "check-in about 24h before",
+        "morning-of nudge",
+        "name the event time in the prompt",
         "only the message to deliver",
         "never instructions about style",
     ):

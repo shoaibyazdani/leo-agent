@@ -1,7 +1,7 @@
 """ScheduleService: the one proposal/consent/commit authority.
 
-Covers direct operator writes, answerable-surface cards, fail-closed no-card
-proposals, request replay, concurrent name reservation, semantic no-op edits,
+Covers direct operator writes, answerable-surface cards, no-card auto-save
+(Hermes), request replay, concurrent name reservation, semantic no-op edits,
 CAS stale edits, repeat merge and the grant path.
 """
 
@@ -127,17 +127,54 @@ async def test_answerable_surface_presents_one_create_card(env):
     assert await db.fetchone("SELECT id FROM approvals WHERE id=?", (card["approval_id"],)) is not None
 
 
-async def test_incapable_surface_fails_closed_with_zero_schedule_and_approval_rows(env):
+async def test_incapable_surface_saves_at_once_audited(env):
+    """Hermes (Teknium PR #158289): where no card can be shown, the job
+    saves at once, audited — no approval wait, no proposal to resolve."""
     out = await env.service.create(
         {"name": "cli-job", "schedule": "1h", "prompt": "Check."},
         actor="chat:cli",
         turn=_chat("cli"),
     )
-    assert out["status"] == "approval_required"
+    assert out["status"] == "created"
     assert out["approval_id"] is None and out["card"] is None
-    assert await db.fetchall("SELECT id FROM schedules") == []
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='cli-job'") is not None
     assert await db.fetchall("SELECT id FROM approvals") == []
-    assert len(await db.fetchall("SELECT id FROM schedule_proposals")) == 1
+    proposal = await db.fetchone("SELECT status FROM schedule_proposals")
+    assert proposal["status"] == "committed"
+    audit = await db.fetchone(
+        "SELECT reason FROM audit_log WHERE action='schedule.created'"
+    )
+    assert audit["reason"] == "no-card save"
+
+
+async def test_incapable_surface_edit_saves_at_once(env):
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    out = await env.service.update(
+        name="job", arguments={"prompt": "b"},
+        actor="chat:web", turn=_chat("cli"),
+    )
+    assert out["status"] == "updated"
+    assert out["card"] is None
+    row = await db.fetchone("SELECT payload FROM schedules WHERE name='job'")
+    assert json.loads(row["payload"])["objective"] == "b"
+    audit = await db.fetchone(
+        "SELECT reason FROM audit_log WHERE action='schedule.updated'"
+    )
+    assert audit["reason"] == "no-card edit"
+
+
+async def test_incapable_surface_remove_happens_at_once(env):
+    await _create_operator(env, name="job", schedule="1h", prompt="a")
+    out = await env.service.remove(
+        name="job", actor="chat:web", turn=_chat("cli")
+    )
+    assert out["status"] == "removed"
+    assert out["card"] is None
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='job'") is None
+    audit = await db.fetchone(
+        "SELECT reason FROM audit_log WHERE action='schedule.removed'"
+    )
+    assert audit["reason"] == "no-card removal"
 
 
 async def test_concurrent_same_name_reservation_allows_exactly_one(env):
@@ -164,11 +201,11 @@ async def test_concurrent_same_name_reservation_allows_exactly_one(env):
 async def test_request_key_replays_the_same_proposal(env):
     first = await env.service.create(
         {"name": "replay", "schedule": "1h", "prompt": "a"},
-        actor="chat:web", turn=_chat("cli"), request_key="req-1",
+        actor="chat:web", turn=_chat("tui"), request_key="req-1",
     )
     second = await env.service.create(
         {"name": "replay", "schedule": "1h", "prompt": "different"},
-        actor="chat:web", turn=_chat("cli"), request_key="req-1",
+        actor="chat:web", turn=_chat("tui"), request_key="req-1",
     )
     assert second["replayed"] is True
     assert second["proposal_id"] == first["proposal_id"]
@@ -258,10 +295,10 @@ async def test_always_grant_is_profile_scoped_and_expires(env):
 
     other = await env.service.create(
         {"name": "two", "schedule": "1h", "prompt": "b"},
-        actor="chat:other", turn=_chat("cli", principal="chat:other", conversation_id="conv-b"),
+        actor="chat:other", turn=_chat("tui", principal="chat:other", conversation_id="conv-b"),
     )
     assert other["status"] == "approval_required"
-    assert other["approval_id"] is None
+    assert other["approval_id"] is not None
 
 
 async def test_edit_card_commit_cas_and_revision_bump(env):
@@ -275,7 +312,7 @@ async def test_edit_card_commit_cas_and_revision_bump(env):
     card = out["card"]
     assert card["kind"] == KIND_SCHEDULE_EDIT
     assert card["choices"] == ["once", "deny"]
-    assert "prompt changed" in card["body"]
+    assert "prompt: a -> b" in card["body"]
 
     resolved = await _resolve(
         env, card["approval_id"], choice="once", digest=card["proposal_digest"]
@@ -397,12 +434,13 @@ async def test_denied_card_releases_the_active_name(env):
         "SELECT status FROM schedule_proposals WHERE id=?", (first["proposal_id"],)
     )
     assert proposal["status"] == "denied"
-    # The reservation no longer blocks a fresh proposal with the same name.
+    # The reservation no longer blocks a fresh create with the same name.
     second = await env.service.create(
         {"name": "name", "schedule": "1h", "prompt": "b"},
         actor="chat:web", turn=_chat("cli"),
     )
-    assert second["status"] == "approval_required"
+    assert second["status"] == "created"
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='name'") is not None
 
 
 # --------------------------------------------------------------------------- remove / run / cancel
@@ -578,8 +616,10 @@ async def test_run_now_creates_a_manual_task_and_cancel_stops_it(env):
 
 
 @pytest.mark.parametrize("source", ["scheduled", "unattended", "agent"])
-async def test_create_grant_cannot_write_silently_in_unattended_turns(env, source):
-    """A session grant must not be inherited by a scheduled/agent run."""
+async def test_unattended_turn_saves_at_once_without_a_card(env, source):
+    """Hermes (Teknium PR #158289): a cron run that may schedule saves at
+    once where no card can be shown. The session grant is not inherited —
+    the audit shows the save came from the no-card rule, not the grant."""
     first = await env.service.create(
         {"name": "one", "schedule": "1h", "prompt": "a"},
         actor="chat:web", turn=_chat("tui"),
@@ -598,10 +638,15 @@ async def test_create_grant_cannot_write_silently_in_unattended_turns(env, sourc
         {"name": "two", "schedule": "1h", "prompt": "b"},
         actor="chat:web", turn=unattended,
     )
-    assert second["status"] == "approval_required"
+    assert second["status"] == "created"
     assert second["card"] is None
-    assert await db.fetchone("SELECT id FROM schedules WHERE name='two'") is None
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='two'") is not None
     assert len(await db.fetchall("SELECT id FROM approvals")) == 1
+    audit = await db.fetchone(
+        "SELECT reason FROM audit_log WHERE action='schedule.created' AND resource=?",
+        (second["schedule_id"],),
+    )
+    assert audit["reason"] == "no-card save"
 
 
 async def test_stay_paused_edit_commits_without_changing_enabled_state(env):

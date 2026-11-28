@@ -1,7 +1,9 @@
 """Per-turn schedule outcome registry and truthful final-answer enforcement.
 
 A model that says "created it" after a denied, timed-out, failed or
-approval-required schedule must have that claim replaced by durable store truth.
+approval-required schedule must have that claim replaced by durable store
+truth — except when the pending job is already on a card in front of the
+human: then the card is the message and the answer is silenced instead.
 """
 
 from __future__ import annotations
@@ -43,7 +45,13 @@ def test_truthful_answer_replaces_a_false_success_claim() -> None:
     assert "Done" not in answer
 
 
-def test_a_truthful_answer_about_the_gate_is_left_alone() -> None:
+def test_a_shown_card_silences_the_answer() -> None:
+    """Regression: 28 Nov 2026 — after a schedule card was shown, the model
+    still sent a second message repeating the store summary ("not created
+    yet — waiting for approval (approval apr_...)"). The card already states
+    the job, the time, and that nothing is created unless answered, so when
+    a card was presented the answer is silenced, even for a truthful draft.
+    """
     outcomes = [
         ScheduleOutcome(
             operation="create", status="approval_required", name="Water",
@@ -51,7 +59,45 @@ def test_a_truthful_answer_about_the_gate_is_left_alone() -> None:
         )
     ]
     answer = "The Water schedule is waiting for your approval; nothing was created yet."
-    assert enforce_truthful_answer(answer, outcomes) == answer
+    assert enforce_truthful_answer(answer, outcomes) == ""
+
+
+def test_false_success_claim_with_a_shown_card_is_silenced() -> None:
+    outcomes = [
+        ScheduleOutcome(
+            operation="create", status="approval_required", name="Water",
+            approval_id="apr-1",
+        )
+    ]
+    assert enforce_truthful_answer("Done — I created the Water schedule.", outcomes) == ""
+
+
+def test_pending_without_a_card_still_gets_the_summary() -> None:
+    """No card (CLI/API/WhatsApp) means the proposal is invisible without
+    text, so the store summary still speaks for it."""
+    outcomes = [
+        ScheduleOutcome(
+            operation="create", status="approval_required", name="Water",
+            proposal_id="prop-1",
+        )
+    ]
+    answer = enforce_truthful_answer("Here is the schedule I made for you.", outcomes)
+    assert "not created yet" in answer
+    assert "Water" in answer
+
+
+def test_mixed_pending_and_denied_outcomes_still_get_the_summary() -> None:
+    outcomes = [
+        ScheduleOutcome(
+            operation="create", status="approval_required", name="Water",
+            approval_id="apr-1",
+        ),
+        ScheduleOutcome(operation="create", status="denied", name="Tea"),
+    ]
+    answer = enforce_truthful_answer("Done — I created both schedules.", outcomes)
+    assert "not created yet" in answer
+    assert "not created — denied" in answer
+    assert "Tell them in one line what you wanted to schedule, and do not retry it." in answer
 
 
 def test_successful_outcomes_never_rewrite_the_answer() -> None:
@@ -252,7 +298,10 @@ class _ClaimingScheduleRouter:
         )
 
 
-async def test_app_final_answer_is_corrected_after_an_approval_required_create() -> None:
+async def test_app_final_answer_keeps_a_true_success_claim_after_a_no_card_create() -> None:
+    """Hermes (Teknium PR #158289): on a surface with no card, the job
+    saves at once — so the model's success claim is true and the
+    truthful-answer guard leaves it alone."""
     settings = Settings()
     settings.models = ModelConfig(
         default="mock",
@@ -267,10 +316,11 @@ async def test_app_final_answer_is_corrected_after_an_approval_required_create()
         await app.shutdown()
 
     content = answer["content"]
-    assert "Done" not in content
-    assert "not created yet" in content
+    assert "Done" in content
+    assert "not created yet" not in content
     assert "Water" in content
-    # The store is the truth: nothing was written.
-    assert await db.fetchone("SELECT id FROM schedules WHERE name='Water'") is None
+    # The store is the truth: the job was written.
+    assert await db.fetchone("SELECT id FROM schedules WHERE name='Water'") is not None
     assert await db.fetchall("SELECT id FROM approvals") == []
-    assert len(await db.fetchall("SELECT id FROM schedule_proposals")) == 1
+    proposal = await db.fetchone("SELECT status FROM schedule_proposals")
+    assert proposal["status"] == "committed"

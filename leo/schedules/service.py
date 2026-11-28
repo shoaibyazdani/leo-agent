@@ -11,8 +11,10 @@ Three authority paths exist, in priority order:
 2. A live schedule-create grant: commit a *create* without a card. Grants never
    cover edits, removal, run, cancel or future tools.
 3. Model-initiated create/edit/remove: reserve a durable proposal and either
-   present a full card on an answerable surface, or fail closed to
-   ``approval_required`` with no schedule write and no invisible approval row.
+   present a full card on an answerable surface, or — where no card can be
+   shown (Hermes, Teknium PR #158289) — save at once, audited, with no
+   approval wait. The model is not told to create jobs unasked on those
+   surfaces, so the save only happens for a job the conversation asked for.
 
 The service never opens a second database authority and never writes a parallel
 schedule store.
@@ -516,9 +518,20 @@ class ScheduleService:
                     stored, "approval_required", result.spec.name, result
                 )
             else:
-                outcome = self._outcome(
-                    stored, "approval_required", result.spec.name, result
+                # Hermes (Teknium PR #158289): where no card can be shown,
+                # the job saves at once, audited — there is no approval wait
+                # and no durable proposal to resolve later. The model is not
+                # told to create jobs unasked on those surfaces, so this only
+                # fires for a job the conversation actually asked for.
+                await self._commit_create(stored, actor=actor)
+                await self.store.update_proposal(
+                    stored.id, status="committed", schedule_id=stored.schedule_id
                 )
+                await self._audit(
+                    actor, "schedule.created", stored.schedule_id, "no-card save",
+                    {"schedule_id": stored.schedule_id, "name": result.spec.name},
+                )
+                outcome = self._outcome(stored, "created", result.spec.name, result)
         if card is not None:
             # A transport failure leaves the committed proposal/card pending for
             # another surface instead of rolling back the human's request.
@@ -630,9 +643,20 @@ class ScheduleService:
                     stored, "approval_required", result.spec.name, result
                 )
             else:
-                outcome = self._outcome(
-                    stored, "approval_required", result.spec.name, result
+                # Hermes (Teknium PR #158289): where no card can be shown,
+                # the edit saves at once, audited — no approval wait.
+                await self._commit_update(stored)
+                await self.store.update_proposal(stored.id, status="committed")
+                await self._audit(
+                    actor, "schedule.updated", stored.schedule_id,
+                    "no-card edit",
+                    {
+                        "schedule_id": stored.schedule_id,
+                        "name": result.spec.name,
+                        "changes": changes,
+                    },
                 )
+                outcome = self._outcome(stored, "updated", result.spec.name, result)
         if card is not None:
             extra["card"] = (await self._present_card(card, turn)).model_dump(mode="json")
         return self._finish(outcome, **extra)
@@ -773,9 +797,18 @@ class ScheduleService:
                         stored, "approval_required", view.name, None
                     )
                 else:
-                    outcome = self._outcome(
-                        stored, "approval_required", view.name, None
+                    # Hermes (Teknium PR #158289): removing never asks, and
+                    # where no card can be shown the removal happens at once,
+                    # audited — no approval wait.
+                    await self._commit_remove(stored)
+                    await self.store.update_proposal(stored.id, status="committed")
+                    await self._audit(
+                        actor, "schedule.removed", stored.schedule_id,
+                        "no-card removal",
+                        {"schedule_id": stored.schedule_id},
                     )
+                    outcome = self._outcome(stored, "removed", view.name, None)
+                    delete_committed = True
         except BaseException:
             await self._settle_live_run_authorization(lease, consumed=False)
             raise
